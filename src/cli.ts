@@ -31,6 +31,8 @@ import { startExecutor } from "./control/executor.js";
 import { approveAction, isKilled, listActions, rejectAction, setKill, toSummary } from "./control/queue.js";
 import { preflightPermissions } from "./control/mac-input.js";
 import { clampMinutes, clearAuto, readAuto, setAuto, type AutoActionKind } from "./control/auto.js";
+import { createDirectActionClient, isDirectMonitorTool } from "./server/direct-action-client.js";
+import { runDirectMonitorCycle } from "./server/direct-monitor-cycle.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -330,6 +332,50 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
   console.error(`workspace: ${path.resolve(workspace)}`);
   process.exitCode = 1;
 }
+async function cmdDirectAction(positional: string[], flags: Record<string, string | boolean>): Promise<void> {
+  const tool = positional[0];
+  if (!tool || positional.length !== 1 || !isDirectMonitorTool(tool)) {
+    throw new Error(
+      "usage: chatgpt2codex direct-action <github_pr_monitor_read|github_pr_monitor_state|github_pr_monitor_prepare|github_pr_monitor_mutate> [--workspace <path>]",
+    );
+  }
+
+  const raw = (await readStdin()).trim();
+  if (!raw) throw new Error("direct-action requires one JSON object on stdin");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("direct-action stdin must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("direct-action stdin must be a JSON object");
+  }
+
+  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
+  const ctx = await buildToolContext(workspace);
+  const client = await createDirectActionClient(ctx);
+  try {
+    const response = await client.call(tool, parsed as Record<string, unknown>);
+    console.log(JSON.stringify(response));
+    if (response.ok !== true) process.exitCode = 1;
+  } finally {
+    await client.close();
+  }
+}
+
+async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
+  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
+  const ctx = await buildToolContext(workspace);
+  const client = await createDirectActionClient(ctx);
+  try {
+    const result = await runDirectMonitorCycle(client);
+    console.log(JSON.stringify(result));
+  } finally {
+    await client.close();
+  }
+}
+
 
 /**
  * `chatgpt2codex control <list|approve|approve-all|reject|kill|preflight|auto> [actionId]`
@@ -586,9 +632,15 @@ async function main(): Promise<void> {
     case "control":
       await cmdControl(positional, flags);
       break;
+    case "direct-action":
+      await cmdDirectAction(positional, flags);
+      break;
+    case "direct-monitor-cycle":
+      await cmdDirectMonitorCycle(flags);
+      break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }
