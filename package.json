@@ -9,7 +9,7 @@
     "chatgpt2codex": "dist/cli.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.16.0"
   },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",

@@ -108,6 +108,19 @@ describe("control/mac-input (non-darwin)", () => {
  * always returning a found:false preview instead, and (b) press/setvalue
  * exhaust every fallback and raise a typed, catchable error rather than
  * silently doing nothing or crashing.
+ *
+ * The System Events query against a nonexistent process is slow (measured
+ * 3-5s warm); activate-based fallback legs fail fast in roughly 60ms. A single
+ * query therefore already approaches vitest's old 5s default and crosses it
+ * under desktop load. The 90s ceiling provides headroom above the observed
+ * contention range: one query measured 39s against a cold System Events daemon
+ * and 37-69s while four concurrent System Events loops were running. A vitest
+ * timeout is a ceiling, not a sleep, so the warm path still finishes in seconds;
+ * the only cost is slower detection of a real hang. It only widens the clock;
+ * every assertion still runs. The remaining cases carry none
+ * because they reject before any osascript is built at all:
+ * the missing-title report, the unbuilt-helper preflight, and the two
+ * role-injection guards, each measured at 1-2ms.
  */
 describe("control/mac-input AX targeting (darwin fallback path)", () => {
   it("resolveAxElement returns a found:false preview (no throw) when the target can't be resolved", async () => {
@@ -115,7 +128,7 @@ describe("control/mac-input AX targeting (darwin fallback path)", () => {
     expect(result.found).toBe(false);
     expect(result.source).toBe("system-events");
     expect(typeof result.reason).toBe("string");
-  });
+  }, 90_000);
 
   it("resolveAxElement requires a title or description and reports so instead of throwing", async () => {
     const result = await resolveAxElement("Chatgpt2CodexNoSuchApp", { role: "button" });
@@ -127,17 +140,21 @@ describe("control/mac-input AX targeting (darwin fallback path)", () => {
     await expect(pressAxElement("Chatgpt2CodexNoSuchApp", { role: "button", title: "Nonexistent" })).rejects.toBeInstanceOf(
       DomainError,
     );
-  });
+  }, 90_000);
 
   it("setAxValue never leaks the raw text into its error when resolution fails", async () => {
     try {
-      await setAxValue("Chatgpt2CodexNoSuchApp", { role: "textField", title: "Nonexistent" }, "super-secret-value");
+      await setAxValue("Chatgpt2CodexNoSuchApp", { role: "text field", title: "Nonexistent" }, "super-secret-value");
       throw new Error("expected setAxValue to reject");
     } catch (err) {
       expect(err).toBeInstanceOf(DomainError);
       expect(String((err as DomainError).message)).not.toContain("super-secret-value");
     }
-  });
+    // "text field" (with a space) is the real System Events class name, so this
+    // exhausts the same fallback chain as pressAxElement above rather than failing
+    // at osascript compile time the way an invalid class ("textField") would --
+    // it is the resolve path that must not leak the text, so it has to run.
+  }, 90_000);
 
   // The native `chatgpt2codex-ax` helper never exists next to source/test-run
   // files, so preflightPermissions() must honestly report that it cannot
@@ -182,7 +199,7 @@ describe("control/mac-input AX targeting (darwin fallback path)", () => {
     const result = await resolveAxElement("Chatgpt2CodexNoSuchApp", { role: "text field", title: "x" });
     expect(result.found).toBe(false);
     expect(result.reason).not.toContain("Invalid accessibility role class");
-  });
+  }, 90_000);
 });
 
 // Exercise the helper once directly so it isn't flagged as unused if the

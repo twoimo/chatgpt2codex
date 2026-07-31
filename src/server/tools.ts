@@ -29,7 +29,8 @@ import { prepareChatGptImagesApp } from "../assets/chatgpt-images-app.js";
 import { listCommands, runCommand } from "../exec/command-runner.js";
 import { runLocalShell } from "../exec/local-shell.js";
 import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
-import { addToolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
+import { addToolCallProof, toolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
+import { ActionReceiptAuthority, ACTION_RECEIPT_TTL_MS, type ActionReceiptPhase, type MutationOutcomeBinding, type MutationOutcomeStatus, type StoredActionReceipt } from "./action-receipts.js";
 import {
   captureE2eAppScreenshot,
   captureE2eAppScreenshotSet,
@@ -53,10 +54,12 @@ import {
   handleComputerRequestAction,
   handleComputerScreenshot,
 } from "../control/tools.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import path from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 
 // ---------------------------------------------------------------------------
 // Session helpers
@@ -99,6 +102,111 @@ async function currentRegistry(ctx: ToolContext): Promise<ProjectRegistryEntry[]
   const loaded = await ctx.store.loadProjects();
   ctx.registry.splice(0, ctx.registry.length, ...loaded);
   return ctx.registry;
+}
+function isStalePathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+const PROJECT_MARKER_FILES = [
+  ".git",
+  "package.json",
+  "pubspec.yaml",
+  "go.mod",
+  "Cargo.toml",
+  "requirements.txt",
+  ".chatgpt2codex",
+];
+
+async function hasStrictProjectMarker(root: string): Promise<boolean> {
+  for (const marker of PROJECT_MARKER_FILES) {
+    try {
+      await fs.access(path.join(root, marker));
+      return true;
+    } catch (error) {
+      if (!isStalePathError(error)) throw error;
+    }
+  }
+  return false;
+}
+
+async function canonicalizeRegistryEntries(entries: ProjectRegistryEntry[]): Promise<ProjectRegistryEntry[]> {
+  return Promise.all(entries.map(async (entry) => ({
+    ...entry,
+    root: await fs.realpath(entry.root),
+  })));
+}
+
+function assertUniqueRegistryIdentity(entries: ProjectRegistryEntry[]): void {
+  const projectIds = new Set<string>();
+  const roots = new Set<string>();
+  for (const entry of entries) {
+    if (projectIds.has(entry.projectId) || roots.has(entry.root)) {
+      throw new DomainError(ErrorCode.AMBIGUOUS_PROJECT, "Refreshed registry contains duplicate project identity");
+    }
+    projectIds.add(entry.projectId);
+    roots.add(entry.root);
+  }
+}
+
+async function monitorRepositoryRoots(entries: ProjectRegistryEntry[]): Promise<string[]> {
+  const roots: string[] = [];
+  for (const entry of entries) {
+    if (entry.name !== "gajae-code") continue;
+    try {
+      roots.push(await fs.realpath(entry.root));
+    } catch (error) {
+      if (!isStalePathError(error)) throw error;
+    }
+  }
+  return roots;
+}
+
+async function validRegisteredProjects(
+  ctx: ToolContext,
+  scanned: ProjectRegistryEntry[],
+  registered: ProjectRegistryEntry[],
+): Promise<ProjectRegistryEntry[]> {
+  const workspaceRoot = await fs.realpath(ctx.workspaceRoot);
+  const scannedRoots = new Set(scanned.map((entry) => entry.root));
+  const repositoryRoots = await monitorRepositoryRoots([...scanned, ...registered]);
+
+  const retained = await Promise.all(registered.map(async (entry) => {
+    if (!path.isAbsolute(entry.root)) return undefined;
+
+    let root: string;
+    try {
+      const stat = await fs.lstat(entry.root);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return undefined;
+      root = await fs.realpath(entry.root);
+    } catch (error) {
+      if (isStalePathError(error)) return undefined;
+      throw error;
+    }
+
+    const relative = path.relative(workspaceRoot, root);
+    if (relative.startsWith("..") || path.isAbsolute(relative) || scannedRoots.has(root)) return undefined;
+
+    const identity = /^pr-([1-9]\d*)-([0-9a-f]{40})$/i.exec(path.basename(root));
+    if (
+      !identity ||
+      entry.name !== path.basename(root) ||
+      entry.projectId !== entry.name.toLowerCase() ||
+      !repositoryRoots.some((repositoryRoot) =>
+        root === monitorWorktreePath(repositoryRoot, Number(identity[1]), identity[2] as string),
+      )
+    ) {
+      return undefined;
+    }
+
+    if (!(await hasStrictProjectMarker(root))) return undefined;
+    return {
+      ...entry,
+      root,
+      aliases: Array.from(new Set([...entry.aliases, root])),
+    };
+  }));
+
+  return retained.filter((entry): entry is ProjectRegistryEntry => entry !== undefined);
 }
 
 function toProject(entry: ProjectRegistryEntry): Project {
@@ -196,6 +304,17 @@ const CONTROL_ANNOTATIONS = {
 } as const;
 
 const CHATGPT_SAFETY_HIDDEN_TOOL_NAMES = new Set(["code_context_pack"]);
+const CHATGPT_READ_ONLY_ENV = "CHATGPT2CODEX_CHATGPT_READ_ONLY";
+
+function isChatGptReadOnlyMode(ctx: ToolContext): boolean {
+  if (ctx.remote !== true) return false;
+  const value = process.env[CHATGPT_READ_ONLY_ENV]?.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "on";
+}
+
+function hasReadOnlyHint(tool: RegisteredToolLike): boolean {
+  return (tool.annotations as { readOnlyHint?: unknown } | undefined)?.readOnlyHint === true;
+}
 
 const CHATGPT2CODEX_SECURITY_SCHEMES = [{ type: "oauth2", scopes: ["chatgpt2codex"] }] as const;
 const EMPTY_OBJECT_JSON_SCHEMA = {
@@ -233,19 +352,21 @@ function schemaToJsonSchema(schema: unknown, pipeStrategy: "input" | "output"): 
     : { ...EMPTY_OBJECT_JSON_SCHEMA };
 }
 
-function installChatGptToolListHandler(s: McpServer): void {
+function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): void {
   const registeredTools = (s as unknown as { _registeredTools: Record<string, RegisteredToolLike> })._registeredTools;
   s.server.setRequestHandler(ListToolsRequestSchema, () => {
     // Re-read at request time (not server-construction time) so tests/ops
     // toggling the env var take effect immediately.
     const exposeControl = isControlChatGptExposed();
+    const readOnlyMode = isChatGptReadOnlyMode(ctx);
     return {
       tools: Object.entries(registeredTools)
         .filter(
           ([name, tool]) =>
             tool.enabled !== false &&
             !CHATGPT_SAFETY_HIDDEN_TOOL_NAMES.has(name) &&
-            (exposeControl || !CONTROL_TOOL_NAMES.has(name)),
+            (exposeControl || !CONTROL_TOOL_NAMES.has(name)) &&
+            (!readOnlyMode || (!CONTROL_TOOL_NAMES.has(name) && hasReadOnlyHint(tool))),
         )
         .map(([name, tool]) => {
           const definition: Record<string, unknown> = {
@@ -325,6 +446,1210 @@ function redactUnknown(input: unknown): unknown {
 // ---------------------------------------------------------------------------
 // Lease enforcement for mutating tools
 // ---------------------------------------------------------------------------
+const execFileAsync = promisify(execFile);
+const GITHUB_PR_REPOSITORY = "Yeachan-Heo/gajae-code";
+const GITHUB_PR_AUTHOR = "twoimo";
+const SAFE_SHA = /^[0-9a-f]{40}$/i;
+const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$/;
+const SAFE_ID = /^[A-Za-z0-9_=-]{1,300}$/;
+
+function requireGithubPrIdentity(repository: string, author: string, prNumber: number): void {
+  if (repository !== GITHUB_PR_REPOSITORY || author !== GITHUB_PR_AUTHOR) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Only Yeachan-Heo/gajae-code PRs authored by twoimo are allowed");
+  }
+  if (!Number.isSafeInteger(prNumber) || prNumber < 1) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR number must be a positive integer");
+}
+
+async function githubCommand(args: string[], cwd?: string): Promise<string> {
+  const result = await execFileAsync("gh", args, { cwd, maxBuffer: 1024 * 1024 });
+  return result.stdout;
+}
+const GITHUB_PR_MONITOR_CLI_DIR = "/Users/twoimo/Library/Application Support/GajaeCodePRMonitor";
+const GITHUB_PR_MONITOR_SOURCE_DIR = `${GITHUB_PR_MONITOR_CLI_DIR}/source`;
+const GITHUB_PR_MONITOR_DATABASE = `${GITHUB_PR_MONITOR_CLI_DIR}/.gajae-pr-monitor.sqlite`;
+const MONITOR_STATE_COMMANDS = ["ingest", "plan-cycle", "record-side-effect", "reconcile", "terminal-report", "status"] as const;
+type MonitorActionOperation = "create" | "quarantine" | "post_reply" | "resolve_thread" | "rerequest_reviewer" | "push_prepared_worktree";
+
+interface MonitorActionClaim {
+  runId: string;
+  actionPlanId: string;
+  idempotencyKey: string;
+  repository: typeof GITHUB_PR_REPOSITORY;
+  prNumber: number;
+  headSha: string;
+  phase: "prepare" | "mutate";
+  operation: MonitorActionOperation;
+  operationFields: Record<string, unknown>;
+}
+
+interface MonitorActionClaimReceipt {
+  ok: true;
+  claimId: string;
+  claimedAt: string;
+  payloadDigest: string;
+  coordinationId: string;
+  claimStatus: "claimed" | "applied" | "reconciled";
+}
+
+type MonitorStateCommand = typeof MONITOR_STATE_COMMANDS[number];
+type MonitorRecoveryStage = "ingest" | "plan" | "claim" | "record" | "reconcile";
+
+interface MonitorRecoveryQuery {
+  stage: MonitorRecoveryStage;
+  runId: string;
+  coordinationId: string;
+  requestDigest: string;
+  actionPlanId?: string;
+  idempotencyKey?: string;
+  claimId?: string;
+  claimPayloadDigest?: string;
+}
+
+interface MonitorExecution {
+  response: Record<string, unknown>;
+  stdout: string;
+}
+
+const MONITOR_INPUT_BYTES = 64 * 1024;
+const MONITOR_STDOUT_BYTES = 256 * 1024;
+const MONITOR_STDERR_BYTES = 64 * 1024;
+const MONITOR_TIMEOUT_MS = 15_000;
+const MONITOR_TERM_GRACE_MS = 500;
+const MONITOR_KILL_REAP_MS = 1_500;
+const MONITOR_DIGEST = /^[0-9a-f]{64}$/;
+
+function monitorCanonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "boolean": return value ? "true" : "false";
+    case "number":
+      if (!Number.isFinite(value)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor IPC only accepts finite numbers");
+      return JSON.stringify(value);
+    case "string": return JSON.stringify(value);
+    case "undefined": throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor IPC cannot bind undefined");
+    case "object":
+      if (Array.isArray(value)) return `[${value.map(monitorCanonicalJson).join(",")}]`;
+      return `{${Object.keys(value as Record<string, unknown>).sort().map((key) =>
+        `${JSON.stringify(key)}:${monitorCanonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+    default: throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor IPC cannot bind ${typeof value}`);
+  }
+}
+
+function monitorFingerprint(value: unknown): string {
+  return createHash("sha256").update(monitorCanonicalJson(value), "utf8").digest("hex");
+}
+
+function monitorExactRecord(value: unknown, keys: readonly string[], context: string): Record<string, unknown> {
+  const record = requireRecord(value, `${context} returned a non-object JSON document`);
+  const actual = Object.keys(record).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} returned an unexpected response schema`);
+  }
+  return record;
+}
+
+function monitorBoundString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !SAFE_ID.test(value)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor response has an invalid ${name}`);
+  }
+  return value;
+}
+
+function monitorIso(value: unknown, name: string): string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor response has an invalid ${name}`);
+  }
+  return value;
+}
+
+function parseMonitorDocument(stdout: string, command: string): Record<string, unknown> {
+  const document = stdout.trim();
+  if (!document) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} returned an empty response`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(document);
+  } catch {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} did not return exactly one JSON document`);
+  }
+  return requireRecord(parsed, `Monitor ${command} returned a non-object JSON document`);
+}
+
+async function boundedMonitorProcess(command: string, input: unknown): Promise<MonitorExecution> {
+  const serialized = JSON.stringify(input ?? {});
+  if (serialized === undefined) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor IPC input is not JSON-serializable");
+  const payload = serialized;
+  if (Buffer.byteLength(payload, "utf8") > MONITOR_INPUT_BYTES) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor IPC input exceeds 64KiB");
+  }
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const child = spawn("npm", ["run", "--silent", "monitor", "--", command, "--db", GITHUB_PR_MONITOR_DATABASE], {
+      cwd: GITHUB_PR_MONITOR_SOURCE_DIR,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { PATH: process.env.PATH ?? "" },
+      detached: process.platform !== "win32",
+    });
+    const output: Buffer[] = [];
+    const errors: Buffer[] = [];
+    let outputBytes = 0;
+    let errorBytes = 0;
+    let closed = false;
+    let terminalError: DomainError | undefined;
+    let termTimer: NodeJS.Timeout | undefined;
+    let reapTimer: NodeJS.Timeout | undefined;
+
+    const clearTimers = () => {
+      clearTimeout(timeout);
+      if (termTimer) clearTimeout(termTimer);
+      if (reapTimer) clearTimeout(reapTimer);
+    };
+    const signalMonitorGroup = (signal: NodeJS.Signals) => {
+      if (process.platform !== "win32" && child.pid !== undefined) {
+        try {
+          return process.kill(-child.pid, signal);
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") return child.kill(signal);
+          return false;
+        }
+      }
+      return child.kill(signal);
+    };
+    const terminate = (error: DomainError) => {
+      if (terminalError) return;
+      terminalError = error;
+      child.stdin.destroy();
+      signalMonitorGroup("SIGTERM");
+      termTimer = setTimeout(() => {
+        if (closed) return;
+        signalMonitorGroup("SIGKILL");
+        reapTimer = setTimeout(() => {
+          if (closed) return;
+          clearTimers();
+          reject(new DomainError(ErrorCode.APPROVAL_REQUIRED, `${error.message}; monitor process reap was not confirmed`));
+        }, MONITOR_KILL_REAP_MS);
+      }, MONITOR_TERM_GRACE_MS);
+    };
+    const timeout = setTimeout(() => {
+      terminate(new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} timed out after ${MONITOR_TIMEOUT_MS}ms`));
+    }, MONITOR_TIMEOUT_MS);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputBytes += chunk.length;
+      if (outputBytes > MONITOR_STDOUT_BYTES) {
+        terminate(new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor stdout exceeded 256KiB"));
+        return;
+      }
+      output.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      errorBytes += chunk.length;
+      if (errorBytes > MONITOR_STDERR_BYTES) {
+        terminate(new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor stderr exceeded 64KiB"));
+        return;
+      }
+      errors.push(chunk);
+    });
+    child.once("error", (error) => {
+      clearTimers();
+      reject(new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} could not start: ${error.message}`));
+    });
+    child.once("close", (code, signal) => {
+      closed = true;
+      clearTimers();
+      if (terminalError) {
+        reject(new DomainError(
+          ErrorCode.APPROVAL_REQUIRED,
+          `${terminalError.message}; monitor process reaped after ${signal ?? `exit ${String(code)}`}`,
+        ));
+        return;
+      }
+      const captured = Buffer.concat(output).toString("utf8");
+      if (code === 0) resolve(captured);
+      else {
+        const detail = Buffer.concat(errors).toString("utf8").trim() || captured.trim();
+        reject(new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} failed: ${detail.slice(0, 1000)}`));
+      }
+    });
+    child.stdin.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE" && !terminalError) terminate(new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} stdin failed`));
+    });
+    child.stdin.end(payload);
+  });
+  return { response: parseMonitorDocument(stdout, command), stdout };
+}
+
+function validateRecoveryResponse(query: MonitorRecoveryQuery, value: Record<string, unknown>): Record<string, unknown> {
+  if (!MONITOR_DIGEST.test(query.requestDigest)
+    || (query.claimPayloadDigest !== undefined && !MONITOR_DIGEST.test(query.claimPayloadDigest))) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor recovery query contains an invalid digest");
+  }
+  const baseKeys = ["ok", "command", "stage", "runId", "coordinationId", "requestDigest", "committed"];
+  const actionKeys = query.stage === "claim" || query.stage === "record" || query.stage === "reconcile"
+    ? ["actionPlanId", "idempotencyKey"]
+    : [];
+  const receiptKeys = query.stage === "record" || query.stage === "reconcile"
+    ? ["claimId", "claimPayloadDigest"]
+    : [];
+  const committed = value.committed === true;
+  let committedKeys: string[] = [];
+  if (committed) {
+    committedKeys = query.stage === "ingest"
+      ? ["committedAt"]
+      : query.stage === "plan"
+        ? ["actionPlanId", "committedAt"]
+        : query.stage === "claim"
+          ? ["claimId", "claimPayloadDigest", "claimStatus", "committedAt"]
+          : ["claimStatus", "sideEffectId", "committedAt"];
+  }
+  const response = monitorExactRecord(value, [...baseKeys, ...actionKeys, ...receiptKeys, ...committedKeys], "Monitor recover");
+  if (response.ok !== true
+    || response.command !== "recover"
+    || response.stage !== query.stage
+    || response.runId !== query.runId
+    || response.coordinationId !== query.coordinationId
+    || response.requestDigest !== query.requestDigest
+    || typeof response.committed !== "boolean"
+    || (query.actionPlanId !== undefined && response.actionPlanId !== query.actionPlanId)
+    || (query.idempotencyKey !== undefined && response.idempotencyKey !== query.idempotencyKey)
+    || (query.claimId !== undefined && response.claimId !== query.claimId)
+    || (query.claimPayloadDigest !== undefined && response.claimPayloadDigest !== query.claimPayloadDigest)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor recover response did not exactly bind the recovery query");
+  }
+  if (committed) {
+    monitorIso(response.committedAt, "committedAt");
+    if (query.stage === "plan") monitorBoundString(response.actionPlanId, "actionPlanId");
+    if (query.stage === "claim") {
+      monitorBoundString(response.claimId, "claimId");
+      if (response.claimPayloadDigest !== query.requestDigest) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor recovered claim digest does not bind the exact request");
+      }
+    }
+    const allowedClaimStatuses = query.stage === "claim"
+      ? ["claimed", "applied", "reconciled"]
+      : query.stage === "record"
+        ? ["applied", "reconciled"]
+        : query.stage === "reconcile"
+          ? ["reconciled"]
+          : undefined;
+    if (allowedClaimStatuses && !allowedClaimStatuses.includes(String(response.claimStatus))) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor recover response has an invalid claimStatus");
+    }
+    if ((query.stage === "record" || query.stage === "reconcile")) monitorBoundString(response.sideEffectId, "sideEffectId");
+  }
+  return response;
+}
+
+async function recoverMonitorTransition(query: MonitorRecoveryQuery): Promise<MonitorExecution> {
+  const execution = await boundedMonitorProcess("recover", query);
+  validateRecoveryResponse(query, execution.response);
+  return execution;
+}
+
+function validateClaimResponse(
+  input: MonitorActionClaim,
+  coordinationId: string,
+  value: Record<string, unknown>,
+): MonitorActionClaimReceipt {
+  const claim = monitorExactRecord(
+    value,
+    ["command", "ok", "claimId", "claimedAt", "payloadDigest", "runId", "coordinationId", "actionPlanId", "idempotencyKey"],
+    "Monitor claim-action",
+  );
+  const expectedPayloadDigest = monitorFingerprint(input);
+  if (claim.command !== "claim-action"
+    || claim.ok !== true
+    || claim.runId !== input.runId
+    || claim.coordinationId !== coordinationId
+    || claim.actionPlanId !== input.actionPlanId
+    || claim.idempotencyKey !== input.idempotencyKey
+    || claim.payloadDigest !== expectedPayloadDigest) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor action claim was not durably granted with exact run, coordination, plan, idempotency, and payload bindings");
+  }
+  return {
+    ok: true,
+    claimId: monitorBoundString(claim.claimId, "claimId"),
+    claimedAt: monitorIso(claim.claimedAt, "claimedAt"),
+    payloadDigest: expectedPayloadDigest,
+    coordinationId,
+    claimStatus: "claimed",
+  };
+}
+
+async function claimMonitorAction(ctx: ToolContext, input: MonitorActionClaim): Promise<MonitorActionClaimReceipt> {
+  const { coordinationId } = await receiptAuthority(ctx).planBinding(input.runId, input.actionPlanId);
+  const requestDigest = monitorFingerprint(input);
+  const recoveryQuery: MonitorRecoveryQuery = {
+    stage: "claim",
+    runId: input.runId,
+    coordinationId,
+    requestDigest,
+    actionPlanId: input.actionPlanId,
+    idempotencyKey: input.idempotencyKey,
+  };
+  const recover = async (): Promise<MonitorActionClaimReceipt | undefined> => {
+    const recovered = await recoverMonitorTransition(recoveryQuery);
+    if (recovered.response.committed !== true) return undefined;
+    return {
+      ok: true,
+      claimId: monitorBoundString(recovered.response.claimId, "claimId"),
+      claimedAt: monitorIso(recovered.response.committedAt, "committedAt"),
+      payloadDigest: requestDigest,
+      coordinationId,
+      claimStatus: recovered.response.claimStatus as "claimed" | "applied" | "reconciled",
+    };
+  };
+  const existing = await recover();
+  if (existing) return existing;
+  try {
+    const execution = await boundedMonitorProcess("claim-action", input);
+    return validateClaimResponse(input, coordinationId, execution.response);
+  } catch (error: unknown) {
+    const recovered = await recover();
+    if (recovered) return recovered;
+    throw error;
+  }
+}
+
+function readReceiptCoordination(input: Record<string, unknown>): string {
+  const readReceipt = requireRecord(input.readReceipt, "Monitor state input omitted its durable read receipt");
+  const structured = requireRecord(readReceipt.structuredContent, "Monitor read receipt omitted structured content");
+  return monitorBoundString(structured.actionPlanId, "coordinationId");
+}
+
+function validateMonitorStateResponse(
+  command: MonitorStateCommand,
+  input: Record<string, unknown>,
+  value: Record<string, unknown>,
+  expectedCoordinationId?: string,
+  expectedRunId?: string,
+): Record<string, unknown> {
+  if (command === "status") {
+    const response = monitorExactRecord(value, ["ok", "command", "result"], "Monitor status");
+    if (response.ok !== true || response.command !== command) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor status response is not bound to status");
+    return response;
+  }
+  if (command === "terminal-report") {
+    const response = monitorExactRecord(value, ["command", "proof", "ok", "runId", "actionPlanId", "status"], "Monitor terminal-report");
+    if (response.command !== command
+      || response.proof !== "ChatGPT_To_Codex"
+      || response.ok !== true
+      || response.runId !== input.runId
+      || response.actionPlanId !== input.actionPlanId) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor terminal-report response did not exactly bind the request");
+    }
+    return response;
+  }
+  const keys = command === "plan-cycle"
+    ? ["ok", "command", "runId", "coordinationId", "actionPlanId", "requestDigest", "result"]
+    : command === "record-side-effect"
+      ? ["ok", "command", "runId", "coordinationId", "actionPlanId", "idempotencyKey", "claimId", "claimPayloadDigest", "requestDigest", "result"]
+      : command === "reconcile"
+        ? ["ok", "command", "runId", "coordinationId", "actionPlanId", "idempotencyKey", "requestDigest", "result"]
+        : ["ok", "command", "runId", "coordinationId", "requestDigest", "result"];
+  const response = monitorExactRecord(value, keys, `Monitor ${command}`);
+  const reconciliationReceipt = command === "reconcile"
+    ? requireRecord(
+        requireRecord(
+          Array.isArray(input.evidence) ? input.evidence[0] : undefined,
+          "Monitor reconcile omitted evidence",
+        ).structuredContent,
+        "Monitor reconcile evidence omitted structured content",
+      )
+    : undefined;
+  const coordinationId = expectedCoordinationId ?? readReceiptCoordination(input);
+  const boundRunId = reconciliationReceipt?.runId ?? expectedRunId ?? input.runId;
+  if (response.ok !== true
+    || response.command !== command
+    || response.runId !== boundRunId
+    || response.coordinationId !== coordinationId
+    || response.requestDigest !== monitorFingerprint(input)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} response did not exactly bind its run, coordination, and request digest`);
+  }
+  if (command === "plan-cycle") {
+    const result = requireRecord(response.result, "Monitor plan-cycle omitted its result");
+    if (monitorBoundString(response.actionPlanId, "actionPlanId") !== result.actionPlanId) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor plan-cycle response did not bind its generated action plan");
+    }
+  }
+  if (command === "record-side-effect") {
+    if (response.actionPlanId !== input.actionPlanId
+      || response.idempotencyKey !== input.idempotencyKey
+      || response.claimId !== input.claimId
+      || response.claimPayloadDigest !== input.payloadDigest) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor record response did not exactly bind its plan, idempotency key, and claim");
+    }
+  }
+  if (command === "reconcile") {
+    if (response.actionPlanId !== reconciliationReceipt?.actionPlanId || response.idempotencyKey !== reconciliationReceipt?.idempotencyKey) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor reconcile response did not exactly bind its plan and idempotency key");
+    }
+  }
+  return response;
+}
+
+async function runMonitorState(
+  command: MonitorStateCommand,
+  input: Record<string, unknown>,
+  expectedCoordinationId?: string,
+  expectedRunId?: string,
+): Promise<MonitorExecution> {
+  const execution = await boundedMonitorProcess(command, input);
+  validateMonitorStateResponse(command, input, execution.response, expectedCoordinationId, expectedRunId);
+  return execution;
+}
+async function requireGithubAuthenticatedAuthor(): Promise<void> {
+  const user = JSON.parse(await githubCommand(["api", "user"])) as { login?: string };
+  if (user.login !== GITHUB_PR_AUTHOR) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "GitHub authentication must be the fixed author twoimo");
+  }
+}
+
+function parseGithubGraphql(stdout: string, context: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} returned malformed GraphQL JSON`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} returned an invalid GraphQL response`);
+  }
+  const response = parsed as Record<string, unknown>;
+  if (response.errors !== undefined && (!Array.isArray(response.errors) || response.errors.length > 0)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} returned GraphQL errors`);
+  }
+  return response;
+}
+
+function requireRecord(value: unknown, message: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, message);
+  }
+  return value as Record<string, unknown>;
+}
+
+function parseGithubRestRecord(stdout: string, context: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} returned malformed JSON`);
+  }
+  return requireRecord(parsed, `${context} returned an invalid response`);
+}
+
+function requireReviewerFromSnapshot(snapshot: Record<string, unknown>, reviewer: string): void {
+  if (!Array.isArray(snapshot.reviewRequests) || !Array.isArray(snapshot.reviews)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot omitted reviewer eligibility data");
+  }
+  const isCurrentRequest = snapshot.reviewRequests.some((value) => {
+    const request = requireRecord(value, "Current PR snapshot returned an invalid review request");
+    return request.login === reviewer;
+  });
+  const isPreviousReviewer = snapshot.reviews.some((value) => {
+    const review = requireRecord(value, "Current PR snapshot returned an invalid review");
+    if (review.author === null || review.author === undefined) return false;
+    return requireRecord(review.author, "Current PR snapshot returned an invalid review author").login === reviewer;
+  });
+  if (!isCurrentRequest && !isPreviousReviewer) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "rerequest_reviewer requires a current request or reviewer from the current fixed PR snapshot");
+  }
+}
+
+async function githubReviewThreads(prNumber: number): Promise<{ nodes: Array<Record<string, unknown>>; pageInfo: { hasNextPage: false; endCursor: null } }> {
+  const nodes: Array<Record<string, unknown>> = [];
+  const seenIds = new Set<string>();
+  let endCursor: string | undefined;
+  for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+    const args = [
+      "api", "graphql",
+      "-f", "query=query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){nodes{id isResolved comments(first:100){nodes{id databaseId body author{login} path line} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}",
+      "-f", "owner=Yeachan-Heo", "-f", "repo=gajae-code", "-F", `number=${prNumber}`,
+      ...(endCursor === undefined ? [] : ["-f", `endCursor=${endCursor}`]),
+    ];
+    const response = parseGithubGraphql(await githubCommand(args), "Review-thread query");
+    const data = requireRecord(response.data, "Review-thread query omitted data");
+    const repository = requireRecord(data.repository, "Review-thread query omitted repository");
+    const pullRequest = requireRecord(repository.pullRequest, "Review-thread query omitted pullRequest");
+    const reviewThreads = requireRecord(pullRequest.reviewThreads, "Review-thread query omitted reviewThreads");
+    if (!Array.isArray(reviewThreads.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread query returned invalid nodes");
+    const pageInfo = requireRecord(reviewThreads.pageInfo, "Review-thread query omitted pagination");
+    if (typeof pageInfo.hasNextPage !== "boolean") throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread query returned invalid pagination");
+
+    for (const value of reviewThreads.nodes) {
+      const thread = requireRecord(value, "Review-thread query returned an invalid thread");
+      if (typeof thread.id !== "string" || typeof thread.isResolved !== "boolean" || seenIds.has(thread.id)) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread query returned an invalid or duplicate thread");
+      }
+      const comments = requireRecord(thread.comments, "Review-thread query omitted thread comments");
+      if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread query returned invalid comments");
+      const commentPageInfo = requireRecord(comments.pageInfo, "Review-thread query omitted comment pagination");
+      if (typeof commentPageInfo.hasNextPage !== "boolean" || commentPageInfo.hasNextPage) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread comments were not completely paginated");
+      }
+      seenIds.add(thread.id);
+      nodes.push(thread);
+    }
+
+    if (!pageInfo.hasNextPage) return { nodes, pageInfo: { hasNextPage: false, endCursor: null } };
+    if (typeof pageInfo.endCursor !== "string" || !pageInfo.endCursor || pageInfo.endCursor === endCursor) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread pagination did not provide a fresh cursor");
+    }
+    endCursor = pageInfo.endCursor;
+  }
+  throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread pagination exceeded the safe page limit");
+}
+
+async function githubPrSnapshot(prNumber: number): Promise<Record<string, unknown>> {
+  const stdout = await githubCommand([
+    "pr", "view", String(prNumber), "--repo", GITHUB_PR_REPOSITORY, "--json",
+    "number,url,state,author,headRefName,headRefOid,reviewRequests,reviews,comments,latestReviews,statusCheckRollup",
+  ]);
+  const snapshot = JSON.parse(stdout) as Record<string, unknown>;
+  if (snapshot.state !== "OPEN" || (snapshot.author as { login?: string } | undefined)?.login !== GITHUB_PR_AUTHOR) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR is not an open PR authored by twoimo");
+  }
+  snapshot.reviewThreads = await githubReviewThreads(prNumber);
+  return snapshot;
+}
+async function githubOpenAuthoredPrNumbers(): Promise<number[]> {
+  const listed = JSON.parse(await githubCommand([
+    "pr", "list", "--repo", GITHUB_PR_REPOSITORY, "--author", GITHUB_PR_AUTHOR,
+    "--state", "open", "--limit", "1000", "--json", "number",
+  ])) as unknown;
+  if (!Array.isArray(listed) || listed.length >= 1000) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Open PR listing was invalid or may be incompletely paginated");
+  }
+  const numbers = listed.map((value) => {
+    const record = requireRecord(value, "Open PR listing returned an invalid entry");
+    if (typeof record.number !== "number" || !Number.isSafeInteger(record.number) || record.number < 1) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Open PR listing returned an invalid PR number");
+    }
+    return Number(record.number);
+  });
+  if (new Set(numbers).size !== numbers.length) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Open PR listing returned duplicate PRs");
+  return numbers;
+}
+const GITHUB_PR_MONITOR_DIR = "gajae-code-pr-monitor-pr-worktrees";
+const GITHUB_PR_MONITOR_REPO_DIR = "Yeachan-Heo--gajae-code";
+
+function githubRepositoryRemoteIsAllowed(remote: string): boolean {
+  return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)Yeachan-Heo\/gajae-code(?:\.git)?\s*$/.test(remote.trim());
+}
+
+function githubForkRemoteIsAllowed(remote: string): boolean {
+  return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)twoimo\/gajae-code(?:\.git)?\s*$/.test(remote.trim());
+}
+
+function safeMonitorHeadRef(headRef: string): boolean {
+  return SAFE_REF.test(headRef) && !headRef.startsWith("-") && !headRef.includes("..");
+}
+
+interface IssuedActionReceipt {
+  structured: Record<string, unknown>;
+  input: Record<string, unknown>;
+  text: string;
+  issuedAt: number;
+}
+
+interface IssuedVerificationReceipt extends IssuedActionReceipt {
+  projectId: string;
+  commandId: string;
+  riskTier: "verify";
+  args: string[];
+  headSha: string;
+  treeSha: string;
+  phase: ActionReceiptPhase;
+}
+
+interface ReceiptLifecycleClaim {
+  receiptId: string;
+  kind: "monitor-read" | "monitor-action";
+  pending: ActionReceiptPhase;
+  rollback: ActionReceiptPhase;
+  success: ActionReceiptPhase;
+  recovery: MonitorRecoveryQuery;
+}
+
+interface PreparedMonitorState {
+  lifecycle: ReceiptLifecycleClaim;
+  stateInput: Record<string, unknown>;
+  actionResponse: unknown;
+  coordinationId: string;
+  recovered?: MonitorExecution;
+}
+
+function receiptAuthority(ctx: ToolContext): ActionReceiptAuthority {
+  return new ActionReceiptAuthority(ctx.stateDir);
+}
+
+function expectedActionResponse(tool: string, issued: IssuedActionReceipt): Record<string, unknown> {
+  return {
+    ok: true,
+    tool,
+    toolCall: {
+      ...toolCallProof(tool, true),
+      toolName: tool,
+      input: issued.input,
+    },
+    text: issued.text,
+    imageMarkdownList: [],
+    structuredContent: addToolCallProof(issued.structured, tool, true),
+  };
+}
+
+async function issueActionReceipt(
+  ctx: ToolContext,
+  kind: "verification" | "monitor-read" | "monitor-action",
+  tool: string,
+  receiptId: string,
+  issued: IssuedActionReceipt,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  await receiptAuthority(ctx).issue({
+    receiptId,
+    kind,
+    response: expectedActionResponse(tool, issued),
+    input: issued.input,
+    issuedAt: issued.issuedAt,
+    metadata,
+  });
+}
+
+function monitorMutationOutcomeBinding(
+  input: Record<string, unknown> & {
+    runId: string;
+    actionPlanId: string;
+    idempotencyKey: string;
+    eventId: string;
+    prNumber: number;
+    expectedHeadSha: string;
+    operation: MonitorActionOperation;
+  },
+  phase: "prepare" | "mutate",
+  operationFields: Record<string, unknown>,
+  claim: MonitorActionClaimReceipt,
+): MutationOutcomeBinding {
+  return {
+    runId: input.runId,
+    coordinationId: claim.coordinationId,
+    actionPlanId: input.actionPlanId,
+    idempotencyKey: input.idempotencyKey,
+    claimId: claim.claimId,
+    claimPayloadDigest: claim.payloadDigest,
+    repository: GITHUB_PR_REPOSITORY,
+    author: GITHUB_PR_AUTHOR,
+    prNumber: input.prNumber,
+    expectedHeadSha: input.expectedHeadSha.toLowerCase(),
+    eventId: input.eventId,
+    phase,
+    operation: input.operation,
+    operationFields: structuredClone(operationFields),
+    input: structuredClone(input),
+  };
+}
+
+function toolResultFromDurableActionResponse(
+  tool: "github_pr_monitor_prepare" | "github_pr_monitor_mutate",
+  response: Record<string, unknown>,
+): ToolResult<Record<string, unknown>> {
+  const structured = requireRecord(response.structuredContent, "Durable Action outcome omitted structured content");
+  if (response.ok !== true || response.tool !== tool || typeof response.text !== "string") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Durable Action outcome is not the exact successful tool response");
+  }
+  return makeResult(structured, response.text);
+}
+
+type DurableMutationInspection =
+  | Extract<MutationOutcomeStatus, { state: "intent" }>
+  | { state: "completed"; result: ToolResult<Record<string, unknown>> };
+
+async function inspectDurableMutationOutcome(
+  ctx: ToolContext,
+  tool: "github_pr_monitor_prepare" | "github_pr_monitor_mutate",
+  binding: MutationOutcomeBinding,
+  claimStatus: MonitorActionClaimReceipt["claimStatus"],
+): Promise<DurableMutationInspection | undefined> {
+  const authority = receiptAuthority(ctx);
+  const status = await authority.mutationOutcomeStatus(binding, claimStatus);
+  if (!status) return undefined;
+  if (status.state === "intent") return status;
+  const materialized = await authority.materializeMutationOutcome(binding);
+  return { state: "completed", result: toolResultFromDurableActionResponse(tool, materialized.response) };
+}
+
+async function persistDurableMutationOutcome(
+  ctx: ToolContext,
+  binding: MutationOutcomeBinding,
+  outcomeKey: string,
+  tool: "github_pr_monitor_prepare" | "github_pr_monitor_mutate",
+  receiptId: string,
+  issued: IssuedActionReceipt,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  const authority = receiptAuthority(ctx);
+  await authority.completeMutationOutcome(outcomeKey, binding, {
+    response: expectedActionResponse(tool, issued),
+    receiptId,
+    issuedAt: issued.issuedAt,
+    metadata,
+  });
+  await authority.materializeMutationOutcome(binding);
+}
+
+function receiptIdFromActionResponse(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const structured = (value as Record<string, unknown>).structuredContent;
+  if (!structured || typeof structured !== "object" || Array.isArray(structured)) return undefined;
+  const receiptId = (structured as Record<string, unknown>).receiptId;
+  return typeof receiptId === "string" ? receiptId : undefined;
+}
+
+async function beginReceiptLifecycle(
+  ctx: ToolContext,
+  lifecycle: ReceiptLifecycleClaim,
+  actionResponse: unknown,
+  currentPhase: ActionReceiptPhase,
+): Promise<MonitorExecution | undefined> {
+  const authority = receiptAuthority(ctx);
+  if (currentPhase === lifecycle.pending) {
+    const pending = await authority.exact(lifecycle.receiptId, lifecycle.kind, actionResponse, [lifecycle.pending]);
+    if (pending.metadata.recovery === undefined) {
+      await authority.transitionExact(
+        lifecycle.receiptId,
+        lifecycle.kind,
+        actionResponse,
+        [lifecycle.pending],
+        lifecycle.pending,
+        { recovery: structuredClone(lifecycle.recovery) },
+      );
+    } else if (monitorCanonicalJson(pending.metadata.recovery) !== monitorCanonicalJson(lifecycle.recovery)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending Action receipt does not exactly bind the monitor recovery query");
+    }
+    const recovered = await recoverMonitorTransition(lifecycle.recovery);
+    if (recovered.response.committed === true) {
+      await authority.transitionExact(
+        lifecycle.receiptId,
+        lifecycle.kind,
+        actionResponse,
+        [lifecycle.pending],
+        lifecycle.success,
+        {
+          recoveryResult: structuredClone(recovered.response),
+          ...(lifecycle.recovery.stage === "plan"
+            ? {
+                monitorActionPlanId: recovered.response.actionPlanId,
+                coordinationId: recovered.response.coordinationId,
+                requestDigest: recovered.response.requestDigest,
+              }
+            : {}),
+        },
+      );
+      return recovered;
+    }
+    await authority.transitionExact(lifecycle.receiptId, lifecycle.kind, actionResponse, [lifecycle.pending], lifecycle.rollback);
+  }
+  await authority.transitionExact(
+    lifecycle.receiptId,
+    lifecycle.kind,
+    actionResponse,
+    [lifecycle.rollback],
+    lifecycle.pending,
+    { recovery: structuredClone(lifecycle.recovery) },
+  );
+  return undefined;
+}
+
+async function claimIssuedMonitorActionReceipt(
+  ctx: ToolContext,
+  value: unknown,
+  command: "record-side-effect" | "reconcile",
+  envelope: { runId: string; actionPlanId: string; idempotencyKey: string; eventId: string },
+): Promise<PreparedMonitorState> {
+  const receiptId = receiptIdFromActionResponse(value);
+  if (!receiptId) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${command} requires an exact server-issued Action receipt`);
+  const rollback: ActionReceiptPhase = command === "record-side-effect" ? "issued" : "recorded";
+  const pending: ActionReceiptPhase = command === "record-side-effect" ? "record-pending" : "reconcile-pending";
+  const success: ActionReceiptPhase = command === "record-side-effect" ? "recorded" : "consumed";
+  const stored = await receiptAuthority(ctx).exact(receiptId, "monitor-action", value, [rollback, pending]);
+  const structured = requireRecord(stored.response.structuredContent, "Action receipt omitted structured content");
+  const claim = requireRecord(stored.metadata.claim, "Action receipt omitted its durable claim");
+  const bindingIsExact = structured.repository === GITHUB_PR_REPOSITORY
+    && structured.author === GITHUB_PR_AUTHOR
+    && stored.metadata.runId === structured.runId
+    && stored.metadata.actionPlanId === structured.actionPlanId
+    && stored.metadata.idempotencyKey === structured.idempotencyKey
+    && structured.runId === envelope.runId
+    && structured.actionPlanId === envelope.actionPlanId
+    && structured.idempotencyKey === envelope.idempotencyKey
+    && structured.eventId === envelope.eventId
+    && claim.ok === true
+    && claim.claimId === structured.claimId
+    && claim.claimedAt === structured.claimedAt
+    && claim.payloadDigest === structured.payloadDigest
+    && typeof claim.coordinationId === "string";
+  if (!bindingIsExact) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Action receipt claim binding is incomplete or corrupt");
+  }
+  const stateInput = command === "record-side-effect"
+    ? {
+        id: monitorBoundString(structured.receiptId, "receiptId"),
+        kind: monitorBoundString(structured.operation, "operation"),
+        idempotencyKey: monitorBoundString(structured.idempotencyKey, "idempotencyKey"),
+        actionPlanId: monitorBoundString(structured.actionPlanId, "actionPlanId"),
+        expectedHead: monitorBoundString(structured.expectedHeadSha, "expectedHeadSha"),
+        claimId: monitorBoundString(structured.claimId, "claimId"),
+        payloadDigest: String(structured.payloadDigest),
+        payload: { receiptId: structured.receiptId },
+      }
+    : { evidence: [value] };
+  if (!MONITOR_DIGEST.test(String(structured.payloadDigest))) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Action receipt has an invalid durable claim payload digest");
+  }
+  const recovery: MonitorRecoveryQuery = {
+    stage: command === "record-side-effect" ? "record" : "reconcile",
+    runId: envelope.runId,
+    coordinationId: monitorBoundString(claim.coordinationId, "coordinationId"),
+    requestDigest: monitorFingerprint(stateInput),
+    actionPlanId: envelope.actionPlanId,
+    idempotencyKey: envelope.idempotencyKey,
+    claimId: monitorBoundString(structured.claimId, "claimId"),
+    claimPayloadDigest: String(structured.payloadDigest),
+  };
+  const lifecycle = { receiptId, kind: "monitor-action" as const, pending, rollback, success, recovery };
+  const recovered = await beginReceiptLifecycle(ctx, lifecycle, value, stored.phase);
+  return { lifecycle, stateInput, actionResponse: value, coordinationId: recovery.coordinationId, ...(recovered ? { recovered } : {}) };
+}
+
+async function claimIssuedMonitorReadReceipt(
+  ctx: ToolContext,
+  value: unknown,
+  command: "ingest" | "plan-cycle",
+  runId: string,
+  actionPlanId: string,
+  requested: Record<string, unknown>,
+): Promise<PreparedMonitorState> {
+  const receiptId = receiptIdFromActionResponse(value);
+  if (!receiptId) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${command} requires an exact server-issued read receipt`);
+  const rollback: ActionReceiptPhase = command === "ingest" ? "issued" : "ingested";
+  const pending: ActionReceiptPhase = command === "ingest" ? "ingest-pending" : "plan-pending";
+  const success: ActionReceiptPhase = command === "ingest" ? "ingested" : "consumed";
+  const stored = await receiptAuthority(ctx).exact(receiptId, "monitor-read", value, [rollback, pending]);
+  if (stored.metadata.runId !== runId || stored.metadata.actionPlanId !== actionPlanId) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${command} receipt does not bind the same run and action plan`);
+  }
+  const readRequest = { ...requested };
+  delete readRequest.receipt;
+  const stateInput = command === "ingest"
+    ? { runId, actionPlanId, readReceipt: value }
+    : { ...readRequest, runId, actionPlanId, readReceipt: value };
+  const coordinationId = readReceiptCoordination(stateInput);
+  if (coordinationId !== actionPlanId) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${command} receipt coordination does not bind the state envelope`);
+  }
+  const recovery: MonitorRecoveryQuery = {
+    stage: command === "ingest" ? "ingest" : "plan",
+    runId,
+    coordinationId,
+    requestDigest: monitorFingerprint(stateInput),
+  };
+  const lifecycle = { receiptId, kind: "monitor-read" as const, pending, rollback, success, recovery };
+  const recovered = await beginReceiptLifecycle(ctx, lifecycle, value, stored.phase);
+  return { lifecycle, stateInput, actionResponse: value, coordinationId, ...(recovered ? { recovered } : {}) };
+}
+
+async function finishReceiptLifecycle(
+  ctx: ToolContext,
+  prepared: PreparedMonitorState,
+  succeeded: boolean,
+  monitorResponse?: Record<string, unknown>,
+): Promise<void> {
+  const metadata = succeeded && monitorResponse
+    ? {
+        recoveryResult: structuredClone(monitorResponse),
+        ...(prepared.lifecycle.recovery.stage === "plan"
+          ? {
+              monitorActionPlanId: monitorResponse.actionPlanId,
+              coordinationId: monitorResponse.coordinationId,
+              requestDigest: monitorResponse.requestDigest,
+            }
+          : {}),
+      }
+    : undefined;
+  await receiptAuthority(ctx).transitionExact(
+    prepared.lifecycle.receiptId,
+    prepared.lifecycle.kind,
+    prepared.actionResponse,
+    [prepared.lifecycle.pending],
+    succeeded ? prepared.lifecycle.success : prepared.lifecycle.rollback,
+    metadata,
+  );
+}
+
+async function recoverFailedReceiptLifecycle(
+  ctx: ToolContext,
+  prepared: PreparedMonitorState,
+): Promise<MonitorExecution | undefined> {
+  const recovered = await recoverMonitorTransition(prepared.lifecycle.recovery);
+  if (recovered.response.committed !== true) {
+    await finishReceiptLifecycle(ctx, prepared, false);
+    return undefined;
+  }
+  await finishReceiptLifecycle(ctx, prepared, true, recovered.response);
+  return recovered;
+}
+
+async function successfulVerificationReceipt(
+  ctx: ToolContext,
+  value: unknown,
+  expectedProjectId: string,
+  phases: readonly ActionReceiptPhase[] = ["issued"],
+  expectedPushBinding?: Record<string, unknown>,
+): Promise<IssuedVerificationReceipt | undefined> {
+  const receiptId = receiptIdFromActionResponse(value);
+  if (!receiptId) return undefined;
+  let stored: StoredActionReceipt;
+  try {
+    stored = await receiptAuthority(ctx).exact(receiptId, "verification", value, phases);
+  } catch (error: unknown) {
+    if (error instanceof DomainError && error.message === "Action receipt is corrupt, stale, replayed, or not the exact issued response") return undefined;
+    throw error;
+  }
+  const structured = requireRecord(stored.response.structuredContent, "Verification receipt omitted structured content");
+  const metadata = stored.metadata;
+  if (metadata.projectId !== expectedProjectId
+    || metadata.riskTier !== "verify"
+    || structured.exitCode !== 0
+    || structured.riskTier !== "verify"
+    || typeof metadata.commandId !== "string"
+    || !Array.isArray(metadata.args)
+    || !metadata.args.every((arg) => typeof arg === "string")
+    || typeof metadata.headSha !== "string"
+    || typeof metadata.treeSha !== "string"
+    || (stored.phase === "consumed" && (
+      !expectedPushBinding
+      || monitorCanonicalJson(metadata.pushBinding) !== monitorCanonicalJson(expectedPushBinding)
+    ))) return undefined;
+  return {
+    structured,
+    input: requireRecord(requireRecord(stored.response.toolCall, "Verification receipt omitted toolCall").input, "Verification receipt omitted toolCall input"),
+    text: String(stored.response.text),
+    issuedAt: stored.issuedAt,
+    projectId: expectedProjectId,
+    commandId: metadata.commandId,
+    riskTier: "verify",
+    args: metadata.args as string[],
+    headSha: metadata.headSha,
+    treeSha: metadata.treeSha,
+    phase: stored.phase,
+  };
+}
+
+function monitorWorktreePath(repositoryRoot: string, prNumber: number, headSha: string): string {
+  return path.join(path.dirname(path.resolve(repositoryRoot)), GITHUB_PR_MONITOR_DIR, GITHUB_PR_MONITOR_REPO_DIR, `pr-${prNumber}-${headSha.toLowerCase()}`);
+}
+
+function pushVerificationBinding(input: {
+  runId: string;
+  actionPlanId: string;
+  idempotencyKey: string;
+  eventId: string;
+  repository: string;
+  prNumber: number;
+  expectedHeadSha: string;
+  worktreePath: string;
+  headRef: string;
+}): Record<string, unknown> {
+  return {
+    runId: input.runId,
+    actionPlanId: input.actionPlanId,
+    idempotencyKey: input.idempotencyKey,
+    eventId: input.eventId,
+    repository: input.repository,
+    prNumber: input.prNumber,
+    expectedHeadSha: input.expectedHeadSha.toLowerCase(),
+    worktreePath: input.worktreePath,
+    headRef: input.headRef,
+    outcome: "push_prepared_worktree",
+  };
+}
+
+function monitorReceiptId(input: Record<string, unknown>): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+async function gitOutput(cwd: string, args: string[]): Promise<string> {
+  const result = await execFileAsync("git", ["-C", cwd, ...args], { maxBuffer: 1024 * 1024 });
+  return result.stdout;
+}
+async function verificationGitIdentity(cwd: string): Promise<{ headSha: string; treeSha: string } | undefined> {
+  try {
+    const [head, tree] = await Promise.all([
+      gitOutput(cwd, ["rev-parse", "HEAD"]),
+      gitOutput(cwd, ["rev-parse", "HEAD^{tree}"]),
+    ]);
+    const headSha = head.trim().toLowerCase();
+    const treeSha = tree.trim().toLowerCase();
+    return SAFE_SHA.test(headSha) && SAFE_SHA.test(treeSha) ? { headSha, treeSha } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function registeredMonitorRepository(ctx: ToolContext): ProjectRegistryEntry {
+  const matches = ctx.registry.filter((entry) => entry.name === "gajae-code");
+  const match = matches[0];
+  if (matches.length !== 1 || !match) throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, "Registry must contain exactly one gajae-code checkout");
+  return match;
+}
+
+async function resolveMonitorRepository(ctx: ToolContext): Promise<string> {
+  const matches = (await currentRegistry(ctx)).filter((entry) => entry.name === "gajae-code");
+  if (matches.length !== 1) throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, "Registry must contain exactly one gajae-code checkout");
+  const match = matches[0];
+  if (!match) throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, "Registry must contain exactly one gajae-code checkout");
+  const repositoryRoot = await fs.realpath(match.root);
+  const stat = await fs.lstat(repositoryRoot);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Registry gajae-code checkout must be a real directory");
+  const [origin, upstream] = await Promise.all([
+    gitOutput(repositoryRoot, ["remote", "get-url", "origin"]),
+    gitOutput(repositoryRoot, ["remote", "get-url", "upstream"]),
+  ]);
+  if (!githubForkRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Registry checkout must use twoimo/gajae-code origin and Yeachan-Heo/gajae-code upstream");
+  }
+  return repositoryRoot;
+}
+
+async function assertMonitorWorktreePath(worktreePath: string): Promise<void> {
+  const stat = await fs.lstat(worktreePath);
+  if (stat.isSymbolicLink() || !stat.isDirectory() || await fs.realpath(worktreePath) !== worktreePath) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor worktree path must be a real directory");
+  }
+}
+async function ensureMonitorParentTopology(repositoryRoot: string, monitorRoot: string, createMissing: boolean): Promise<void> {
+  const trustedParent = path.dirname(path.resolve(repositoryRoot));
+  const relative = path.relative(trustedParent, path.resolve(monitorRoot));
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor worktree parent escapes the repository parent");
+  }
+  const trustedStat = await fs.lstat(trustedParent);
+  if (trustedStat.isSymbolicLink() || !trustedStat.isDirectory()) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor worktree parent must be a real directory");
+  }
+
+  let current = trustedParent;
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment);
+    try {
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor worktree parent topology contains a symlink or non-directory");
+      }
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (!createMissing) return;
+      try {
+        await fs.mkdir(current);
+      } catch (mkdirError: unknown) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+      }
+      const createdStat = await fs.lstat(current);
+      if (createdStat.isSymbolicLink() || !createdStat.isDirectory()) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor worktree parent topology changed during creation");
+      }
+    }
+  }
+}
+
+async function assertCleanMonitorWorktree(worktreePath: string, expectedHeadSha: string): Promise<void> {
+  const [topLevel, origin, upstream, status, head] = await Promise.all([
+    gitOutput(worktreePath, ["rev-parse", "--show-toplevel"]),
+    gitOutput(worktreePath, ["remote", "get-url", "origin"]),
+    gitOutput(worktreePath, ["remote", "get-url", "upstream"]),
+    gitOutput(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
+    gitOutput(worktreePath, ["rev-parse", "HEAD"]),
+  ]);
+  if (path.resolve(topLevel.trim()) !== worktreePath || !githubForkRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream) || head.trim().toLowerCase() !== expectedHeadSha.toLowerCase() || status.trim()) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Existing monitor worktree is not clean, exact, or fixed-remote");
+  }
+}
+
+async function localGitObjectExists(repositoryRoot: string, sha: string): Promise<boolean> {
+  try {
+    await gitOutput(repositoryRoot, ["cat-file", "-e", `${sha}^{commit}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type MonitorWorktreeQuarantine =
+  | { quarantinedPath: string; alreadyAbsent?: never }
+  | { quarantinedPath?: never; alreadyAbsent: true };
+
+async function quarantineMonitorWorktree(
+  worktreePath: string,
+  quarantinedPath = `${worktreePath}.quarantine-${Date.now()}`,
+): Promise<MonitorWorktreeQuarantine> {
+  try {
+    await fs.lstat(worktreePath);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { alreadyAbsent: true };
+    throw error;
+  }
+  await assertMonitorWorktreePath(worktreePath);
+  try {
+    await fs.lstat(quarantinedPath);
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Exact monitor quarantine destination already exists");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await fs.rename(worktreePath, quarantinedPath);
+  return { quarantinedPath };
+}
+
+async function prepareMonitorWorktree(
+  repositoryRoot: string,
+  prNumber: number,
+  expectedHeadSha: string,
+  operation: "create" | "quarantine",
+  quarantineIdentity?: string,
+): Promise<{ worktreePath: string; quarantinedPath?: string; alreadyAbsent?: true }> {
+  const worktreePath = monitorWorktreePath(repositoryRoot, prNumber, expectedHeadSha);
+  const monitorRoot = path.dirname(worktreePath);
+  await ensureMonitorParentTopology(repositoryRoot, monitorRoot, operation === "create");
+
+  if (operation === "quarantine") {
+    if (!quarantineIdentity || !/^[0-9a-f]{64}$/u.test(quarantineIdentity)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Quarantine requires an exact durable outcome identity");
+    }
+    const quarantine = await quarantineMonitorWorktree(worktreePath, `${worktreePath}.quarantine-${quarantineIdentity}`);
+    await gitOutput(repositoryRoot, ["worktree", "prune", "--expire", "now"]);
+    return { worktreePath, ...quarantine };
+  }
+
+  try {
+    await assertMonitorWorktreePath(worktreePath);
+    await assertCleanMonitorWorktree(worktreePath, expectedHeadSha);
+    return { worktreePath };
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && error instanceof DomainError) {
+      await quarantineMonitorWorktree(worktreePath);
+      await gitOutput(repositoryRoot, ["worktree", "prune", "--expire", "now"]);
+    } else if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  if (!await localGitObjectExists(repositoryRoot, expectedHeadSha)) {
+    await gitOutput(repositoryRoot, ["fetch", "origin", expectedHeadSha]);
+  }
+  if (!await localGitObjectExists(repositoryRoot, expectedHeadSha)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Expected PR head is unavailable in the registry checkout");
+  }
+  await gitOutput(repositoryRoot, ["worktree", "add", "--detach", worktreePath, expectedHeadSha]);
+  await assertMonitorWorktreePath(worktreePath);
+  await assertCleanMonitorWorktree(worktreePath, expectedHeadSha);
+  return { worktreePath };
+}
 // requireProjectLease now lives in src/workspace/lease-guard.ts (imported
 // above) so src/control/tools.ts can share the exact same preset ->
 // capability table without importing this module (avoiding a cycle).
@@ -782,7 +2107,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           ...((config._meta as Record<string, unknown> | undefined) ?? {}),
         },
       } as never,
-      handler as never,
+      (async (...args: unknown[]) => {
+        if (isChatGptReadOnlyMode(ctx) && (CONTROL_TOOL_NAMES.has(name) || !hasReadOnlyHint(config as RegisteredToolLike))) {
+          return withErrorMapping(ctx, name, args[0], async () => {
+            throw new DomainError(
+              ErrorCode.PERMISSION_DENIED,
+              `${name} is unavailable while CHATGPT2CODEX_CHATGPT_READ_ONLY is enabled`,
+            );
+          });
+        }
+        return (handler as (...handlerArgs: unknown[]) => unknown)(...args);
+      }) as never,
     )) as unknown as McpServer["registerTool"];
 
   const widgetMeta = e2eWidgetResourceMeta(ctx.config.publicUrl);
@@ -1179,13 +2514,27 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       return withErrorMapping(ctx, "workspace_list_projects", input, async () => {
         let entries = await currentRegistry(ctx);
         if (input.query && input.query.trim().length > 0) {
-          const norm = input.query.trim().toLowerCase();
-          entries = entries.filter(
-            (e) =>
-              e.name.toLowerCase().includes(norm) ||
-              e.projectId.toLowerCase().includes(norm) ||
-              e.aliases.some((a) => a.toLowerCase().includes(norm)),
-          );
+          const query = input.query.trim();
+          if (path.isAbsolute(query)) {
+            let canonicalQuery: string;
+            try {
+              canonicalQuery = await fs.realpath(query);
+            } catch {
+              return makeResult({ projects: [] }, "Found 0 project(s).");
+            }
+            entries = (await Promise.all(entries.map(async (entry) => ({
+              entry,
+              root: await fs.realpath(entry.root).catch(() => undefined),
+            })))).flatMap(({ entry, root }) => root === canonicalQuery ? [entry] : []);
+          } else {
+            const norm = query.toLowerCase();
+            entries = entries.filter(
+              (e) =>
+                e.name.toLowerCase().includes(norm) ||
+                e.projectId.toLowerCase().includes(norm) ||
+                e.aliases.some((a) => a.toLowerCase().includes(norm)),
+            );
+          }
         }
         const limit = input.limit ?? 100;
         const projects = entries.slice(0, limit).map(toProject);
@@ -1265,13 +2614,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
     async (input) => {
       return withErrorMapping(ctx, "workspace_refresh_index", input, async () => {
-        const scanned = await scanWorkspace(ctx.workspaceRoot);
-        ctx.registry.splice(0, ctx.registry.length, ...scanned);
-        await ctx.store.saveProjects(scanned);
+        const scanned = await canonicalizeRegistryEntries(await scanWorkspace(ctx.workspaceRoot));
+        const registered = ctx.registry.length > 0 ? [...ctx.registry] : await ctx.store.loadProjects();
+        const merged = [...scanned, ...await validRegisteredProjects(ctx, scanned, registered)];
+        assertUniqueRegistryIdentity(merged);
+        await ctx.store.saveProjects(merged);
+        ctx.registry.splice(0, ctx.registry.length, ...merged);
         const updatedAt = Date.now();
         return makeResult(
-          { count: scanned.length, updatedAt },
-          `Refreshed workspace index: ${scanned.length} project(s).`,
+          { count: merged.length, updatedAt },
+          `Refreshed workspace index: ${merged.length} project(s).`,
         );
       });
     },
@@ -1732,16 +3084,45 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           commandId: input.commandId,
           exitCode: result.exitCode,
         });
-        return makeResult(
-          {
-            exitCode: result.exitCode,
-            stdoutSummary: redact(result.stdoutSummary),
-            stderrSummary: redact(result.stderrSummary),
-            durationMs: result.durationMs,
-            outputTruncated: result.outputTruncated,
-          },
-          `Command ${input.commandId} exited ${result.exitCode} in ${result.durationMs}ms.`,
-        );
+        const gitIdentity = result.exitCode === 0 && commandForPolicy?.riskTier === "verify" ? await verificationGitIdentity(entry.root) : undefined;
+        const issuedAt = Date.now();
+        const receiptFields = {
+          projectId: input.projectId,
+          commandId: input.commandId,
+          riskTier: commandForPolicy?.riskTier ?? "unknown",
+          args: Object.freeze([...(input.args ?? [])]),
+          exitCode: result.exitCode,
+          stdoutSummary: redact(result.stdoutSummary),
+          stderrSummary: redact(result.stderrSummary),
+          durationMs: result.durationMs,
+          outputTruncated: result.outputTruncated,
+          issuedAt,
+          ...(gitIdentity ?? {}),
+        };
+        const receiptId = monitorReceiptId({
+          tool: "command_run",
+          input,
+          nonce: randomUUID(),
+          ...receiptFields,
+        });
+        const receipt = Object.freeze({ receiptId, ...receiptFields });
+        const text = `Command ${input.commandId} exited ${result.exitCode} in ${result.durationMs}ms.`;
+        if (result.exitCode === 0 && gitIdentity && commandForPolicy?.riskTier === "verify") {
+          const issued = {
+            structured: receipt,
+            input: structuredClone(input),
+            text,
+            issuedAt,
+          };
+          await issueActionReceipt(ctx, "verification", "command_run", receiptId, issued, {
+            projectId: input.projectId,
+            commandId: input.commandId,
+            riskTier: "verify",
+            args: [...(input.args ?? [])],
+            ...gitIdentity,
+          });
+        }
+        return makeResult(receipt, text);
       });
     },
   );
@@ -2386,6 +3767,629 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
   );
 
+  registerTool(
+    "github_pr_monitor_state",
+    {
+      title: "Run one fixed PR-monitor state command",
+      description: "Runs only a fixed monitor state command in the fixed local monitor checkout; JSON input is sent over stdin.",
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Updating PR monitor state...", "PR monitor state updated"),
+      inputSchema: {
+        runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID),
+        idempotencyKey: z.string().regex(SAFE_ID), eventId: z.string().regex(SAFE_ID),
+        command: z.enum(MONITOR_STATE_COMMANDS),
+        input: z.record(z.string(), z.unknown()).optional(),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "github_pr_monitor_state", input, async () => {
+      const requested = input.input ?? {};
+      const actionReceipt = requested.receipt;
+      if (actionReceipt !== undefined
+        && input.command !== "ingest"
+        && input.command !== "plan-cycle"
+        && input.command !== "record-side-effect"
+        && input.command !== "reconcile") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${input.command} does not accept an Action receipt`);
+      }
+      let stateInput: Record<string, unknown> = input.command === "status"
+        ? {}
+        : input.command === "terminal-report"
+          ? { runId: input.runId, actionPlanId: input.actionPlanId }
+          : {
+              ...requested,
+              runId: input.runId,
+              actionPlanId: input.actionPlanId,
+              idempotencyKey: input.idempotencyKey,
+              eventId: input.eventId,
+            };
+      let prepared: PreparedMonitorState | undefined;
+      if (input.command === "ingest" || input.command === "plan-cycle") {
+        prepared = await claimIssuedMonitorReadReceipt(
+          ctx,
+          actionReceipt,
+          input.command,
+          input.runId,
+          input.actionPlanId,
+          requested,
+        );
+        stateInput = prepared.stateInput;
+      } else if (input.command === "record-side-effect" || input.command === "reconcile") {
+        prepared = await claimIssuedMonitorActionReceipt(ctx, actionReceipt, input.command, input);
+        stateInput = prepared.stateInput;
+      }
+      let execution = prepared?.recovered;
+      let lifecycleSettled = execution !== undefined;
+      if (!execution) {
+        try {
+          execution = await runMonitorState(
+            input.command,
+            stateInput,
+            prepared?.coordinationId,
+            prepared?.lifecycle.recovery.runId,
+          );
+        } catch (error: unknown) {
+          if (!prepared) throw error;
+          const recovered = await recoverFailedReceiptLifecycle(ctx, prepared);
+          if (!recovered) throw error;
+          execution = recovered;
+          lifecycleSettled = true;
+        }
+        if (prepared && !lifecycleSettled) await finishReceiptLifecycle(ctx, prepared, true, execution.response);
+      }
+      const stdout = execution.stdout;
+      const receipt = Object.freeze({
+        receiptId: monitorReceiptId({ tool: "github_pr_monitor_state", command: input.command, runId: input.runId, actionPlanId: input.actionPlanId, input: input.input ?? {} }),
+        namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_state", operation: input.command, ok: true,
+        runId: input.runId, actionPlanId: input.actionPlanId, command: input.command, stdout,
+      });
+      return makeResult(receipt, `Ran monitor state command ${input.command}.`);
+    }),
+  );
+  registerTool(
+    "github_pr_monitor_read",
+    {
+      title: "Read fixed-repository authored PR state",
+      description: "Read open PR response state only for Yeachan-Heo/gajae-code PRs authored by twoimo.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Reading authored PR state...", "Authored PR state read"),
+      inputSchema: { runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive().optional() },
+    },
+    async (input) => withErrorMapping(ctx, "github_pr_monitor_read", input, async () => {
+      await requireGithubAuthenticatedAuthor();
+      const prNumbers = input.prNumber ? [input.prNumber] : await githubOpenAuthoredPrNumbers();
+      const snapshots = await Promise.all(prNumbers.map((number) => githubPrSnapshot(number)));
+      const issuedAt = Date.now();
+      const observedAt = new Date(issuedAt).toISOString();
+      const receiptId = monitorReceiptId({
+        tool: "github_pr_monitor_read",
+        input,
+        snapshots,
+        issuedAt,
+        nonce: randomUUID(),
+      });
+      const receipt = Object.freeze({
+        receiptId,
+        namespace: "ChatGPT_To_Codex",
+        tool: "github_pr_monitor_read",
+        operation: "read",
+        ok: true,
+        runId: input.runId,
+        actionPlanId: input.actionPlanId,
+        repository: GITHUB_PR_REPOSITORY,
+        author: GITHUB_PR_AUTHOR,
+        prs: snapshots,
+        observedAt,
+        issuedAt,
+      });
+      const text = "Read authored open PR state.";
+      const issued = {
+        structured: receipt,
+        input: structuredClone(input),
+        text,
+        issuedAt,
+      };
+      await issueActionReceipt(ctx, "monitor-read", "github_pr_monitor_read", receiptId, issued, {
+        runId: input.runId,
+        actionPlanId: input.actionPlanId,
+      });
+      return makeResult(receipt, text);
+    }),
+  );
+
+  registerTool(
+    "github_pr_monitor_prepare",
+    {
+      title: "Prepare or quarantine fixed-repository PR worktree",
+      description: "Create or quarantine only the exact monitor-owned detached worktree for an open Yeachan-Heo/gajae-code PR authored by twoimo.",
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Preparing authored PR worktree...", "Authored PR worktree prepared"),
+      inputSchema: {
+        runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), idempotencyKey: z.string().regex(SAFE_ID), eventId: z.string().regex(SAFE_ID),
+        repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive(),
+        expectedHeadSha: z.string().regex(SAFE_SHA), operation: z.enum(["create", "quarantine"]),
+        headRef: z.string().regex(SAFE_REF).optional(),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "github_pr_monitor_prepare", input, async () => {
+      requireGithubPrIdentity(input.repository, input.author, input.prNumber);
+      if (input.operation === "create" && (!input.headRef || !safeMonitorHeadRef(input.headRef))) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "create requires a safe headRef");
+      if (input.operation === "quarantine" && input.headRef !== undefined) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "quarantine does not accept headRef");
+      registeredMonitorRepository(ctx);
+      const claim = await claimMonitorAction(ctx, {
+        runId: input.runId,
+        actionPlanId: input.actionPlanId,
+        idempotencyKey: input.idempotencyKey,
+        repository: GITHUB_PR_REPOSITORY,
+        prNumber: input.prNumber,
+        headSha: input.expectedHeadSha.toLowerCase(),
+        phase: "prepare",
+        operation: input.operation,
+        operationFields: input.operation === "create" ? { headRef: input.headRef } : {},
+      });
+      const outcomeBinding = monitorMutationOutcomeBinding(
+        input,
+        "prepare",
+        input.operation === "create" ? { headRef: input.headRef } : {},
+        claim,
+      );
+      let inspection = await inspectDurableMutationOutcome(
+        ctx,
+        "github_pr_monitor_prepare",
+        outcomeBinding,
+        claim.claimStatus,
+      );
+      if (inspection?.state === "completed") return inspection.result;
+      await requireGithubAuthenticatedAuthor();
+      const snapshot = await githubPrSnapshot(input.prNumber);
+      if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase() || (input.operation === "create" && snapshot.headRefName !== input.headRef)) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote PR head no longer matches the expected head");
+      }
+      const repositoryRoot = await resolveMonitorRepository(ctx);
+      const recoveringIntent = inspection?.state === "intent";
+      if (!inspection) {
+        await receiptAuthority(ctx).beginMutationOutcome(outcomeBinding);
+        inspection = await inspectDurableMutationOutcome(ctx, "github_pr_monitor_prepare", outcomeBinding, claim.claimStatus);
+      }
+      if (!inspection || inspection.state !== "intent") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Exact durable prepare intent was not established");
+      }
+      const { outcomeKey, startedAt } = inspection;
+      const expectedWorktreePath = monitorWorktreePath(repositoryRoot, input.prNumber, input.expectedHeadSha);
+      const expectedQuarantinePath = `${expectedWorktreePath}.quarantine-${outcomeKey}`;
+      let prepared: { worktreePath: string; quarantinedPath?: string; alreadyAbsent?: true } | undefined;
+
+      if (recoveringIntent && input.operation === "create") {
+        try {
+          await assertMonitorWorktreePath(expectedWorktreePath);
+          await assertCleanMonitorWorktree(expectedWorktreePath, input.expectedHeadSha);
+          prepared = { worktreePath: expectedWorktreePath };
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending create intent has ambiguous non-exact worktree evidence");
+          }
+        }
+      } else if (recoveringIntent) {
+        const [source, destination] = await Promise.all([
+          fs.lstat(expectedWorktreePath).catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+            throw error;
+          }),
+          fs.lstat(expectedQuarantinePath).catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+            throw error;
+          }),
+        ]);
+        if (source && destination) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending quarantine intent has conflicting source and destination evidence");
+        }
+        if (destination) {
+          if (destination.isSymbolicLink() || !destination.isDirectory()) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending quarantine intent destination is not an exact directory");
+          }
+          prepared = { worktreePath: expectedWorktreePath, quarantinedPath: expectedQuarantinePath };
+        } else if (!source) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending quarantine intent has no exact applied or not-applied evidence");
+        }
+      }
+      prepared ??= await prepareMonitorWorktree(
+        repositoryRoot,
+        input.prNumber,
+        input.expectedHeadSha,
+        input.operation,
+        outcomeKey,
+      );
+
+      let nextRegistry: ProjectRegistryEntry[];
+      if (input.operation === "create") {
+        const name = path.basename(prepared.worktreePath);
+        const entry: ProjectRegistryEntry = {
+          projectId: name.toLowerCase(),
+          name,
+          root: prepared.worktreePath,
+          aliases: [name, prepared.worktreePath],
+          branch: "(detached)",
+          dirty: false,
+          hasAgentsMd: false,
+          hasCodeBrain: false,
+          packageHints: [],
+          lastSeenAt: new Date(startedAt).toISOString(),
+        };
+        nextRegistry = [
+          ...ctx.registry.filter((project) => project.projectId !== entry.projectId && project.root !== entry.root),
+          entry,
+        ];
+      } else {
+        nextRegistry = ctx.registry.filter((project) => project.root !== prepared.worktreePath);
+      }
+      await ctx.store.saveProjects(nextRegistry);
+      ctx.registry.splice(0, ctx.registry.length, ...nextRegistry);
+      const alreadyAbsent = prepared.alreadyAbsent === true;
+      const safePath = input.operation === "create" ? prepared.worktreePath : prepared.quarantinedPath;
+      const timestamp = new Date(startedAt).toISOString();
+      const receipt = Object.freeze({
+        receiptId: monitorReceiptId({
+          tool: "github_pr_monitor_prepare",
+          operation: input.operation,
+          idempotencyKey: input.idempotencyKey,
+          prNumber: input.prNumber,
+          expectedHeadSha: input.expectedHeadSha,
+          ...(alreadyAbsent ? { alreadyAbsent: true, worktreePath: prepared.worktreePath } : { safePath }),
+        }),
+        namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_prepare", operation: input.operation, ok: true,
+        runId: input.runId, actionPlanId: input.actionPlanId, idempotencyKey: input.idempotencyKey, eventId: input.eventId,
+        repository: GITHUB_PR_REPOSITORY, author: GITHUB_PR_AUTHOR, prNumber: input.prNumber,
+        expectedHeadSha: input.expectedHeadSha, oldHeadSha: input.expectedHeadSha, newHeadSha: input.expectedHeadSha,
+        claimId: claim.claimId, claimedAt: claim.claimedAt, payloadDigest: claim.payloadDigest,
+        ...(input.headRef ? { headRef: input.headRef } : {}),
+        worktreePath: prepared.worktreePath,
+        ...(prepared.quarantinedPath ? { quarantinedPath: prepared.quarantinedPath } : {}),
+        ...(safePath ? { safePath } : {}),
+        ...(alreadyAbsent ? { alreadyAbsent: true } : {}),
+        remoteObject: alreadyAbsent
+          ? { worktreePath: prepared.worktreePath, alreadyAbsent: true }
+          : { safePath },
+        timestamp,
+      });
+      const text = alreadyAbsent
+        ? `Monitor worktree for PR #${input.prNumber} was already absent; no quarantine was needed.`
+        : `${input.operation === "create" ? "Prepared" : "Quarantined"} monitor worktree for PR #${input.prNumber}.`;
+      const issued = {
+        structured: receipt,
+        input: structuredClone(input),
+        text,
+        issuedAt: startedAt,
+      };
+      await persistDurableMutationOutcome(
+        ctx,
+        outcomeBinding,
+        outcomeKey,
+        "github_pr_monitor_prepare",
+        receipt.receiptId,
+        issued,
+        {
+          claim: structuredClone(claim),
+          runId: input.runId,
+          actionPlanId: input.actionPlanId,
+          idempotencyKey: input.idempotencyKey,
+        },
+      );
+      return makeResult(receipt, text);
+    }),
+  );
+  registerTool(
+    "github_pr_monitor_mutate",
+    {
+      title: "Apply one bounded authored PR response",
+      description: "Post one marked reply, resolve one thread, re-request one reviewer, or normal-push a prepared monitor worktree after remote-head proof. Fixed repository and author only; no merge, approval, force push, settings, or credentials.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Applying bounded PR response...", "Bounded PR response applied"),
+      inputSchema: {
+        runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), idempotencyKey: z.string().regex(SAFE_ID), eventId: z.string().regex(SAFE_ID),
+        repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive(),
+        expectedHeadSha: z.string().regex(SAFE_SHA), operation: z.enum(["post_reply", "resolve_thread", "rerequest_reviewer", "push_prepared_worktree"]),
+        body: z.string().min(1).max(6000).optional(), threadId: z.string().regex(SAFE_ID).optional(), reviewer: z.string().regex(/^[A-Za-z0-9-]{1,39}$/).optional(),
+        worktreePath: z.string().optional(), headRef: z.string().regex(SAFE_REF).optional(),
+        verificationReceipt: z.record(z.string(), z.unknown()).optional(),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "github_pr_monitor_mutate", input, async () => {
+      requireGithubPrIdentity(input.repository, input.author, input.prNumber);
+      let verification: IssuedVerificationReceipt | undefined;
+      let pushBinding: Record<string, unknown> | undefined;
+      let operationFields: Record<string, unknown>;
+      if (input.operation === "post_reply") {
+        if (!input.body || input.threadId !== undefined || input.reviewer !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "post_reply accepts only its exact body field");
+        }
+        operationFields = { body: input.body };
+      } else if (input.operation === "resolve_thread") {
+        if (!input.threadId || input.body !== undefined || input.reviewer !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "resolve_thread accepts only its exact threadId field");
+        }
+        operationFields = { threadId: input.threadId };
+      } else if (input.operation === "rerequest_reviewer") {
+        if (!input.reviewer || input.body !== undefined || input.threadId !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "rerequest_reviewer accepts only its exact reviewer field");
+        }
+        operationFields = { reviewer: input.reviewer };
+      } else {
+        if (!input.worktreePath || !input.headRef || !safeMonitorHeadRef(input.headRef) || !input.verificationReceipt || input.body !== undefined || input.threadId !== undefined || input.reviewer !== undefined) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push accepts only its exact worktree, headRef, and verification fields");
+        }
+        const registeredRepository = registeredMonitorRepository(ctx);
+        const locallyExpectedPath = monitorWorktreePath(path.resolve(registeredRepository.root), input.prNumber, input.expectedHeadSha);
+        if (input.worktreePath !== locallyExpectedPath) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires the exact prepared monitor worktree path");
+        pushBinding = pushVerificationBinding({
+          runId: input.runId,
+          actionPlanId: input.actionPlanId,
+          idempotencyKey: input.idempotencyKey,
+          eventId: input.eventId,
+          repository: input.repository,
+          prNumber: input.prNumber,
+          expectedHeadSha: input.expectedHeadSha,
+          worktreePath: input.worktreePath,
+          headRef: input.headRef,
+        });
+        verification = await successfulVerificationReceipt(
+          ctx,
+          input.verificationReceipt,
+          path.basename(locallyExpectedPath),
+          ["issued", "consumed"],
+          pushBinding,
+        );
+        if (!verification) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires a fresh, exact, successful verify-tier command_run ActionToolResponse");
+        operationFields = {
+          worktreePath: input.worktreePath,
+          headRef: input.headRef,
+          verification: {
+            receiptId: String(verification.structured.receiptId),
+            projectId: verification.projectId,
+            commandId: verification.commandId,
+            riskTier: verification.riskTier,
+            args: verification.args,
+            headSha: verification.headSha,
+            treeSha: verification.treeSha,
+            issuedAt: verification.issuedAt,
+          },
+        };
+      }
+      const claim = await claimMonitorAction(ctx, {
+        runId: input.runId,
+        actionPlanId: input.actionPlanId,
+        idempotencyKey: input.idempotencyKey,
+        repository: GITHUB_PR_REPOSITORY,
+        prNumber: input.prNumber,
+        headSha: input.expectedHeadSha.toLowerCase(),
+        phase: "mutate",
+        operation: input.operation,
+        operationFields,
+      });
+      const outcomeBinding = monitorMutationOutcomeBinding(input, "mutate", operationFields, claim);
+      let inspection = await inspectDurableMutationOutcome(
+        ctx,
+        "github_pr_monitor_mutate",
+        outcomeBinding,
+        claim.claimStatus,
+      );
+      if (inspection?.state === "completed") return inspection.result;
+
+      await requireGithubAuthenticatedAuthor();
+      let snapshot = await githubPrSnapshot(input.prNumber);
+      const recoveringIntent = inspection?.state === "intent";
+      if (!inspection) {
+        if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote PR head no longer matches expectedHeadSha");
+        }
+        let intentEvidence: Record<string, unknown> = {};
+        if (input.operation === "rerequest_reviewer") {
+          const reviewer = input.reviewer;
+          if (!reviewer) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "rerequest_reviewer requires reviewer");
+          const reviewRequests = Array.isArray(snapshot.reviewRequests) ? snapshot.reviewRequests : [];
+          const requestedBeforeIntent = reviewRequests.filter((value) =>
+            requireRecord(value, "Current PR snapshot returned an invalid review request").login === reviewer);
+          if (requestedBeforeIntent.length > 1) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Reviewer request has duplicate exact pre-apply evidence");
+          }
+          requireReviewerFromSnapshot(snapshot, reviewer);
+          intentEvidence = { reviewerRequestedBeforeIntent: requestedBeforeIntent.length === 1 };
+        }
+        await receiptAuthority(ctx).beginMutationOutcome(outcomeBinding, intentEvidence);
+        inspection = await inspectDurableMutationOutcome(ctx, "github_pr_monitor_mutate", outcomeBinding, claim.claimStatus);
+      }
+      if (!inspection || inspection.state !== "intent") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Exact durable mutation intent was not established");
+      }
+      const { outcomeKey, startedAt } = inspection;
+      const oldHeadSha = input.expectedHeadSha;
+      let remoteObject: Record<string, unknown> | undefined;
+
+      if (input.operation === "post_reply") {
+        if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has ambiguous remote-head evidence");
+        }
+        const body = `${input.body}\n\n<!-- chatgpt2codex-idempotency:${input.idempotencyKey} -->`;
+        const parsedComments = JSON.parse(await githubCommand(["api", `repos/${GITHUB_PR_REPOSITORY}/issues/${input.prNumber}/comments`, "--paginate"])) as unknown;
+        if (!Array.isArray(parsedComments)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR comments pagination returned an invalid response");
+        const matches = parsedComments
+          .map((value) => requireRecord(value, "PR comments pagination returned an invalid comment"))
+          .filter((comment) => comment.body === body);
+        if (matches.length > 1) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has duplicate exact idempotency evidence");
+        }
+        const existing = matches[0];
+        if (existing) {
+          if (!Number.isSafeInteger(existing.id) || typeof existing.html_url !== "string") {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has malformed exact remote evidence");
+          }
+          remoteObject = { id: existing.id, html_url: existing.html_url };
+        } else {
+          const created = parseGithubRestRecord(
+            await githubCommand(["api", `repos/${GITHUB_PR_REPOSITORY}/issues/${input.prNumber}/comments`, "-f", `body=${body}`]),
+            "Post-reply mutation",
+          );
+          if (!Number.isSafeInteger(created.id) || typeof created.html_url !== "string") {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Post-reply mutation did not return an exact remote object");
+          }
+          remoteObject = { id: created.id, html_url: created.html_url };
+        }
+      } else if (input.operation === "resolve_thread") {
+        if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending resolve intent has ambiguous remote-head evidence");
+        }
+        const threads = (snapshot.reviewThreads as { nodes: Array<{ id?: string; isResolved?: boolean }> }).nodes;
+        const matchingThreads = threads.filter((thread) => thread.id === input.threadId);
+        if (matchingThreads.length !== 1 || typeof matchingThreads[0]?.isResolved !== "boolean") {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending resolve intent has no unique exact thread evidence");
+        }
+        if (recoveringIntent && matchingThreads[0].isResolved) {
+          remoteObject = { id: input.threadId, html_url: String(snapshot.url) };
+        } else {
+          if (matchingThreads[0].isResolved) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve thread was already applied without an exact pending intent");
+          }
+          const resolvedResponse = parseGithubGraphql(await githubCommand(["api", "graphql", "-f", "query=mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}", "-f", `id=${input.threadId}`]), "Resolve-review-thread mutation");
+          const resolvedData = requireRecord(resolvedResponse.data, "Resolve-review-thread mutation omitted data");
+          const resolvedPayload = requireRecord(resolvedData.resolveReviewThread, "Resolve-review-thread mutation omitted payload");
+          const resolvedThread = requireRecord(resolvedPayload.thread, "Resolve-review-thread mutation omitted thread");
+          if (resolvedThread.id !== input.threadId || resolvedThread.isResolved !== true) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread was not resolved");
+          remoteObject = { id: input.threadId, html_url: String(snapshot.url) };
+        }
+      } else if (input.operation === "rerequest_reviewer") {
+        const reviewer = input.reviewer;
+        if (!reviewer) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "rerequest_reviewer requires reviewer");
+        if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reviewer intent has ambiguous remote-head evidence");
+        }
+        const reviewRequests = Array.isArray(snapshot.reviewRequests) ? snapshot.reviewRequests : [];
+        const requested = reviewRequests.filter((value) =>
+          requireRecord(value, "Current PR snapshot returned an invalid review request").login === reviewer);
+        if (requested.length > 1) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reviewer intent has duplicate exact reviewer evidence");
+        }
+        if (recoveringIntent && requested.length === 1) {
+          if (inspection.intentEvidence?.reviewerRequestedBeforeIntent !== false) {
+            throw new DomainError(
+              ErrorCode.APPROVAL_REQUIRED,
+              "Pending reviewer intent has ambiguous preexisting requested-reviewer evidence",
+            );
+          }
+          remoteObject = { id: reviewer, html_url: String(snapshot.url), reviewer };
+        } else {
+          if (recoveringIntent && inspection.intentEvidence?.reviewerRequestedBeforeIntent !== false) {
+            throw new DomainError(
+              ErrorCode.APPROVAL_REQUIRED,
+              "Pending reviewer intent has ambiguous or missing pre-apply evidence",
+            );
+          }
+          requireReviewerFromSnapshot(snapshot, reviewer);
+          const response = parseGithubRestRecord(
+            await githubCommand(["api", `repos/${GITHUB_PR_REPOSITORY}/pulls/${input.prNumber}/requested_reviewers`, "-X", "POST", "-f", `reviewers[]=${reviewer}`]),
+            "Re-request-reviewer mutation",
+          );
+          if (!Array.isArray(response.requested_reviewers)) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Re-request-reviewer mutation omitted the requested-reviewer set");
+          }
+          const requestedReviewerLogins = response.requested_reviewers.map((value) => {
+            const requestedReviewer = requireRecord(value, "Re-request-reviewer mutation returned an invalid requested reviewer");
+            if (typeof requestedReviewer.login !== "string" || !requestedReviewer.login) {
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Re-request-reviewer mutation returned an invalid requested reviewer login");
+            }
+            return requestedReviewer.login;
+          });
+          if (!requestedReviewerLogins.includes(reviewer)) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Re-request-reviewer mutation did not confirm the exact reviewer");
+          }
+          remoteObject = { id: reviewer, html_url: String(snapshot.url), reviewer };
+        }
+      } else {
+        const pushVerification = verification;
+        const exactPushBinding = pushBinding;
+        if (!pushVerification || !exactPushBinding) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires an exact verification receipt");
+        const repositoryRoot = await resolveMonitorRepository(ctx);
+        const expectedPath = monitorWorktreePath(repositoryRoot, input.prNumber, input.expectedHeadSha);
+        if (input.worktreePath !== expectedPath) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires the exact prepared monitor worktree path");
+        await assertMonitorWorktreePath(expectedPath);
+        const [topLevel, origin, upstream, localHead, localTree] = await Promise.all([
+          gitOutput(expectedPath, ["rev-parse", "--show-toplevel"]),
+          gitOutput(expectedPath, ["remote", "get-url", "origin"]),
+          gitOutput(expectedPath, ["remote", "get-url", "upstream"]),
+          gitOutput(expectedPath, ["rev-parse", "HEAD"]),
+          gitOutput(expectedPath, ["rev-parse", "HEAD^{tree}"]),
+        ]);
+        const normalizedHead = localHead.trim().toLowerCase();
+        const normalizedTree = localTree.trim().toLowerCase();
+        if (topLevel.trim() !== expectedPath || !githubForkRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream) || normalizedHead === input.expectedHeadSha.toLowerCase()) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires a new local commit in the exact fixed-remote worktree");
+        }
+        if (normalizedHead !== pushVerification.headSha || normalizedTree !== pushVerification.treeSha) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push verification is stale because the prepared worktree HEAD or tree changed after command_run");
+        }
+        const remoteHead = String(snapshot.headRefOid).toLowerCase();
+        if (recoveringIntent && remoteHead === normalizedHead) {
+          if (snapshot.headRefName !== input.headRef) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Recovered push does not bind the exact PR headRef");
+          remoteObject = { url: snapshot.url, headRefOid: snapshot.headRefOid, headRefName: snapshot.headRefName };
+        } else {
+          if (remoteHead !== input.expectedHeadSha.toLowerCase() || snapshot.headRefName !== input.headRef) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending push intent has ambiguous remote-head evidence");
+          }
+          const receiptAgeAtIntent = startedAt - pushVerification.issuedAt;
+          if (receiptAgeAtIntent < 0 || receiptAgeAtIntent > ACTION_RECEIPT_TTL_MS) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push verification receipt was stale when the durable intent began");
+          }
+          if (pushVerification.phase === "issued") {
+            await receiptAuthority(ctx).transitionExact(
+              String(pushVerification.structured.receiptId),
+              "verification",
+              input.verificationReceipt,
+              ["issued"],
+              "consumed",
+              { pushBinding: exactPushBinding },
+            );
+          }
+          await gitOutput(expectedPath, ["push", "origin", `HEAD:refs/heads/${input.headRef}`]);
+          snapshot = await githubPrSnapshot(input.prNumber);
+          if (String(snapshot.headRefOid).toLowerCase() !== normalizedHead || snapshot.headRefName !== input.headRef) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote PR head does not equal the pushed local commit");
+          }
+          remoteObject = { url: snapshot.url, headRefOid: snapshot.headRefOid, headRefName: snapshot.headRefName };
+        }
+      }
+
+      if (!remoteObject) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Mutation did not produce exact operation-specific evidence");
+      const timestamp = new Date(startedAt).toISOString();
+      const receipt = Object.freeze({
+        receiptId: monitorReceiptId({ tool: "github_pr_monitor_mutate", operation: input.operation, idempotencyKey: input.idempotencyKey, prNumber: input.prNumber, oldHeadSha, remoteObject }),
+        namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_mutate", operation: input.operation, ok: true,
+        runId: input.runId, actionPlanId: input.actionPlanId, idempotencyKey: input.idempotencyKey, eventId: input.eventId,
+        repository: GITHUB_PR_REPOSITORY, author: GITHUB_PR_AUTHOR, prNumber: input.prNumber, expectedHeadSha: input.expectedHeadSha,
+        claimId: claim.claimId, claimedAt: claim.claimedAt, payloadDigest: claim.payloadDigest,
+        oldHeadSha, newHeadSha: input.operation === "push_prepared_worktree" ? String(remoteObject.headRefOid) : oldHeadSha,
+        remoteObject, timestamp,
+      });
+      const text = `Applied ${input.operation} to PR #${input.prNumber}.`;
+      const issued = {
+        structured: receipt,
+        input: structuredClone(input),
+        text,
+        issuedAt: startedAt,
+      };
+      await persistDurableMutationOutcome(
+        ctx,
+        outcomeBinding,
+        outcomeKey,
+        "github_pr_monitor_mutate",
+        receipt.receiptId,
+        issued,
+        {
+          claim: structuredClone(claim),
+          runId: input.runId,
+          actionPlanId: input.actionPlanId,
+          idempotencyKey: input.idempotencyKey,
+        },
+      );
+      return makeResult(receipt, text);
+    }),
+  );
   registerTool(
     "git_push",
     {
@@ -3070,7 +5074,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     );
   }
 
-  installChatGptToolListHandler(s);
+  installChatGptToolListHandler(s, ctx);
 }
 
 async function pathExists(p: string): Promise<boolean> {

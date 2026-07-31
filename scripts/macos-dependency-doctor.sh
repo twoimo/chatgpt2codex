@@ -38,8 +38,8 @@ brew_install() {
   command -v "$command_name" >/dev/null 2>&1
 }
 
-node_major() {
-  node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf '0'
+node_supported() {
+  node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 16) ? 0 : 1)' 2>/dev/null
 }
 
 need_cloudflared=0
@@ -64,19 +64,18 @@ if ! command -v node >/dev/null 2>&1; then
   if brew_install node node; then
     fixed "Node.js installed"
   else
-    block "Node.js 22+ is missing. Reinstall the pkg built with bundled Node, or install Node.js 22+."
+    block "Node.js 22.16.0 or newer is missing. Reinstall the pkg built with bundled Node, or install Node.js 22.16.0 or newer."
   fi
 fi
 
 if command -v node >/dev/null 2>&1; then
-  major="$(node_major)"
-  if [[ "$major" -ge 22 ]]; then
+  if node_supported; then
     ok "node: $(node -v) ($(command -v node))"
   else
-    if brew_install node node && [[ "$(node_major)" -ge 22 ]]; then
+    if brew_install node node && node_supported; then
       fixed "Node.js upgraded to $(node -v)"
     else
-      block "Node.js 22+ is required; found $(node -v 2>/dev/null || echo unknown)."
+      block "Node.js 22.16.0 or newer is required; found $(node -v 2>/dev/null || echo unknown)."
     fi
   fi
 fi

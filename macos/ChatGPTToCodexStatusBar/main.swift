@@ -135,6 +135,7 @@ private let desktopLocalizationRows: [String: [String]] = [
     "startOnOpenSetting": ["Start MCP when the app opens", "앱 열 때 MCP 시작", "アプリ起動時に MCP を開始", "应用打开时启动 MCP", "App 開啟時啟動 MCP", "Iniciar MCP al abrir la app", "Démarrer MCP à l'ouverture", "MCP beim Öffnen der App starten", "Iniciar MCP ao abrir o app", "Avvia MCP all'apertura", "Start MCP bij openen", "Uruchamiaj MCP przy otwarciu aplikacji", "Запускать MCP при открытии приложения", "Uygulama açılınca MCP başlat", "Khởi động MCP khi mở ứng dụng", "Mulai MCP saat app dibuka", "เริ่ม MCP เมื่อเปิดแอป", "بدء MCP عند فتح التطبيق", "ऐप खुलने पर MCP शुरू करें", "Запускати MCP під час відкриття застосунку"],
     "autoUpdatesSetting": ["Auto check for updates", "업데이트 자동 확인", "更新を自動確認", "自动检查更新", "自動檢查更新", "Buscar actualizaciones automáticamente", "Recherche automatique des mises à jour", "Automatisch nach Updates suchen", "Verificar atualizações automaticamente", "Controlla aggiornamenti automaticamente", "Automatisch updates zoeken", "Automatycznie sprawdzaj aktualizacje", "Автоматически проверять обновления", "Güncellemeleri otomatik denetle", "Tự động kiểm tra cập nhật", "Periksa pembaruan otomatis", "ตรวจอัปเดตอัตโนมัติ", "التحقق التلقائي من التحديثات", "अपडेट अपने-आप जांचें", "Автоматично перевіряти оновлення"],
     "publicTunnelSetting": ["Enable ChatGPT web connector", "ChatGPT 웹 커넥터 사용", "ChatGPT Web コネクタを有効化", "启用 ChatGPT 网页连接器", "啟用 ChatGPT 網頁連接器", "Activar conector web de ChatGPT", "Activer le connecteur web ChatGPT", "ChatGPT-Web-Connector aktivieren", "Ativar conector web do ChatGPT", "Abilita connettore web ChatGPT", "ChatGPT-webconnector inschakelen", "Włącz konektor web ChatGPT", "Включить веб-коннектор ChatGPT", "ChatGPT web bağlayıcısını etkinleştir", "Bật trình kết nối web ChatGPT", "Aktifkan konektor web ChatGPT", "เปิดตัวเชื่อมต่อเว็บ ChatGPT", "تفعيل موصل ChatGPT على الويب", "ChatGPT वेब कनेक्टर चालू करें", "Увімкнути веб-конектор ChatGPT"],
+    "chatGPTReadOnlySetting": ["Read-only ChatGPT MCP tools", "읽기 전용 ChatGPT MCP 도구"],
     "publicHostname": ["Owned fixed domain (optional)", "본인 소유 고정 도메인 (선택)", "所有する固定ドメイン (任意)", "自有固定域名（可选）", "自有固定網域（選填）", "Dominio fijo propio (opcional)", "Domaine fixe personnel (facultatif)", "Eigene feste Domain (optional)", "Domínio fixo próprio (opcional)", "Dominio fisso personale (opzionale)", "Eigen vast domein (optioneel)", "Własna stała domena (opcjonalnie)", "Собственный постоянный домен (необязательно)", "Kendi sabit alan adınız (isteğe bağlı)", "Tên miền cố định của bạn (tùy chọn)", "Domain tetap milik Anda (opsional)", "โดเมนคงที่ของคุณ (ไม่บังคับ)", "نطاق ثابت تملكه (اختياري)", "अपना स्थिर डोमेन (वैकल्पिक)", "Власний сталий домен (необов'язково)"],
     "publicHostnameHint": ["Blank uses a temporary Quick Tunnel URL. It changes on restart, so reconnect ChatGPT. Enter your own Cloudflare Named Tunnel hostname for daily use.", "비워두면 임시 Quick Tunnel URL을 씁니다. 재시작하면 주소가 바뀌므로 ChatGPT를 다시 연결해야 합니다. 상시 사용은 본인 Cloudflare Named Tunnel 호스트명을 입력하세요.", "空欄なら一時 Quick Tunnel URL を使います。再起動で変わるため ChatGPT の再接続が必要です。常用は自分の Cloudflare Named Tunnel ホスト名を入力してください。", "留空会使用临时 Quick Tunnel URL。重启后会变化，需要重新连接 ChatGPT。日常使用请输入自己的 Cloudflare Named Tunnel 主机名。", "留空會使用臨時 Quick Tunnel URL。重新啟動後會變更，需重新連接 ChatGPT。日常使用請輸入自己的 Cloudflare Named Tunnel 主機名稱。", "En blanco usa una URL temporal de Quick Tunnel. Cambia al reiniciar; vuelve a conectar ChatGPT. Para uso diario escribe tu hostname de Cloudflare Named Tunnel.", "Vide, utilise une URL Quick Tunnel temporaire. Elle change au redémarrage; reconnectez ChatGPT. Pour l'usage quotidien, indiquez votre hôte Cloudflare Named Tunnel.", "Leer nutzt eine temporäre Quick-Tunnel-URL. Sie ändert sich beim Neustart; ChatGPT neu verbinden. Für Dauerbetrieb eigene Cloudflare-Named-Tunnel-Hostname eintragen.", "Em branco usa uma URL temporária Quick Tunnel. Ela muda ao reiniciar; reconecte o ChatGPT. Para uso diário, informe seu hostname Cloudflare Named Tunnel.", "Vuoto usa un URL Quick Tunnel temporaneo. Cambia al riavvio; riconnetti ChatGPT. Per l'uso quotidiano inserisci il tuo hostname Cloudflare Named Tunnel.", "Leeg gebruikt een tijdelijke Quick Tunnel-URL. Die wijzigt na herstart; verbind ChatGPT opnieuw. Voor dagelijks gebruik vul je je Cloudflare Named Tunnel-hostnaam in.", "Puste używa tymczasowego URL Quick Tunnel. Zmienia się po restarcie; połącz ChatGPT ponownie. Do codziennego użycia wpisz własny hostname Cloudflare Named Tunnel.", "Пусто — временный URL Quick Tunnel. Он меняется при перезапуске; подключите ChatGPT заново. Для постоянной работы укажите свой hostname Cloudflare Named Tunnel.", "Boşsa geçici Quick Tunnel URL kullanır. Yeniden başlatınca değişir; ChatGPT'yi yeniden bağlayın. Günlük kullanım için kendi Cloudflare Named Tunnel hostname'inizi girin.", "Để trống sẽ dùng URL Quick Tunnel tạm thời. URL đổi khi khởi động lại; hãy kết nối lại ChatGPT. Dùng hằng ngày thì nhập hostname Cloudflare Named Tunnel của bạn.", "Kosong memakai URL Quick Tunnel sementara. URL berubah saat restart; hubungkan ulang ChatGPT. Untuk harian, isi hostname Cloudflare Named Tunnel milik Anda.", "เว้นว่างเพื่อใช้ URL Quick Tunnel ชั่วคราว ซึ่งจะเปลี่ยนเมื่อรีสตาร์ต ต้องเชื่อมต่อ ChatGPT ใหม่ ใช้งานประจำให้ใส่ hostname Cloudflare Named Tunnel ของคุณ", "فارغ يعني استخدام رابط Quick Tunnel مؤقت. يتغير عند إعادة التشغيل؛ أعد ربط ChatGPT. للاستخدام اليومي أدخل اسم مضيف Cloudflare Named Tunnel الخاص بك.", "खाली रखने पर अस्थायी Quick Tunnel URL प्रयोग होगा। रीस्टार्ट पर बदलता है; ChatGPT फिर जोड़ें। रोज़ उपयोग के लिए अपना Cloudflare Named Tunnel hostname डालें।", "Порожньо — тимчасовий URL Quick Tunnel. Після перезапуску змінюється; підключіть ChatGPT знову. Для щоденного використання вкажіть свій hostname Cloudflare Named Tunnel."],
     "fixedDomainSetup": ["Setup...", "설정..."],
@@ -205,6 +206,7 @@ private final class ServiceController {
     private let launchAtLoginKey = "launchAtLogin"
     private let startMCPOnLaunchKey = "startMCPOnLaunch"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
+    private let chatGPTReadOnlyKey = "chatGPTReadOnly"
     private(set) var process: Process?
 
     let appName = "ChatGPT To Codex"
@@ -286,6 +288,9 @@ private final class ServiceController {
 
     var autoCheckUpdates: Bool {
         defaults.bool(forKey: autoCheckUpdatesKey)
+    }
+    var chatGPTReadOnly: Bool {
+        defaults.bool(forKey: chatGPTReadOnlyKey)
     }
 
     var githubRepoURL: URL {
@@ -646,6 +651,10 @@ private final class ServiceController {
     func setAutoCheckUpdates(_ enabled: Bool) {
         defaults.set(enabled, forKey: autoCheckUpdatesKey)
     }
+    func setChatGPTReadOnly(_ enabled: Bool) {
+        defaults.set(enabled, forKey: chatGPTReadOnlyKey)
+    }
+
 
     func setPreferredLanguage(_ value: String) {
         defaults.set(value, forKey: preferredLanguageKey)
@@ -781,6 +790,7 @@ private final class ServiceController {
         cd \(shellQuote(runtimeRoot.path))
         export PATH=\(shellQuote(runtimeRoot.appendingPathComponent("bin").path))":$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
         export WORKSPACE=\(shellQuote(workspace))
+        \(chatGPTReadOnly ? "export CHATGPT2CODEX_CHATGPT_READ_ONLY=1" : "unset CHATGPT2CODEX_CHATGPT_READ_ONLY")
         export PORT=\(port)
         \(enablePublicTunnel ? "export CHATGPT2CODEX_EXPOSE_WEB=1" : "unset CHATGPT2CODEX_EXPOSE_WEB")
         \(publicHost.map { "export PUBLIC_HOSTNAME=\(shellQuote($0))" } ?? "unset PUBLIC_HOSTNAME")
@@ -905,6 +915,11 @@ private final class ServiceController {
         environment["WORKSPACE"] = workspace
         environment["PORT"] = "\(port)"
         environment["CHATGPT2CODEX_DOCTOR_REPAIR"] = repair ? "1" : "0"
+        if chatGPTReadOnly {
+            environment["CHATGPT2CODEX_CHATGPT_READ_ONLY"] = "1"
+        } else {
+            environment.removeValue(forKey: "CHATGPT2CODEX_CHATGPT_READ_ONLY")
+        }
         if enablePublicTunnel {
             environment["CHATGPT2CODEX_EXPOSE_WEB"] = "1"
         } else {
@@ -970,6 +985,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private weak var settingsStartOnLaunch: NSButton?
     private weak var settingsAutoUpdate: NSButton?
     private weak var settingsPublicTunnel: NSButton?
+    private weak var settingsChatGPTReadOnly: NSButton?
     private weak var settingsOwnerTokenStatus: NSTextField?
     private weak var settingsOwnerTokenButton: NSButton?
     private weak var settingsOwnerTokenCopyButton: NSButton?
@@ -1405,7 +1421,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         settingsWindow?.close()
         let width: CGFloat = 540
         let hintWidth: CGFloat = 322
-        let publicHintY: CGFloat = 398
+        let publicHintY: CGFloat = 426
         let hintFont = NSFont.systemFont(ofSize: 10)
         func measuredHintHeight(_ text: String, width: CGFloat) -> CGFloat {
             let rect = (text as NSString).boundingRect(
@@ -1530,12 +1546,17 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         publicTunnel.state = controller.enablePublicTunnel ? .on : .off
         settingsPublicTunnel = publicTunnel
         content.addSubview(publicTunnel)
+        let chatGPTReadOnly = NSButton(checkboxWithTitle: t("chatGPTReadOnlySetting"), target: nil, action: nil)
+        chatGPTReadOnly.frame = NSRect(x: 190, y: 360, width: 322, height: 22)
+        chatGPTReadOnly.state = controller.chatGPTReadOnly ? .on : .off
+        settingsChatGPTReadOnly = chatGPTReadOnly
+        content.addSubview(chatGPTReadOnly)
 
-        content.addSubview(label(t("publicHostname"), x: 28, y: 370, width: 170))
-        let hostField = field(controller.savedPublicHost ?? "", x: 190, y: 366, width: 230, placeholder: "chatgpt2codex.example.com")
+        content.addSubview(label(t("publicHostname"), x: 28, y: 398, width: 170))
+        let hostField = field(controller.savedPublicHost ?? "", x: 190, y: 394, width: 230, placeholder: "chatgpt2codex.example.com")
         settingsHostField = hostField
         content.addSubview(hostField)
-        content.addSubview(button(t("fixedDomainSetup"), x: 428, y: 365, width: 84, action: #selector(showFixedDomainSetup)))
+        content.addSubview(button(t("fixedDomainSetup"), x: 428, y: 393, width: 84, action: #selector(showFixedDomainSetup)))
         content.addSubview(hint(publicHintText, x: 190, y: publicHintY, width: hintWidth, height: publicHintHeight))
         content.addSubview(label(t("localPort"), x: 28, y: localPortY, width: 170))
         let portField = field("\(controller.port)", x: 190, y: portFieldY, width: 120)
@@ -1609,6 +1630,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
               let launchAtLogin = settingsLaunchAtLogin,
               let startOnLaunch = settingsStartOnLaunch,
               let publicTunnel = settingsPublicTunnel,
+              let chatGPTReadOnly = settingsChatGPTReadOnly,
               let hostField = settingsHostField,
               let portField = settingsPortField
         else { return }
@@ -1630,6 +1652,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         controller.setLaunchAtLogin(launchAtLogin.state == .on)
         controller.setStartMCPOnLaunch(startOnLaunch.state == .on)
         controller.setEnablePublicTunnel(publicTunnel.state == .on)
+        controller.setChatGPTReadOnly(chatGPTReadOnly.state == .on)
         controller.setPublicHostname(hostField.stringValue)
         if let port = Int(portField.stringValue), port > 0 {
             controller.setPort(port)

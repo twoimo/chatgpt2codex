@@ -179,7 +179,15 @@ describe("desktop-control tool gating", () => {
     expect(result?.isError).toBeFalsy();
     expect(result?.structuredContent?.status).toBe("pending");
     expect(result?.structuredContent?.actionId).toEqual(expect.stringMatching(/^ctl_/));
-  });
+    // The only osascript on this path is resolveFrontmostApp (src/control/tools.ts:228),
+    // issued for the allowlist check; the AX resolve below it is gated on `target.ax`,
+    // which a windowPoint target never sets. That round-trip is ~110ms against an idle,
+    // warm System Events daemon but queues behind other System Events work machine-wide;
+    // latency therefore varies with daemon state and unrelated concurrent automation.
+    // The 90s ceiling provides headroom above the measured range documented in
+    // mac-input.test.ts: 39s against a cold daemon and 37-69s under concurrent load.
+    // It only widens the clock; every assertion still runs.
+  }, 90_000);
 
   it("blocks a request targeting a sensitive app even with a valid control lease", async () => {
     process.env.CHATGPT2CODEX_CONTROL = "1";
@@ -200,7 +208,11 @@ describe("desktop-control tool gating", () => {
     expect(result?.isError).toBe(true);
     expect(result?.structuredContent?.code).toBe("SENSITIVE_TARGET_BLOCKED");
     expect(events.some((e) => e.type === "control.action.blocked")).toBe(true);
-  });
+    // Same single resolveFrontmostApp round-trip as the allowlisted sibling above: it
+    // runs at src/control/tools.ts:228, *before* assertAllowedTarget at :230, so the
+    // denylist does not fail fast — it pays the same System Events contention.
+    // Same 90s ceiling, same reason.
+  }, 90_000);
 
   it("kill switch rejects new requests and existing pending actions", async () => {
     process.env.CHATGPT2CODEX_CONTROL = "1";
@@ -260,7 +272,8 @@ describe("desktop-control tool gating", () => {
     expect((status?.structuredContent?.action as { textSummary?: { length: number } } | undefined)?.textSummary?.length).toBe(
       "super-secret-value".length,
     );
-  });
+    // Same resolveFrontmostApp round-trip on the enqueue path as above.
+  }, 90_000);
 
   it("computer_request_action builds a dry-run AX resolve preview with no side effect; the action stays pending", async () => {
     process.env.CHATGPT2CODEX_CONTROL = "1";
@@ -289,7 +302,7 @@ describe("desktop-control tool gating", () => {
     // still exactly where enqueue() left it.
     const status = await tools.computer_action_status?.handler?.({ actionId: result?.structuredContent?.actionId as string });
     expect((status?.structuredContent?.action as { status?: string } | undefined)?.status).toBe("pending");
-  }, 15_000);
+  }, 90_000);
 
   it("computer_request_action's registered schema rejects an AppleScript-injecting role before any handler/enqueue runs (osascript RCE guard)", async () => {
     // `role` is interpolated as a raw AppleScript element class in

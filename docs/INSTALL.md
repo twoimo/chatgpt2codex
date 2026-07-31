@@ -38,7 +38,7 @@ ChatGPT To Codex는 내 Mac 또는 Windows PC에서 실행되는 로컬 코딩 �
 3. Windows SmartScreen이 경고하면 **추가 정보** -> **실행**을 누릅니다. 단, 반드시 이 GitHub 릴리스에서 받은 파일일 때만 진행하세요.
 4. 설치가 끝나면 **ChatGPT To Codex**를 실행합니다.
 5. 오른쪽 아래 시스템 트레이에 아이콘이 보이면 실행된 것입니다.
-6. 설치 중 Node.js LTS 또는 cloudflared가 없으면 앱이 설치를 안내할 수 있습니다.
+6. 설치 중 Node.js 22.16.0 이상 또는 cloudflared가 없으면 앱이 설치를 안내할 수 있습니다.
 
 ### 첫 설정
 
@@ -102,7 +102,7 @@ PKG is better for this release. A DMG is great for drag-and-drop apps, but this 
 3. If Windows SmartScreen appears, choose **More info** -> **Run anyway** only if the file came from this GitHub release.
 4. Open **ChatGPT To Codex**.
 5. Confirm the tray icon appears near the clock.
-6. If Node.js LTS or cloudflared is missing, follow the app's setup prompt.
+6. If Node.js 22.16.0 or newer or cloudflared is missing, follow the app's setup prompt.
 
 ### First setup
 
@@ -113,6 +113,28 @@ PKG is better for this release. A DMG is great for drag-and-drop apps, but this 
 5. Click **Copy Connector URL**. It should end with `/mcp`.
 6. Add that URL in ChatGPT under Apps, Apps & Connectors, or Connectors.
 7. Approve the connection with the Owner Token from the app.
+
+### Custom GPT Actions
+
+As an alternative to Apps / Connectors, a Custom GPT can use the Actions
+bridge:
+
+1. Keep ChatGPT To Codex running with a public HTTPS URL.
+2. In the Custom GPT editor, import
+   `<public-origin>/actions/openapi.json`.
+3. Configure the Action authentication as Bearer and enter the Owner Token.
+4. Save the GPT, then call `agent_guide` once and confirm that the returned
+   workspace is the project you selected.
+
+If the public tunnel hostname changes, import the new schema URL and save the
+GPT again. On macOS, enable **Read-only ChatGPT MCP tools** when the remote GPT
+should receive only read-only tools. This mode is remote-only and does not
+change local sessions or the default full catalog.
+
+ChatGPT scheduled tasks currently may open a separate conversation without the
+Custom GPT Actions connection. Test every schedule with **Run now** and require
+a real tool result. If the task says the Action is not connected, pause the task;
+the schedule is not executing local work.
 
 ### E2E screenshots
 

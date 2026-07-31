@@ -27,6 +27,23 @@ interface ActionRoute {
   description: string;
   schema: string;
 }
+type ActionsMode = "general" | "github-pr-monitor";
+
+const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
+const GITHUB_PR_MONITOR_TOOL_NAMES = new Set([
+  "github_pr_monitor_read",
+  "github_pr_monitor_prepare",
+  "github_pr_monitor_mutate",
+  "github_pr_monitor_state",
+]);
+
+function configuredActionsMode(): ActionsMode {
+  const raw = process.env[ACTIONS_MODE_ENV];
+  if (raw === undefined) return "general";
+  const mode = raw.trim().toLowerCase();
+  if (mode === "general" || mode === "github-pr-monitor") return mode;
+  throw new Error(`${ACTIONS_MODE_ENV} must be either "general" or "github-pr-monitor".`);
+}
 
 const ACTION_ROUTES: ActionRoute[] = [
   {
@@ -311,6 +328,38 @@ const ACTION_ROUTES: ActionRoute[] = [
     description: "Lists images already saved under .chatgpt2codex/images for a project.",
     schema: "ListImagesInput",
   },
+  {
+    path: "/actions/github-pr-monitor-read",
+    tool: "github_pr_monitor_read",
+    operationId: "github_pr_monitor_read",
+    summary: "Read fixed-repository authored PR state",
+    description: "Read open Yeachan-Heo/gajae-code PR state for the fixed author twoimo.",
+    schema: "GithubPrMonitorReadInput",
+  },
+  {
+    path: "/actions/github-pr-monitor-prepare",
+    tool: "github_pr_monitor_prepare",
+    operationId: "github_pr_monitor_prepare",
+    summary: "Prepare a fixed-repository PR worktree",
+    description: "Create or quarantine the bounded monitor worktree for an authored Yeachan-Heo/gajae-code PR.",
+    schema: "GithubPrMonitorPrepareInput",
+  },
+  {
+    path: "/actions/github-pr-monitor-mutate",
+    tool: "github_pr_monitor_mutate",
+    operationId: "github_pr_monitor_mutate",
+    summary: "Apply a bounded authored PR response",
+    description: "Post a reply, resolve a thread, re-request a reviewer, or push a verified prepared worktree for the fixed repository and author.",
+    schema: "GithubPrMonitorMutateInput",
+  },
+  {
+    path: "/actions/github-pr-monitor-state",
+    tool: "github_pr_monitor_state",
+    operationId: "github_pr_monitor_state",
+    summary: "Run a bounded PR-monitor state command",
+    description: "Run one fixed monitor state command. The input property is a JSON object encoded as a string and is decoded before MCP dispatch.",
+    schema: "GithubPrMonitorStateInput",
+  },
 ];
 
 const OPENAPI_ACTION_TOOL_NAMES = new Set([
@@ -335,16 +384,39 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "e2e_open_url_screenshot",
   "repo_status",
   "repo_diff_summary",
-  "show_changes",
-  "git_commit",
-  "git_push",
+  "github_pr_monitor_read",
+  "github_pr_monitor_prepare",
+  "github_pr_monitor_mutate",
+  "github_pr_monitor_state",
   "save_chatgpt_image",
   "save_chatgpt_image_from_url",
   "list_images",
 ]);
+const GITHUB_PR_ACTION_FIELDS: Record<string, { allowed: ReadonlySet<string>; required: ReadonlySet<string> }> = {
+  github_pr_monitor_read: {
+    allowed: new Set(["runId", "actionPlanId", "repository", "author", "prNumber"]),
+    required: new Set(["runId", "actionPlanId", "repository", "author"]),
+  },
+  github_pr_monitor_prepare: {
+    allowed: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", "headRef"]),
+    required: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"]),
+  },
+  github_pr_monitor_mutate: {
+    allowed: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", "body", "threadId", "reviewer", "worktreePath", "headRef", "verificationReceipt"]),
+    required: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"]),
+  },
+  github_pr_monitor_state: {
+    allowed: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "command", "input"]),
+    required: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "command"]),
+  },
+};
 
-function openApiActionRoutes(): ActionRoute[] {
-  return ACTION_ROUTES.filter((route) => OPENAPI_ACTION_TOOL_NAMES.has(route.tool));
+function openApiActionRoutes(mode: ActionsMode): ActionRoute[] {
+  return ACTION_ROUTES.filter(
+    (route) =>
+      OPENAPI_ACTION_TOOL_NAMES.has(route.tool) &&
+      (mode === "general" || GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool)),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -372,11 +444,65 @@ function genericToolInput(body: unknown): { toolName: string; input: Record<stri
         ? body
         : {};
   const toolName = typeof raw.toolName === "string" ? raw.toolName.trim() : "";
-  const input = isRecord(raw.input) ? { ...raw.input } : {};
+  let input: Record<string, unknown> = {};
+  if (isRecord(raw.input)) {
+    input = { ...raw.input };
+  } else if (typeof raw.input === "string") {
+    try {
+      const parsed: unknown = JSON.parse(raw.input);
+      if (isRecord(parsed)) input = { ...parsed };
+    } catch {
+      input = {};
+    }
+  }
   if (toolName === "project_select" && input.preset === undefined) {
     input.preset = "full-write";
   }
   return { toolName, input };
+}
+function invalidActionInput(toolName: string, detail: string): CallToolResultLike {
+  const message = `Invalid arguments for tool ${toolName}: ${detail}`;
+  return {
+    isError: true,
+    structuredContent: { code: "INVALID_INPUT", error: message },
+    content: [{ type: "text", text: message }],
+  };
+}
+
+function strictGithubPrActionInput(
+  route: ActionRoute,
+  body: unknown,
+): { input: Record<string, unknown> } | { error: CallToolResultLike } | undefined {
+  const fields = GITHUB_PR_ACTION_FIELDS[route.tool];
+  if (!fields) return undefined;
+  if (!isRecord(body)) return { error: invalidActionInput(route.tool, "request body must be an object") };
+
+  const extra = Object.keys(body).filter((key) => !fields.allowed.has(key));
+  if (extra.length > 0) return { error: invalidActionInput(route.tool, `unexpected field(s): ${extra.join(", ")}`) };
+
+  const missing = [...fields.required].filter((key) => body[key] === undefined);
+  if (missing.length > 0) return { error: invalidActionInput(route.tool, `missing required field(s): ${missing.join(", ")}`) };
+
+  const input = { ...body };
+  if (route.tool === "github_pr_monitor_state" && input.input !== undefined) {
+    if (typeof input.input !== "string") {
+      return { error: invalidActionInput(route.tool, "input must be a JSON object encoded as a string") };
+    }
+    if (Buffer.byteLength(input.input, "utf8") > 64 * 1024) {
+      return { error: invalidActionInput(route.tool, "encoded input exceeds 64KiB") };
+    }
+    try {
+      const decoded: unknown = JSON.parse(input.input);
+      if (!isRecord(decoded)) {
+        return { error: invalidActionInput(route.tool, "input must encode a JSON object") };
+      }
+      input.input = decoded;
+    } catch {
+      return { error: invalidActionInput(route.tool, "input must encode valid JSON") };
+    }
+  }
+
+  return { input };
 }
 
 function bearerToken(req: Request): string | undefined {
@@ -532,7 +658,14 @@ async function actionResponse(ctx: ToolContext, publicOrigin: string, tool: stri
   };
 }
 
-function openApiSpec(publicOrigin: string): Record<string, unknown> {
+const CHATGPT_ACTION_DESCRIPTION_LIMIT = 300;
+
+function chatGptActionDescription(description: string): string {
+  if (description.length <= CHATGPT_ACTION_DESCRIPTION_LIMIT) return description;
+  return `${description.slice(0, CHATGPT_ACTION_DESCRIPTION_LIMIT - 1).trimEnd()}…`;
+}
+
+function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, unknown> {
   const paths: Record<string, unknown> = {
     "/actions/health": {
       get: {
@@ -551,8 +684,9 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
       post: {
         operationId: "call_tool",
         summary: "Call any chatgpt2codex MCP tool",
-        description:
+        description: chatGptActionDescription(
           "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits: select project with preset=full-write, then call file_apply_patch or file_create through this route. The response toolCall object is the required proof that the local tool was actually callable.",
+        ),
         security: [{ ownerBearer: [] }],
         requestBody: {
           required: true,
@@ -571,13 +705,16 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
       },
     },
   };
+  if (mode === "github-pr-monitor") {
+    delete paths["/actions/call-tool"];
+  }
 
-  for (const route of openApiActionRoutes()) {
+  for (const route of openApiActionRoutes(mode)) {
     paths[route.path] = {
       post: {
-        operationId: route.tool,
+        operationId: route.operationId,
         summary: route.summary,
-        description: `ChatGPT_To_Codex tool: ${route.tool}. ${route.description}`,
+        description: chatGptActionDescription(`ChatGPT_To_Codex tool: ${route.tool}. ${route.description}`),
         security: [{ ownerBearer: [] }],
         requestBody: {
           required: route.schema !== "EmptyInput",
@@ -600,13 +737,18 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
   return {
     openapi: "3.1.0",
     info: {
-      title: "chatgpt2codex Custom GPT Actions",
+      title:
+        mode === "github-pr-monitor"
+          ? "chatgpt2codex GitHub PR Monitor Actions"
+          : "chatgpt2codex Custom GPT Actions",
       version: "0.1.6",
       description:
-        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
+        mode === "github-pr-monitor"
+          ? "Monitor-only OpenAPI bridge for the deployed Custom GPT. It exposes only health plus the four dedicated github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_mutate, and github_pr_monitor_state operations. The monitor identity is fixed to repository Yeachan-Heo/gajae-code and author twoimo."
+          : "OpenAPI bridge for Custom GPTs. This compact schema stays within 30 operations and exposes workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing. Dedicated strict PR monitor actions github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_mutate, and github_pr_monitor_state dispatch through their registered MCP tools; they are fixed to Yeachan-Heo/gajae-code and authenticated author twoimo, and return toolCall.namespace=ChatGPT_To_Codex proof. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
-      "x-chatgpt2codex-tool-names": openApiActionRoutes().map((route) => route.tool),
+      "x-chatgpt2codex-tool-names": openApiActionRoutes(mode).map((route) => route.tool),
     },
     servers: [{ url: publicOrigin }],
     paths,
@@ -624,7 +766,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
         CallToolInput: {
           type: "object",
           additionalProperties: false,
-          required: ["toolName"],
+          required: ["toolName", "input"],
           properties: {
             toolName: {
               type: "string",
@@ -632,9 +774,8 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
                 "Registered chatgpt2codex MCP tool name, e.g. file_apply_patch, file_create, local_shell_run, repo_status, git_commit, git_push.",
             },
             input: {
-              type: "object",
-              additionalProperties: true,
-              description: "Input object passed directly to the named chatgpt2codex MCP tool.",
+              type: "string",
+              description: "JSON object encoded as a string and passed to the named chatgpt2codex MCP tool. Example: {\"runId\":\"run-1\",\"actionPlanId\":\"bootstrap\"}.",
             },
           },
         },
@@ -962,6 +1103,74 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId"],
           properties: { projectId: { type: "string" } },
         },
+        GithubPrMonitorReadInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["runId", "actionPlanId", "repository", "author"],
+          properties: {
+            runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            repository: { type: "string", const: "Yeachan-Heo/gajae-code" },
+            author: { type: "string", const: "twoimo" },
+            prNumber: { type: "integer", minimum: 1 },
+          },
+        },
+        GithubPrMonitorPrepareInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"],
+          properties: {
+            runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            idempotencyKey: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            eventId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            repository: { type: "string", const: "Yeachan-Heo/gajae-code" },
+            author: { type: "string", const: "twoimo" },
+            prNumber: { type: "integer", minimum: 1 },
+            expectedHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$", minLength: 40, maxLength: 40 },
+            operation: { type: "string", enum: ["create", "quarantine"] },
+            headRef: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$", maxLength: 241 },
+          },
+        },
+        GithubPrMonitorMutateInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"],
+          properties: {
+            runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            idempotencyKey: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            eventId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            repository: { type: "string", const: "Yeachan-Heo/gajae-code" },
+            author: { type: "string", const: "twoimo" },
+            prNumber: { type: "integer", minimum: 1 },
+            expectedHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$", minLength: 40, maxLength: 40 },
+            operation: { type: "string", enum: ["post_reply", "resolve_thread", "rerequest_reviewer", "push_prepared_worktree"] },
+            body: { type: "string", minLength: 1, maxLength: 6000 },
+            threadId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            reviewer: { type: "string", pattern: "^[A-Za-z0-9-]{1,39}$", maxLength: 39 },
+            worktreePath: { type: "string" },
+            headRef: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$", maxLength: 241 },
+            verificationReceipt: { "$ref": "#/components/schemas/ActionToolResponse" },
+          },
+        },
+        GithubPrMonitorStateInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "command"],
+          properties: {
+            runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            idempotencyKey: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            eventId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            command: { type: "string", enum: ["ingest", "plan-cycle", "record-side-effect", "reconcile", "terminal-report", "status"] },
+            input: {
+              type: "string",
+              maxLength: 65536,
+              description: "Optional JSON object encoded as a string. Decoded to the registered MCP tool's input object before dispatch.",
+            },
+          },
+        },
         ActionToolResponse: {
           type: "object",
           required: ["ok", "tool", "toolCall", "text", "structuredContent"],
@@ -1037,51 +1246,107 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
 
 export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: URL): void {
   const publicOrigin = publicUrl.origin;
+  const mode = configuredActionsMode();
+  const actionRoutes = mode === "github-pr-monitor"
+    ? ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool))
+    : ACTION_ROUTES;
+  const openApiRoutes = openApiActionRoutes(mode);
 
+  if (mode === "github-pr-monitor") {
+    const allowedRequests = new Set([
+      "GET /actions/health",
+      "GET /actions/openapi.json",
+      ...actionRoutes.map((route) => `POST ${route.path}`),
+    ]);
+    app.use("/actions", (req, res, next) => {
+      const path = req.originalUrl.split("?", 1)[0] ?? "";
+      if (!allowedRequests.has(`${req.method.toUpperCase()} ${path}`)) {
+        res.status(404).json({
+          ok: false,
+          error: "Action route is not available in github-pr-monitor mode.",
+        });
+        return;
+      }
+      next();
+    });
+  }
   app.get("/actions/health", (_req, res) => {
     res.json({
       ok: true,
       name: "chatgpt2codex-actions",
-      actions: ACTION_ROUTES.length,
-      openApiOperations: openApiActionRoutes().length + 2,
-      openApiToolNames: openApiActionRoutes().map((route) => route.tool),
+      actions: actionRoutes.length,
+      openApiOperations: openApiRoutes.length + (mode === "general" ? 2 : 1),
+      openApiToolNames: openApiRoutes.map((route) => route.tool),
       toolAvailabilityGate: TOOL_AVAILABILITY_GATE,
     });
   });
 
   app.get("/actions/openapi.json", (_req, res) => {
-    res.json(openApiSpec(publicOrigin));
+    res.json(openApiSpec(publicOrigin, mode));
   });
 
-  app.get("/actions/e2e-screenshot-inline/:token/:filename", async (req, res) => {
-    const share = await readE2eScreenshotShare(ctx.stateDir, String(req.params.token ?? ""));
-    if (!share) {
-      res.status(404).type("text/plain").send("Screenshot link expired or not found.");
-      return;
-    }
-    res.setHeader("Content-Type", "image/png");
-    res.setHeader("Content-Length", String(share.bytes));
-    res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Disposition", `inline; filename="${String(req.params.filename ?? "e2e-screenshot.png").replace(/"/g, "")}"`);
-    res.send(await fs.readFile(share.path));
-  });
+  if (mode === "general") {
+    app.get("/actions/e2e-screenshot-inline/:token/:filename", async (req, res) => {
+      const share = await readE2eScreenshotShare(ctx.stateDir, String(req.params.token ?? ""));
+      if (!share) {
+        res.status(404).type("text/plain").send("Screenshot link expired or not found.");
+        return;
+      }
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Content-Length", String(share.bytes));
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.setHeader("Content-Disposition", `inline; filename="${String(req.params.filename ?? "e2e-screenshot.png").replace(/"/g, "")}"`);
+      res.send(await fs.readFile(share.path));
+    });
+  }
 
-  app.post("/actions/call-tool", async (req, res) => {
-    if (!(await requireOwnerBearer(ctx, req, res))) return;
-    const { toolName, input } = genericToolInput(req.body);
-    if (!toolName) {
-      res.status(400).json({ ok: false, error: "Missing toolName" });
-      return;
-    }
-    const result = await callRegisteredTool(ctx, toolName, input);
-    res.json(await actionResponse(ctx, publicOrigin, toolName, result));
-  });
+  if (mode === "general") {
+    app.post("/actions/call-tool", async (req, res) => {
+      if (!(await requireOwnerBearer(ctx, req, res))) return;
+      const { toolName, input } = genericToolInput(req.body);
+      if (!toolName) {
+        res.status(400).json({ ok: false, error: "Missing toolName" });
+        return;
+      }
+      if (Object.hasOwn(GITHUB_PR_ACTION_FIELDS, toolName)) {
+        res.status(400).json({
+          ok: false,
+          error: `Dedicated monitor tool ${toolName} must use its strict Action route`,
+        });
+        return;
+      }
+      const result = await callRegisteredTool(ctx, toolName, input);
+      const response = await actionResponse(ctx, publicOrigin, toolName, result);
+      response.toolCall = {
+        ...(response.toolCall as Record<string, unknown>),
+        toolName: "call_tool",
+        input: { toolName, input },
+      };
+      res.json(response);
+    });
+  }
 
-  for (const route of ACTION_ROUTES) {
+  for (const route of actionRoutes) {
     app.post(route.path, async (req, res) => {
       if (!(await requireOwnerBearer(ctx, req, res))) return;
-      const result = await callRegisteredTool(ctx, route.tool, actionInputForRoute(route, req.body));
-      res.json(await actionResponse(ctx, publicOrigin, route.tool, result));
+      const strictInput = strictGithubPrActionInput(route, req.body);
+      const routeInput = strictInput
+        ? "error" in strictInput
+          ? undefined
+          : strictInput.input
+        : actionInputForRoute(route, req.body);
+      const result = strictInput && "error" in strictInput
+        ? strictInput.error
+        : await callRegisteredTool(ctx, route.tool, routeInput ?? {});
+      const response = await actionResponse(ctx, publicOrigin, route.tool, result);
+      if (routeInput) {
+        response.toolCall = {
+          ...(response.toolCall as Record<string, unknown>),
+          toolName: route.tool,
+          input: routeInput,
+        };
+      }
+      res.json(response);
     });
   }
 }

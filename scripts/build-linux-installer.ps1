@@ -56,6 +56,17 @@ Assert-UnderPath $PackageDir $BuildRoot
 $Npm = Get-ToolPath @("npm.cmd", "npm")
 $Tar = Get-ToolPath @("tar.exe", "tar")
 
+if (-not $NodeVersion -or $NodeVersion.Trim().Length -eq 0) {
+  $NodeVersion = (& node -p "process.version").Trim()
+  if ($NodeVersion.StartsWith("v")) { $NodeVersion = $NodeVersion.Substring(1) }
+}
+$NodeParts = $NodeVersion.Split('.')
+$NodeMajor = [int]$NodeParts[0]
+$NodeMinor = if ($NodeParts.Length -gt 1) { [int]$NodeParts[1] } else { 0 }
+if ($NodeMajor -lt 22 -or ($NodeMajor -eq 22 -and $NodeMinor -lt 16)) {
+  throw "Linux packaging requires Node.js 22.16.0 or newer; found $NodeVersion."
+}
+
 Write-Host "[chatgpt2codex] installing dependencies..."
 Invoke-Checked $Npm @("install")
 Write-Host "[chatgpt2codex] building TypeScript..."
@@ -88,10 +99,6 @@ try {
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("chatgpt2codex-linux-build-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 try {
-  if (-not $NodeVersion -or $NodeVersion.Trim().Length -eq 0) {
-    $NodeVersion = (& node -p "process.version").Trim()
-    if ($NodeVersion.StartsWith("v")) { $NodeVersion = $NodeVersion.Substring(1) }
-  }
   $NodeArchive = Join-Path $TempDir "node-linux-x64.tar.xz"
   $NodeUrl = "https://nodejs.org/dist/v$NodeVersion/node-v$NodeVersion-linux-x64.tar.xz"
   Write-Host "[chatgpt2codex] downloading Linux Node.js $NodeVersion..."

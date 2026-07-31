@@ -22,8 +22,8 @@ Portable/source install:
   once on Windows.
 - Fallback launcher: `windows\Start-ChatGPTToCodexTray.cmd`.
 
-The app uses `winget` to install Node.js LTS and `cloudflared` only when they
-are missing, then opens a tray controller. Starting MCP is loopback-only by
+The app uses `winget` to install Node.js when missing and requires Node.js
+22.16.0 or newer. It installs `cloudflared` only when missing, then opens a tray controller. Starting MCP is loopback-only by
 default. For ChatGPT web, prefer your own stable hostname; use temporary Quick
 Tunnel URLs only for short tests because they change after restart.
 

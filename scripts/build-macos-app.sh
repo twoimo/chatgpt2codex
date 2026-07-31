@@ -40,6 +40,10 @@ bundle_node_runtime() {
   if [[ "${CHATGPT2CODEX_BUNDLE_NODE:-1}" == "0" ]]; then
     return 0
   fi
+  if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 16) ? 0 : 1)'; then
+    echo "error: packaging requires Node.js 22.16.0 or newer; found $(node -v 2>/dev/null || echo unknown)." >&2
+    return 1
+  fi
   local node_version node_arch node_dist node_url node_tgz
   node_version="$(node -p 'process.versions.node')"
   case "$(uname -m)" in
@@ -56,7 +60,7 @@ bundle_node_runtime() {
     if download_with_cache "$node_url" "$node_tgz"; then
       tar -xzf "$node_tgz" -C "$DEPS_DIR"
     else
-      echo "warning: could not fetch Node.js runtime; installed app may need system Node.js 22+." >&2
+      echo "warning: could not fetch Node.js runtime; installed app needs system Node.js 22.16.0 or newer." >&2
       return 0
     fi
   fi

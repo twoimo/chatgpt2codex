@@ -22,9 +22,19 @@ function Ensure-Command([string]$Command, [string]$WingetId) {
     }
 }
 
+function Assert-NodeVersion {
+    $version = (& node -p "process.versions.node").Trim().Split('.')
+    $major = [int]$version[0]
+    $minor = [int]$version[1]
+    if ($major -lt 22 -or ($major -eq 22 -and $minor -lt 16)) {
+        throw "Node.js 22.16.0 or newer is required; found $(& node -v). Upgrade Node.js, then rerun this script."
+    }
+}
+
 Ensure-Command git "Git.Git"
 Ensure-Command node "OpenJS.NodeJS.LTS"
 Ensure-Command npm "OpenJS.NodeJS.LTS"
+Assert-NodeVersion
 Ensure-Command cloudflared "Cloudflare.cloudflared"
 
 $parent = Split-Path -Parent $InstallDir

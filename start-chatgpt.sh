@@ -132,9 +132,9 @@ wait_quick_tunnel_url() {
   local i
   for i in $(seq 1 "$tries"); do
     local url
-    url="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$CFLOG" | head -n 1 || true)"
+    url="$(awk 'match($0, /https:\/\/[a-zA-Z0-9.-]+\.trycloudflare\.com/) { print substr($0, RSTART, RLENGTH); exit }' "$CFLOG")"
     if [[ -n "$url" ]]; then
-      printf '%s\n' "$url"
+      PUBLIC_URL="$url"
       return 0
     fi
     if [[ -n "${CF_PID:-}" ]] && ! kill -0 "$CF_PID" 2>/dev/null; then
@@ -160,7 +160,7 @@ start_quick_tunnel_with_retry() {
 
     cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" >"$CFLOG" 2>&1 &
     CF_PID=$!
-    if PUBLIC_URL="$(wait_quick_tunnel_url 45)"; then
+    if wait_quick_tunnel_url 45; then
       return 0
     fi
     kill "$CF_PID" 2>/dev/null || true
@@ -268,7 +268,7 @@ if [[ "$USE_TUNNEL" == "1" ]]; then
   fi
 
   if [[ -z "${PUBLIC_URL:-}" ]]; then
-    PUBLIC_URL="$(wait_quick_tunnel_url 30)"
+    wait_quick_tunnel_url 30
   else
     for _ in $(seq 1 3); do
       if ! kill -0 "$CF_PID" 2>/dev/null; then
