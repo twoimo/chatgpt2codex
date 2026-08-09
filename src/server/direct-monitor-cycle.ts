@@ -1,14 +1,27 @@
-import { randomUUID } from "node:crypto";
-import type { DirectActionClient, DirectMonitorTool } from "./direct-action-client.js";
+import { createHash, randomUUID } from "node:crypto";
+import { successfulDirectActionResponse, type DirectActionClient, type DirectActionResponse, type DirectMonitorTool } from "./direct-action-client.js";
+import { executeMonitorActionPlan, type MonitorRollout } from "./direct-monitor-orchestrator.js";
 
 const REPOSITORY = "Yeachan-Heo/gajae-code";
 const AUTHOR = "twoimo";
 
-interface ActionResponse extends Record<string, unknown> {
-  ok: boolean;
-  tool: string;
-  toolCall: Record<string, unknown>;
-  structuredContent: Record<string, unknown>;
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "boolean": return value ? "true" : "false";
+    case "number":
+      if (!Number.isFinite(value)) throw new Error("read receipt contains a non-finite number");
+      return JSON.stringify(value);
+    case "string": return JSON.stringify(value);
+    case "object":
+      if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+      return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+    default: throw new Error("read receipt contains unsupported data");
+  }
+}
+
+function readReceiptFingerprint(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
 }
 
 function id(prefix: string): string {
@@ -17,25 +30,12 @@ function id(prefix: string): string {
 
 function record(value: unknown, message: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new Error(message);
   return value as Record<string, unknown>;
 }
 
-function successfulAction(value: Record<string, unknown>, tool: DirectMonitorTool): ActionResponse {
-  const toolCall = record(value.toolCall, `${tool} omitted toolCall proof`);
-  const structuredContent = record(value.structuredContent, `${tool} omitted structuredContent`);
-  if (
-    value.ok !== true ||
-    value.tool !== tool ||
-    toolCall.namespace !== "ChatGPT_To_Codex" ||
-    toolCall.ok !== true ||
-    structuredContent.ok !== true
-  ) {
-    throw new Error(`${tool} did not return an exact successful ChatGPT_To_Codex Action response`);
-  }
-  return value as ActionResponse;
-}
-
-function receipt(action: ActionResponse): Record<string, unknown> {
+function receipt(action: DirectActionResponse): Record<string, unknown> {
   const receiptId = action.structuredContent.receiptId;
   if (typeof receiptId !== "string" || !/^[0-9a-f]{64}$/u.test(receiptId)) {
     throw new Error(`${action.tool} returned an invalid receiptId`);
@@ -43,7 +43,7 @@ function receipt(action: ActionResponse): Record<string, unknown> {
   return { ok: true, namespace: action.toolCall.namespace, receiptId };
 }
 
-function parseStateStdout(action: ActionResponse): Record<string, unknown> {
+function parseStateStdout(action: DirectActionResponse): Record<string, unknown> {
   const stdout = action.structuredContent.stdout;
   if (typeof stdout !== "string") throw new Error("github_pr_monitor_state omitted stdout");
   const parsed: unknown = JSON.parse(stdout);
@@ -81,26 +81,57 @@ function prSummary(value: unknown): Record<string, unknown> {
 export async function runDirectMonitorCycle(
   client: DirectActionClient,
   identities: { runId?: string; actionPlanId?: string } = {},
+  options: { rollout?: MonitorRollout } = {},
 ): Promise<Record<string, unknown>> {
   const runId = identities.runId ?? id("direct_run");
   const actionPlanId = identities.actionPlanId ?? id("direct_plan");
   const readInput = { runId, actionPlanId, repository: REPOSITORY, author: AUTHOR };
-  const read = successfulAction(await client.call("github_pr_monitor_read", readInput), "github_pr_monitor_read");
+  const readResponse = await client.call("github_pr_monitor_read", readInput);
+  if (readResponse.ok !== true) {
+    const error = record(readResponse.structuredContent, "github_pr_monitor_read failure omitted structuredContent");
+    throw new Error(`github_pr_monitor_read failed: ${String(error.code ?? "UNKNOWN")} ${String(error.error ?? "unknown error")}`);
+  }
+  const read = successfulDirectActionResponse(readResponse, "github_pr_monitor_read", readInput);
   const snapshots = read.structuredContent.prs;
   if (!Array.isArray(snapshots)) throw new Error("github_pr_monitor_read omitted prs");
+  const rollout = options.rollout ?? "off";
+  if (rollout === "off") {
+    return {
+      chromeRequired: false,
+      runId,
+      bootstrapActionPlanId: actionPlanId,
+      read: receipt(read),
+      ingest: { status: "not_executed", reason: "rollout_off" },
+      plan: { status: "not_executed", rollout, execution: { status: "not_executed", reason: "rollout_off", effects: [] } },
+      prs: snapshots.map(prSummary),
+    };
+  }
 
-  const state = async (command: "ingest" | "plan-cycle", input: Record<string, unknown>) =>
-    successfulAction(
-      await client.call("github_pr_monitor_state", {
-        runId,
-        actionPlanId,
-        idempotencyKey: id(`direct_${command.replaceAll("-", "_")}`),
-        eventId: id(`direct_event_${command.replaceAll("-", "_")}`),
-        command,
-        input,
-      }),
-      "github_pr_monitor_state",
-    );
+  const state = async (command: "status" | "ingest" | "plan-cycle", input: Record<string, unknown>) => {
+    const stateInput = {
+      runId,
+      actionPlanId,
+      idempotencyKey: id(`direct_${command.replaceAll("-", "_")}`),
+      eventId: id(`direct_event_${command.replaceAll("-", "_")}`),
+      command,
+      input,
+    };
+    const response = await client.call("github_pr_monitor_state", stateInput);
+    if (response.ok !== true) {
+      const structured = record(response.structuredContent, "github_pr_monitor_state error omitted structuredContent");
+      throw new Error(`github_pr_monitor_state ${command} failed: ${String(structured.code ?? "UNKNOWN")}: ${String(structured.error ?? response.text)}`);
+    }
+    return successfulDirectActionResponse(response, "github_pr_monitor_state", stateInput);
+  };
+
+  const status = await state("status", {});
+  const statusState = parseStateStdout(status);
+  const statusResult = record(statusState.result, "status omitted result");
+  const database = record(statusResult.database, "status omitted database health");
+  const rolloutModes = statusResult.rolloutModes;
+  if (database.userVersion !== 4 || database.healthy !== true || !Array.isArray(rolloutModes) || !rolloutModes.includes(rollout)) {
+    throw new Error("github_pr_monitor_state status failed v4 capability or database-health negotiation");
+  }
 
   const ingest = await state("ingest", { receipt: read });
   const planPrs = snapshots.map((value) => {
@@ -110,13 +141,22 @@ export async function runDirectMonitorCycle(
       author: AUTHOR,
       headRef: pr.headRefName,
       headOid: pr.headRefOid,
-      attempts: 0,
-      tier: 1,
+      baseRepository: record(pr.baseRepository, "PR snapshot omitted baseRepository").nameWithOwner,
+      baseRef: pr.baseRefName,
+      baseOid: pr.baseRefOid,
     };
   });
-  const plan = await state("plan-cycle", { receipt: read, prs: planPrs });
+  const plan = await state("plan-cycle", {
+    receipt: read,
+    prs: planPrs,
+  });
   const planState = parseStateStdout(plan);
   const actionPlan = record(planState.result, "plan-cycle omitted result");
+  const execution = await executeMonitorActionPlan(client, actionPlan, {
+    rollout,
+    runId,
+    readReceiptFingerprint: readReceiptFingerprint(read),
+  });
 
   return {
     chromeRequired: false,
@@ -128,6 +168,8 @@ export async function runDirectMonitorCycle(
       ...receipt(plan),
       status: actionPlan.status,
       actionPlanId: actionPlan.actionPlanId,
+      rollout,
+      execution,
     },
     prs: snapshots.map(prSummary),
     actionPlan,

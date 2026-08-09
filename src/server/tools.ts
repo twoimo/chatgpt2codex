@@ -22,44 +22,87 @@ import { codeSearch } from "../code/search.js";
 import { readSlice } from "../code/read-slice.js";
 import { applyPatch, createFile } from "../code/patch.js";
 import { createCheckpoint, getWorkingDiff, listCheckpoints, readCheckpoint, restoreCheckpoint } from "../state/checkpoints.js";
-import { listImages, retrieveImage, saveImage, writeVersionedImage } from "../assets/images.js";
-import { intakeFromClipboard, intakeFromDownload, intakeFromPath, readClipboardText } from "../assets/image-intake.js";
-import { fetchImageFromUrl } from "../assets/image-url.js";
-import { prepareChatGptImagesApp } from "../assets/chatgpt-images-app.js";
+type ImagesModule = typeof import("../assets/images.js");
+type ImageIntakeModule = typeof import("../assets/image-intake.js");
+type ImageUrlModule = typeof import("../assets/image-url.js");
+type ChatGptImagesAppModule = typeof import("../assets/chatgpt-images-app.js");
+type E2eShareModule = typeof import("../e2e/screenshot-share.js");
+type E2eModule = typeof import("../e2e/local-e2e.js");
+type ControlToolsModule = typeof import("../control/tools.js");
+
+let imagesModulePromise: Promise<ImagesModule> | undefined;
+let imageIntakeModulePromise: Promise<ImageIntakeModule> | undefined;
+let imageUrlModulePromise: Promise<ImageUrlModule> | undefined;
+let chatGptImagesAppModulePromise: Promise<ChatGptImagesAppModule> | undefined;
+let e2eShareModulePromise: Promise<E2eShareModule> | undefined;
+let e2eModulePromise: Promise<E2eModule> | undefined;
+let controlToolsModulePromise: Promise<ControlToolsModule> | undefined;
+
+const loadImagesModule = (): Promise<ImagesModule> => imagesModulePromise ??= import("../assets/images.js");
+const loadImageIntakeModule = (): Promise<ImageIntakeModule> => imageIntakeModulePromise ??= import("../assets/image-intake.js");
+const loadImageUrlModule = (): Promise<ImageUrlModule> => imageUrlModulePromise ??= import("../assets/image-url.js");
+const loadChatGptImagesAppModule = (): Promise<ChatGptImagesAppModule> => chatGptImagesAppModulePromise ??= import("../assets/chatgpt-images-app.js");
+const loadE2eShareModule = (): Promise<E2eShareModule> => e2eShareModulePromise ??= import("../e2e/screenshot-share.js");
+const loadE2eModule = (): Promise<E2eModule> => e2eModulePromise ??= import("../e2e/local-e2e.js");
+const loadControlToolsModule = (): Promise<ControlToolsModule> => controlToolsModulePromise ??= import("../control/tools.js");
+
+const listImages: ImagesModule["listImages"] = (...args) => loadImagesModule().then(({ listImages: fn }) => fn(...args));
+const retrieveImage: ImagesModule["retrieveImage"] = (...args) => loadImagesModule().then(({ retrieveImage: fn }) => fn(...args));
+const saveImage: ImagesModule["saveImage"] = (...args) => loadImagesModule().then(({ saveImage: fn }) => fn(...args));
+const writeVersionedImage: ImagesModule["writeVersionedImage"] = (...args) => loadImagesModule().then(({ writeVersionedImage: fn }) => fn(...args));
+const intakeFromClipboard: ImageIntakeModule["intakeFromClipboard"] = (...args) => loadImageIntakeModule().then(({ intakeFromClipboard: fn }) => fn(...args));
+const intakeFromDownload: ImageIntakeModule["intakeFromDownload"] = (...args) => loadImageIntakeModule().then(({ intakeFromDownload: fn }) => fn(...args));
+const intakeFromPath: ImageIntakeModule["intakeFromPath"] = (...args) => loadImageIntakeModule().then(({ intakeFromPath: fn }) => fn(...args));
+const readClipboardText: ImageIntakeModule["readClipboardText"] = (...args) => loadImageIntakeModule().then(({ readClipboardText: fn }) => fn(...args));
+const fetchImageFromUrl: ImageUrlModule["fetchImageFromUrl"] = (...args) => loadImageUrlModule().then(({ fetchImageFromUrl: fn }) => fn(...args));
+const prepareChatGptImagesApp: ChatGptImagesAppModule["prepareChatGptImagesApp"] = (...args) =>
+  loadChatGptImagesAppModule().then(({ prepareChatGptImagesApp: fn }) => fn(...args));
+const createE2eScreenshotShare: E2eShareModule["createE2eScreenshotShare"] = (...args) =>
+  loadE2eShareModule().then(({ createE2eScreenshotShare: fn }) => fn(...args));
+const captureE2eAppScreenshot: E2eModule["captureE2eAppScreenshot"] = (...args) =>
+  loadE2eModule().then(({ captureE2eAppScreenshot: fn }) => fn(...args));
+const captureE2eAppScreenshotSet: E2eModule["captureE2eAppScreenshotSet"] = (...args) =>
+  loadE2eModule().then(({ captureE2eAppScreenshotSet: fn }) => fn(...args));
+const captureE2eScreenshot: E2eModule["captureE2eScreenshot"] = (...args) =>
+  loadE2eModule().then(({ captureE2eScreenshot: fn }) => fn(...args));
+const captureE2eUrlScreenshot: E2eModule["captureE2eUrlScreenshot"] = (...args) =>
+  loadE2eModule().then(({ captureE2eUrlScreenshot: fn }) => fn(...args));
+const captureE2eUrlScreenshotSet: E2eModule["captureE2eUrlScreenshotSet"] = (...args) =>
+  loadE2eModule().then(({ captureE2eUrlScreenshotSet: fn }) => fn(...args));
+const createE2eScreenshotPreview: E2eModule["createE2eScreenshotPreview"] = (...args) =>
+  loadE2eModule().then(({ createE2eScreenshotPreview: fn }) => fn(...args));
+const openE2eTarget: E2eModule["openE2eTarget"] = (...args) =>
+  loadE2eModule().then(({ openE2eTarget: fn }) => fn(...args));
+const startE2eServer: E2eModule["startE2eServer"] = (...args) =>
+  loadE2eModule().then(({ startE2eServer: fn }) => fn(...args));
+const stopE2eServer: E2eModule["stopE2eServer"] = (...args) =>
+  loadE2eModule().then(({ stopE2eServer: fn }) => fn(...args));
+const handleComputerActionStatus: ControlToolsModule["handleComputerActionStatus"] = (...args) =>
+  loadControlToolsModule().then(({ handleComputerActionStatus: fn }) => fn(...args));
+const handleComputerKillSwitch: ControlToolsModule["handleComputerKillSwitch"] = (...args) =>
+  loadControlToolsModule().then(({ handleComputerKillSwitch: fn }) => fn(...args));
+const handleComputerRequestAction: ControlToolsModule["handleComputerRequestAction"] = (...args) =>
+  loadControlToolsModule().then(({ handleComputerRequestAction: fn }) => fn(...args));
+const handleComputerScreenshot: ControlToolsModule["handleComputerScreenshot"] = (...args) =>
+  loadControlToolsModule().then(({ handleComputerScreenshot: fn }) => fn(...args));
 import { listCommands, runCommand } from "../exec/command-runner.js";
 import { runLocalShell } from "../exec/local-shell.js";
-import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { addToolCallProof, toolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
 import { ActionReceiptAuthority, ACTION_RECEIPT_TTL_MS, type ActionReceiptPhase, type MutationOutcomeBinding, type MutationOutcomeStatus, type StoredActionReceipt } from "./action-receipts.js";
-import {
-  captureE2eAppScreenshot,
-  captureE2eAppScreenshotSet,
-  captureE2eScreenshot,
-  captureE2eUrlScreenshot,
-  captureE2eUrlScreenshotSet,
-  createE2eScreenshotPreview,
-  openE2eTarget,
-  startE2eServer,
-  stopE2eServer,
-} from "../e2e/local-e2e.js";
 import { gitRepositoryStatus, gitStatus, gitDiffSummary, gitStageAndCommit, gitPush } from "../git/git.js";
 import { resolveInProject } from "../policy/paths.js";
 import { isSecretPath, redact } from "../policy/secrets.js";
 import { resolveActiveProject } from "../workspace/active.js";
 import { CONTROL_TOOL_NAMES, isControlChatGptExposed, isControlEnabled } from "../control/policy.js";
 import { clearKill } from "../control/queue.js";
-import {
-  handleComputerActionStatus,
-  handleComputerKillSwitch,
-  handleComputerRequestAction,
-  handleComputerScreenshot,
-} from "../control/tools.js";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { createVerifiedMonitorArtifact, pushVerifiedMonitorArtifact, type MonitorOciArtifactTask, type VerifiedMonitorArtifact } from "./monitor-oci-artifact.js";
 
 // ---------------------------------------------------------------------------
 // Session helpers
@@ -396,10 +439,23 @@ function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): void {
  * wire shape expected by `registerTool` callbacks (plain object + index
  * signature, rather than our narrower interface type).
  */
-function toCallToolResult(toolName: string, result: ToolResult<Record<string, unknown>>): CallToolResultLike {
+function toCallToolResult(
+  toolName: string,
+  result: ToolResult<Record<string, unknown>>,
+  input: unknown,
+): CallToolResultLike {
+  const structured = toolName.startsWith("github_pr_monitor_")
+    ? {
+        ...result.structuredContent,
+        protocolVersion: 1,
+        schemaVersion: 4,
+        requestDigest: monitorFingerprint(input),
+        chatgpt2codexToolCall: toolCallProof(toolName, result.isError !== true),
+      }
+    : addToolCallProof(result.structuredContent, toolName, result.isError !== true);
   return {
     content: result.content,
-    structuredContent: addToolCallProof(result.structuredContent, toolName, result.isError !== true),
+    structuredContent: structured,
     ...(result.isError ? { isError: true } : {}),
     ...(result._meta ? { _meta: result._meta } : {}),
   };
@@ -416,20 +472,20 @@ async function withErrorMapping<T extends Record<string, unknown>>(
     await ctx.ledger.append({
       type: "tool.call.completed",
       tool: toolName,
-      input: redactUnknown(input),
+      input: ledgerSafeInput(toolName, input),
       isError: result.isError ?? false,
     });
-    return toCallToolResult(toolName, result);
+    return toCallToolResult(toolName, result, input);
   } catch (err) {
     const mapped = mapError(err);
     await ctx.ledger.append({
       type: "tool.call.failed",
       tool: toolName,
-      input: redactUnknown(input),
+      input: ledgerSafeInput(toolName, input),
       code: mapped.structuredContent.code,
       error: mapped.structuredContent.error,
     });
-    return toCallToolResult(toolName, mapped);
+    return toCallToolResult(toolName, mapped, input);
   }
 }
 
@@ -443,12 +499,33 @@ function redactUnknown(input: unknown): unknown {
   }
 }
 
+function ledgerSafeInput(toolName: string, input: unknown): unknown {
+  if (!toolName.startsWith("github_pr_monitor_")) return redactUnknown(input);
+  const value = input !== null && typeof input === "object" && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {};
+  return {
+    inputDigest: monitorFingerprint(input),
+    runId: typeof value.runId === "string" ? value.runId : undefined,
+    actionPlanId: typeof value.actionPlanId === "string" ? value.actionPlanId : undefined,
+    idempotencyKey: typeof value.idempotencyKey === "string" ? value.idempotencyKey : undefined,
+    command: typeof value.command === "string" ? value.command : undefined,
+    operation: typeof value.operation === "string" ? value.operation : undefined,
+    prNumber: typeof value.prNumber === "number" ? value.prNumber : undefined,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Lease enforcement for mutating tools
 // ---------------------------------------------------------------------------
 const execFileAsync = promisify(execFile);
 const GITHUB_PR_REPOSITORY = "Yeachan-Heo/gajae-code";
 const GITHUB_PR_AUTHOR = "twoimo";
+type MonitorRolloutMode = "off" | "shadow" | "prepare" | "enabled";
+function monitorRolloutMode(): MonitorRolloutMode {
+  const value = process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+  return value === "shadow" || value === "prepare" || value === "enabled" ? value : "off";
+}
 const SAFE_SHA = /^[0-9a-f]{40}$/i;
 const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$/;
 const SAFE_ID = /^[A-Za-z0-9_=-]{1,300}$/;
@@ -459,37 +536,45 @@ function requireGithubPrIdentity(repository: string, author: string, prNumber: n
   }
   if (!Number.isSafeInteger(prNumber) || prNumber < 1) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR number must be a positive integer");
 }
+const GITHUB_CLI_OUTPUT_BYTES = 256 * 1024;
 
 async function githubCommand(args: string[], cwd?: string): Promise<string> {
-  const result = await execFileAsync("gh", args, { cwd, maxBuffer: 1024 * 1024 });
-  return result.stdout;
+  try {
+    const result = await execFileAsync("gh", args, { cwd, maxBuffer: GITHUB_CLI_OUTPUT_BYTES });
+    return result.stdout;
+  } catch (error: unknown) {
+    if (error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "GitHub CLI output exceeded its bounded 256KiB envelope");
+    }
+    throw error;
+  }
 }
 const GITHUB_PR_MONITOR_CLI_DIR = "/Users/twoimo/Library/Application Support/GajaeCodePRMonitor";
 const GITHUB_PR_MONITOR_SOURCE_DIR = `${GITHUB_PR_MONITOR_CLI_DIR}/source`;
 const GITHUB_PR_MONITOR_DATABASE = `${GITHUB_PR_MONITOR_CLI_DIR}/.gajae-pr-monitor.sqlite`;
 const MONITOR_STATE_COMMANDS = ["ingest", "plan-cycle", "record-side-effect", "reconcile", "terminal-report", "status"] as const;
-type MonitorActionOperation = "create" | "quarantine" | "post_reply" | "resolve_thread" | "rerequest_reviewer" | "push_prepared_worktree";
+type MonitorActionOperation = "create" | "quarantine" | "post_reply" | "resolve_thread" | "rerequest_reviewer" | "push_prepared_worktree" | "apply_suggestions";
 
-interface MonitorActionClaim {
+type MonitorActionClaim = MonitorAuthorizationBindingV1 & {
   runId: string;
   actionPlanId: string;
   idempotencyKey: string;
   repository: typeof GITHUB_PR_REPOSITORY;
   prNumber: number;
   headSha: string;
-  phase: "prepare" | "mutate";
+  phase: "prepare" | "execute" | "mutate";
   operation: MonitorActionOperation;
   operationFields: Record<string, unknown>;
-}
+};
 
-interface MonitorActionClaimReceipt {
+type MonitorActionClaimReceipt = MonitorAuthorizationBindingV1 & {
   ok: true;
   claimId: string;
   claimedAt: string;
   payloadDigest: string;
   coordinationId: string;
   claimStatus: "claimed" | "applied" | "reconciled";
-}
+};
 
 type MonitorStateCommand = typeof MONITOR_STATE_COMMANDS[number];
 type MonitorRecoveryStage = "ingest" | "plan" | "claim" | "record" | "reconcile";
@@ -539,6 +624,127 @@ function monitorFingerprint(value: unknown): string {
   return createHash("sha256").update(monitorCanonicalJson(value), "utf8").digest("hex");
 }
 
+const MONITOR_AUTHORIZATION_EFFECT_KIND = ["prepare_create", "prepare_quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "commit", "normal_push"] as const;
+const MONITOR_AUTHORIZATION_BASE_KEYS = [
+  "protocolVersion", "schemaVersion", "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey",
+  "operationHeadSha", "effectIdentity", "targetDigest", "policyDigest", "bindingDigest",
+] as const;
+const MONITOR_AUTHORIZATION_EFFECT_KEYS = ["effectKey", "effectKind"] as const;
+const MONITOR_AUTHORIZATION_KEYS = [...MONITOR_AUTHORIZATION_BASE_KEYS, ...MONITOR_AUTHORIZATION_EFFECT_KEYS] as const;
+const MonitorAuthorizationBindingV1Fields = {
+  protocolVersion: z.literal(1),
+  schemaVersion: z.literal(4),
+  ownerId: z.string().min(1).max(300),
+  leaseKey: z.string().min(1).max(300),
+  fence: z.number().int().positive(),
+  logicalIdentity: z.string().regex(MONITOR_DIGEST),
+  operationKey: z.string().regex(MONITOR_DIGEST),
+  operationHeadSha: z.string().regex(SAFE_SHA),
+  effectIdentity: z.string().regex(MONITOR_DIGEST),
+  effectKey: z.string().regex(MONITOR_DIGEST).optional(),
+  effectKind: z.enum(MONITOR_AUTHORIZATION_EFFECT_KIND).optional(),
+  targetDigest: z.string().regex(MONITOR_DIGEST),
+  policyDigest: z.string().regex(MONITOR_DIGEST),
+  bindingDigest: z.string().regex(MONITOR_DIGEST),
+};
+
+type MonitorAuthorizationBindingV1Base = {
+  protocolVersion: 1;
+  schemaVersion: 4;
+  ownerId: string;
+  leaseKey: string;
+  fence: number;
+  logicalIdentity: string;
+  operationKey: string;
+  operationHeadSha: string;
+  effectIdentity: string;
+  targetDigest: string;
+  policyDigest: string;
+  bindingDigest: string;
+};
+
+export type MonitorAuthorizationBindingV1 = MonitorAuthorizationBindingV1Base & (
+  | { effectKey: string; effectKind: typeof MONITOR_AUTHORIZATION_EFFECT_KIND[number] }
+  | { effectKey?: never; effectKind?: never }
+);
+
+export const MonitorAuthorizationBindingV1Schema = z.object(MonitorAuthorizationBindingV1Fields).strict().superRefine((binding, ctx) => {
+  const hasEffectKey = binding.effectKey !== undefined;
+  const hasEffectKind = binding.effectKind !== undefined;
+  if (hasEffectKey !== hasEffectKind) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "effectKey and effectKind must be provided together" });
+    return;
+  }
+  const { bindingDigest, ...unsigned } = binding;
+  if (monitorFingerprint(unsigned) !== bindingDigest) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["bindingDigest"], message: "bindingDigest must be the canonical v1 authorization fingerprint" });
+  }
+});
+
+function monitorAuthorizationBinding(
+  value: Record<string, unknown>,
+  effects: "optional" | "required",
+): MonitorAuthorizationBindingV1 {
+  const candidate = Object.fromEntries(
+    MONITOR_AUTHORIZATION_KEYS.flatMap((key) => value[key] === undefined ? [] : [[key, value[key]]]),
+  );
+  const parsed = MonitorAuthorizationBindingV1Schema.parse(candidate) as MonitorAuthorizationBindingV1;
+  if (effects === "required" && (parsed.effectKey === undefined || parsed.effectKind === undefined)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Mutation authorization requires effectKey and effectKind");
+  }
+  if (value.expectedHeadSha !== undefined && parsed.operationHeadSha !== value.expectedHeadSha) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Mutation authorization operationHeadSha must equal expectedHeadSha");
+  }
+  return structuredClone(parsed);
+}
+
+function exactMonitorAuthorizationBinding(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+  effects: "optional" | "required",
+): MonitorAuthorizationBindingV1 {
+  const binding = monitorAuthorizationBinding(left, effects);
+  const compared = monitorAuthorizationBinding(right, effects);
+  if (monitorCanonicalJson(binding) !== monitorCanonicalJson(compared)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor authorization binding was omitted or altered");
+  }
+  return binding;
+}
+
+function relatedMonitorAuthorizationBinding(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): void {
+  const leftBinding = monitorAuthorizationBinding(left, "required");
+  const rightBinding = monitorAuthorizationBinding(right, "required");
+  for (const key of [
+    "protocolVersion",
+    "schemaVersion",
+    "ownerId",
+    "leaseKey",
+    "fence",
+    "operationHeadSha",
+  ] as const) {
+    if (leftBinding[key] !== rightBinding[key]) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Consumed reply receipt is not bound to the current resolve authority");
+    }
+  }
+}
+
+function monitorMutationInputSchema<T extends z.ZodRawShape>(
+  shape: T,
+  effects: "optional" | "required",
+): z.ZodObject<T & typeof MonitorAuthorizationBindingV1Fields> {
+  const authorizationFields = effects === "required"
+    ? {
+        ...MonitorAuthorizationBindingV1Fields,
+        effectKey: z.string().regex(MONITOR_DIGEST),
+        effectKind: z.enum(MONITOR_AUTHORIZATION_EFFECT_KIND),
+      }
+    : MonitorAuthorizationBindingV1Fields;
+  return z.object({ ...shape, ...authorizationFields }).strict() as z.ZodObject<T & typeof MonitorAuthorizationBindingV1Fields>;
+}
+
 function monitorExactRecord(value: unknown, keys: readonly string[], context: string): Record<string, unknown> {
   const record = requireRecord(value, `${context} returned a non-object JSON document`);
   const actual = Object.keys(record).sort();
@@ -563,6 +769,15 @@ function monitorIso(value: unknown, name: string): string {
   return value;
 }
 
+const MONITOR_VERSIONED_COMMANDS = new Set<MonitorStateCommand>([
+  "ingest",
+  "plan-cycle",
+  "record-side-effect",
+  "reconcile",
+  "status",
+  "terminal-report",
+]);
+
 function parseMonitorDocument(stdout: string, command: string): Record<string, unknown> {
   const document = stdout.trim();
   if (!document) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} returned an empty response`);
@@ -572,7 +787,13 @@ function parseMonitorDocument(stdout: string, command: string): Record<string, u
   } catch {
     throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} did not return exactly one JSON document`);
   }
-  return requireRecord(parsed, `Monitor ${command} returned a non-object JSON document`);
+  const response = requireRecord(parsed, `Monitor ${command} returned a non-object JSON document`);
+  if (MONITOR_VERSIONED_COMMANDS.has(command as MonitorStateCommand)
+    && (response.protocolVersion !== 1 || response.schemaVersion !== 4
+      || typeof response.requestDigest !== "string" || !MONITOR_DIGEST.test(response.requestDigest))) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} returned an unversioned or invalid state envelope`);
+  }
+  return response;
 }
 
 async function boundedMonitorProcess(command: string, input: unknown): Promise<MonitorExecution> {
@@ -583,12 +804,19 @@ async function boundedMonitorProcess(command: string, input: unknown): Promise<M
     throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor IPC input exceeds 64KiB");
   }
   const stdout = await new Promise<string>((resolve, reject) => {
-    const child = spawn("npm", ["run", "--silent", "monitor", "--", command, "--db", GITHUB_PR_MONITOR_DATABASE], {
+    const useTestMonitorShim = process.env.NODE_ENV === "test";
+    const child = spawn(
+      useTestMonitorShim ? "npm" : "sh",
+      useTestMonitorShim
+        ? ["run", "--silent", "monitor", "--", command, "--db", GITHUB_PR_MONITOR_DATABASE]
+        : ["scripts/run-monitor.sh", command, "--db", GITHUB_PR_MONITOR_DATABASE],
+      {
       cwd: GITHUB_PR_MONITOR_SOURCE_DIR,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { PATH: process.env.PATH ?? "" },
+      env: { PATH: process.env.PATH ?? "", CHATGPT2CODEX_MONITOR_ROLLOUT: monitorRolloutMode() },
       detached: process.platform !== "win32",
-    });
+      },
+    );
     const output: Buffer[] = [];
     const errors: Buffer[] = [];
     let outputBytes = 0;
@@ -675,7 +903,49 @@ async function boundedMonitorProcess(command: string, input: unknown): Promise<M
     });
     child.stdin.end(payload);
   });
-  return { response: parseMonitorDocument(stdout, command), stdout };
+  const response = parseMonitorDocument(stdout, command);
+  return { response, stdout: JSON.stringify(response) };
+}
+
+async function renewMonitorAuthorizationLease(authorization: MonitorAuthorizationBindingV1): Promise<void> {
+  const request = {
+    protocolVersion: 1 as const,
+    schemaVersion: 4 as const,
+    leaseKey: authorization.leaseKey,
+    ownerId: authorization.ownerId,
+    runId: authorization.ownerId,
+    fence: authorization.fence,
+    leaseMs: 30_000,
+  };
+  const execution = await boundedMonitorProcess("lease-renew", request);
+  const response = monitorExactRecord(
+    execution.response,
+    ["ok", "command", "protocolVersion", "schemaVersion", "requestDigest", "result"],
+    "Monitor lease-renew",
+  );
+  const renewed = monitorExactRecord(
+    response.result,
+    ["protocolVersion", "schemaVersion", "leaseKey", "ownerId", "runId", "fence", "expiresAt", "serverTime"],
+    "Monitor lease-renew result",
+  );
+  const serverTime = monitorIso(renewed.serverTime, "serverTime");
+  const expiresAt = monitorIso(renewed.expiresAt, "expiresAt");
+  const lifetime = Date.parse(expiresAt) - Date.parse(serverTime);
+  if (response.ok !== true
+    || response.command !== "lease-renew"
+    || response.protocolVersion !== 1
+    || response.schemaVersion !== 4
+    || response.requestDigest !== monitorFingerprint(request)
+    || renewed.protocolVersion !== 1
+    || renewed.schemaVersion !== 4
+    || renewed.leaseKey !== authorization.leaseKey
+    || renewed.ownerId !== authorization.ownerId
+    || renewed.runId !== authorization.ownerId
+    || renewed.fence !== authorization.fence
+    || lifetime < 1
+    || lifetime > 30_000) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor lease renewal did not preserve the exact v1 owner, fence, and expiry binding");
+  }
 }
 
 function validateRecoveryResponse(query: MonitorRecoveryQuery, value: Record<string, unknown>): Record<string, unknown> {
@@ -752,10 +1022,15 @@ function validateClaimResponse(
 ): MonitorActionClaimReceipt {
   const claim = monitorExactRecord(
     value,
-    ["command", "ok", "claimId", "claimedAt", "payloadDigest", "runId", "coordinationId", "actionPlanId", "idempotencyKey"],
+    [
+      "command", "ok", "claimId", "claimedAt", "payloadDigest", "runId", "coordinationId", "actionPlanId", "idempotencyKey",
+      ...MONITOR_AUTHORIZATION_BASE_KEYS,
+      ...(input.effectKey === undefined ? [] : MONITOR_AUTHORIZATION_EFFECT_KEYS),
+    ],
     "Monitor claim-action",
   );
   const expectedPayloadDigest = monitorFingerprint(input);
+  const authorization = exactMonitorAuthorizationBinding(claim, input, input.effectKey === undefined ? "optional" : "required");
   if (claim.command !== "claim-action"
     || claim.ok !== true
     || claim.runId !== input.runId
@@ -763,9 +1038,10 @@ function validateClaimResponse(
     || claim.actionPlanId !== input.actionPlanId
     || claim.idempotencyKey !== input.idempotencyKey
     || claim.payloadDigest !== expectedPayloadDigest) {
-    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor action claim was not durably granted with exact run, coordination, plan, idempotency, and payload bindings");
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor action claim was not durably granted with exact run, coordination, plan, idempotency, payload, and v1 fence bindings");
   }
   return {
+    ...authorization,
     ok: true,
     claimId: monitorBoundString(claim.claimId, "claimId"),
     claimedAt: monitorIso(claim.claimedAt, "claimedAt"),
@@ -790,6 +1066,7 @@ async function claimMonitorAction(ctx: ToolContext, input: MonitorActionClaim): 
     const recovered = await recoverMonitorTransition(recoveryQuery);
     if (recovered.response.committed !== true) return undefined;
     return {
+      ...monitorAuthorizationBinding(input, input.effectKey === undefined ? "optional" : "required"),
       ok: true,
       claimId: monitorBoundString(recovered.response.claimId, "claimId"),
       claimedAt: monitorIso(recovered.response.committedAt, "committedAt"),
@@ -812,7 +1089,39 @@ async function claimMonitorAction(ctx: ToolContext, input: MonitorActionClaim): 
 
 function readReceiptCoordination(input: Record<string, unknown>): string {
   const readReceipt = requireRecord(input.readReceipt, "Monitor state input omitted its durable read receipt");
+  if (readReceipt.ok !== true || readReceipt.tool !== "github_pr_monitor_read") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor state read evidence is not a successful github_pr_monitor_read envelope");
+  }
   const structured = requireRecord(readReceipt.structuredContent, "Monitor read receipt omitted structured content");
+  let encodedStructured: string;
+  try {
+    encodedStructured = JSON.stringify(structured);
+  } catch {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor read evidence is not JSON-serializable");
+  }
+  if (Buffer.byteLength(encodedStructured, "utf8") > GITHUB_CLI_OUTPUT_BYTES) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor read evidence exceeded its bounded 256KiB envelope");
+  }
+  if (structured.protocolVersion !== 1 || structured.schemaVersion !== 4
+    || structured.namespace !== "ChatGPT_To_Codex"
+    || structured.tool !== "github_pr_monitor_read"
+    || structured.operation !== "read"
+    || structured.ok !== true
+    || structured.repository !== GITHUB_PR_REPOSITORY
+    || structured.author !== GITHUB_PR_AUTHOR) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor read evidence omitted the exact v1 fixed-repository envelope");
+  }
+  if (!Array.isArray(structured.prs) || structured.prs.length > MONITOR_MAX_FEEDBACK_ITEMS) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor read evidence omitted a bounded PR snapshot list");
+  }
+  for (const value of structured.prs) {
+    const snapshot = requireRecord(value, "Monitor read evidence contains an invalid PR snapshot");
+    const headRepository = requireRecord(snapshot.headRepository, "Monitor read evidence omitted head repository");
+    const baseRepository = requireRecord(snapshot.baseRepository, "Monitor read evidence omitted base repository");
+    if (headRepository.nameWithOwner !== GITHUB_PR_REPOSITORY || baseRepository.nameWithOwner !== GITHUB_PR_REPOSITORY) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor read evidence contains an unapproved repository topology");
+    }
+  }
   return monitorBoundString(structured.actionPlanId, "coordinationId");
 }
 
@@ -824,29 +1133,51 @@ function validateMonitorStateResponse(
   expectedRunId?: string,
 ): Record<string, unknown> {
   if (command === "status") {
-    const response = monitorExactRecord(value, ["ok", "command", "result"], "Monitor status");
-    if (response.ok !== true || response.command !== command) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor status response is not bound to status");
+    const response = monitorExactRecord(
+      value,
+      ["ok", "command", "protocolVersion", "schemaVersion", "requestDigest", "result"],
+      "Monitor status",
+    );
+    if (
+      response.ok !== true
+      || response.command !== command
+      || response.protocolVersion !== 1
+      || response.schemaVersion !== 4
+      || response.requestDigest !== monitorFingerprint(input)
+    ) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor status response is not bound to the versioned status request");
+    }
     return response;
   }
   if (command === "terminal-report") {
-    const response = monitorExactRecord(value, ["command", "proof", "ok", "runId", "actionPlanId", "status"], "Monitor terminal-report");
+    const response = monitorExactRecord(
+      value,
+      ["command", "proof", "ok", "protocolVersion", "schemaVersion", "requestDigest", "runId", "actionPlanId", "status"],
+      "Monitor terminal-report",
+    );
     if (response.command !== command
       || response.proof !== "ChatGPT_To_Codex"
       || response.ok !== true
+      || response.protocolVersion !== 1
+      || response.schemaVersion !== 4
+      || response.requestDigest !== monitorFingerprint(input)
       || response.runId !== input.runId
       || response.actionPlanId !== input.actionPlanId) {
-      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor terminal-report response did not exactly bind the request");
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor terminal-report response did not exactly bind the versioned request");
     }
     return response;
   }
   const keys = command === "plan-cycle"
-    ? ["ok", "command", "runId", "coordinationId", "actionPlanId", "requestDigest", "result"]
+    ? ["ok", "command", "protocolVersion", "schemaVersion", "runId", "coordinationId", "actionPlanId", "requestDigest", "result"]
     : command === "record-side-effect"
-      ? ["ok", "command", "runId", "coordinationId", "actionPlanId", "idempotencyKey", "claimId", "claimPayloadDigest", "requestDigest", "result"]
+      ? ["ok", "command", "protocolVersion", "schemaVersion", "runId", "coordinationId", "actionPlanId", "idempotencyKey", "claimId", "claimPayloadDigest", "requestDigest", "result"]
       : command === "reconcile"
-        ? ["ok", "command", "runId", "coordinationId", "actionPlanId", "idempotencyKey", "requestDigest", "result"]
-        : ["ok", "command", "runId", "coordinationId", "requestDigest", "result"];
+        ? ["ok", "command", "protocolVersion", "schemaVersion", "runId", "coordinationId", "actionPlanId", "idempotencyKey", "requestDigest", "result"]
+        : ["ok", "command", "protocolVersion", "schemaVersion", "runId", "coordinationId", "requestDigest", "result"];
   const response = monitorExactRecord(value, keys, `Monitor ${command}`);
+  if (response.protocolVersion !== 1 || response.schemaVersion !== 4) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Monitor ${command} response did not negotiate protocolVersion=1 and schemaVersion=4`);
+  }
   const reconciliationReceipt = command === "reconcile"
     ? requireRecord(
         requireRecord(
@@ -949,11 +1280,146 @@ function requireReviewerFromSnapshot(snapshot: Record<string, unknown>, reviewer
   const isPreviousReviewer = snapshot.reviews.some((value) => {
     const review = requireRecord(value, "Current PR snapshot returned an invalid review");
     if (review.author === null || review.author === undefined) return false;
-    return requireRecord(review.author, "Current PR snapshot returned an invalid review author").login === reviewer;
+    const reviewAuthor = requireRecord(review.author, "Current PR snapshot returned an invalid review author");
+    return reviewAuthor.login === reviewer && compactMonitorActorIsHuman(reviewAuthor, reviewer);
   });
   if (!isCurrentRequest && !isPreviousReviewer) {
     throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "rerequest_reviewer requires a current request or reviewer from the current fixed PR snapshot");
   }
+}
+function requireHumanSuggestionReviewerFromSnapshot(snapshot: Record<string, unknown>, reviewer: string): void {
+  const threads = requireRecord(snapshot.reviewThreads, "Current PR snapshot omitted review threads");
+  if (!Array.isArray(threads.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot omitted review threads");
+  for (const threadValue of threads.nodes) {
+    const thread = requireRecord(threadValue, "Current PR snapshot returned an invalid review thread");
+    const comments = requireRecord(thread.comments, "Current PR snapshot returned invalid thread comments");
+    if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot returned invalid thread comments");
+    for (const commentValue of comments.nodes) {
+      const comment = requireRecord(commentValue, "Current PR snapshot returned an invalid review thread comment");
+      const author = comment.author;
+      if (author && typeof author === "object" && !Array.isArray(author)
+        && compactMonitorActorIsHuman(author, reviewer)) return;
+    }
+  }
+  throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion reviewer must be an exact human author in the current fixed PR snapshot");
+}
+
+const MONITOR_FEEDBACK_ID = /^[A-Za-z0-9_=-]{1,300}$/u;
+const MONITOR_FEEDBACK_LOGIN = /^[A-Za-z0-9][A-Za-z0-9_.\[\]-]{0,79}$/u;
+const MONITOR_FEEDBACK_FIELD = /^[A-Za-z0-9_.:-]{1,128}$/u;
+const MONITOR_MAX_FEEDBACK_BYTES = 64 * 1024;
+const MONITOR_MAX_FEEDBACK_ITEMS = 500;
+
+function compactMonitorFeedbackId(value: unknown, context: string): string | number {
+  if (typeof value === "string" && MONITOR_FEEDBACK_ID.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+  throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} has an invalid id`);
+}
+
+function compactMonitorAuthor(value: unknown, context: string): Record<string, unknown> | null {
+  if (value === null || value === undefined) return null;
+  const author = requireRecord(value, `${context} author is invalid`);
+  if (typeof author.login !== "string" || !MONITOR_FEEDBACK_LOGIN.test(author.login)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} author login is invalid`);
+  }
+  if (Object.hasOwn(author, "type")) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} author actor metadata is ambiguous`);
+  }
+  const hasType = Object.hasOwn(author, "__typename");
+  const hasBotFlag = Object.hasOwn(author, "isBot");
+  const hasAppFlag = Object.hasOwn(author, "isApp");
+  if (hasType && (hasBotFlag || hasAppFlag)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} author actor metadata is ambiguous`);
+  }
+  if (hasBotFlag !== hasAppFlag) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} author actor flags are incomplete`);
+  }
+  if (hasType) {
+    if (typeof author.__typename !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(author.__typename)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} author actor type is invalid`);
+    }
+    return { login: author.login, __typename: author.__typename };
+  }
+  if (hasBotFlag) {
+    if (typeof author.isBot !== "boolean" || typeof author.isApp !== "boolean" || (author.isBot && author.isApp)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} author actor flags are invalid`);
+    }
+    return { login: author.login, isBot: author.isBot, isApp: author.isApp };
+  }
+  return { login: author.login };
+}
+
+function compactMonitorActorIsHuman(value: unknown, expectedLogin?: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const author = value as Record<string, unknown>;
+  if (typeof author.login !== "string" || !MONITOR_FEEDBACK_LOGIN.test(author.login)
+    || (expectedLogin !== undefined && author.login !== expectedLogin)) return false;
+  if (Object.hasOwn(author, "type")) return false;
+  const hasType = Object.hasOwn(author, "__typename");
+  const hasBotFlag = Object.hasOwn(author, "isBot");
+  const hasAppFlag = Object.hasOwn(author, "isApp");
+  if (hasType && (hasBotFlag || hasAppFlag)) return false;
+  if (hasType) return author.__typename === "User";
+  if (hasBotFlag !== hasAppFlag || typeof author.isBot !== "boolean" || typeof author.isApp !== "boolean") return false;
+  return author.isBot === false && author.isApp === false;
+}
+
+function compactMonitorField(value: unknown, name: string): string {
+  if (typeof value !== "string" || !MONITOR_FEEDBACK_FIELD.test(value)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${name} is invalid`);
+  }
+  return value;
+}
+
+function compactMonitorMarkerInfo(body: string): { readonly autoReplyMarker?: string } {
+  const autoReplyMarker = /(?:^|\n\n)<!-- gjc:auto-response:v1:([0-9a-f]{64}) -->$/u.exec(body)?.[1];
+  if (body.includes("gjc:auto-response:") && autoReplyMarker === undefined) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Feedback contains a malformed receipt-bound marker");
+  }
+  if (body.includes("gajae-code-pr-monitor:")) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Feedback contains a legacy non-receipt marker");
+  }
+  return {
+    ...(autoReplyMarker === undefined ? {} : { autoReplyMarker }),
+  };
+}
+function compactMonitorAutoReplyMarker(body: string): string | undefined {
+  return compactMonitorMarkerInfo(body).autoReplyMarker;
+}
+function compactMonitorBodyIdentity(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
+}
+
+function compactMonitorSuggestionReplacement(body: string, context: string): string | undefined {
+  const markers = body.match(/(?:^|\n)```suggestion(?:\n|$)/gu) ?? [];
+  if (markers.length === 0) return undefined;
+  if (markers.length !== 1 || body.includes("\r")) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} contains a malformed suggestion`);
+  }
+  const match = /(?:^|\n)```suggestion\n([\s\S]*?)\n```(?=\n|$)/u.exec(body);
+  if (!match) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} contains a malformed suggestion`);
+  const replacement = match[1] ?? "";
+  if (replacement.includes("\0") || Buffer.byteLength(replacement, "utf8") > MONITOR_MAX_REPLACEMENT_BYTES) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${context} suggestion replacement is unbounded or invalid`);
+  }
+  return replacement;
+}
+function compactMonitorExpectedOriginal(diffHunk: unknown, startLine: number, endLine: number): string | undefined {
+  if (typeof diffHunk !== "string" || !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) || startLine < 1 || endLine < startLine || diffHunk.includes("\r")) return undefined;
+  const rows = diffHunk.split("\n");
+  const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/u.exec(rows[0] ?? "");
+  if (!header) return undefined;
+  let current = Number(header[1]);
+  const selected: string[] = [];
+  for (const row of rows.slice(1)) {
+    if (row.startsWith("\\ No newline at end of file")) continue;
+    const prefix = row[0];
+    if (prefix === "-") continue;
+    if (prefix !== "+" && prefix !== " ") return undefined;
+    if (current >= startLine && current <= endLine) selected.push(row.slice(1));
+    current += 1;
+  }
+  return selected.length === endLine - startLine + 1 ? selected.join("\n") : undefined;
 }
 
 async function githubReviewThreads(prNumber: number): Promise<{ nodes: Array<Record<string, unknown>>; pageInfo: { hasNextPage: false; endCursor: null } }> {
@@ -963,7 +1429,7 @@ async function githubReviewThreads(prNumber: number): Promise<{ nodes: Array<Rec
   for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
     const args = [
       "api", "graphql",
-      "-f", "query=query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){nodes{id isResolved comments(first:100){nodes{id databaseId body author{login} path line} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}",
+      "-f", "query=query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){nodes{id isResolved isOutdated comments(first:100){nodes{id body author{login __typename} authorAssociation path line startLine outdated diffHunk commit{oid}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}",
       "-f", "owner=Yeachan-Heo", "-f", "repo=gajae-code", "-F", `number=${prNumber}`,
       ...(endCursor === undefined ? [] : ["-f", `endCursor=${endCursor}`]),
     ];
@@ -978,18 +1444,21 @@ async function githubReviewThreads(prNumber: number): Promise<{ nodes: Array<Rec
 
     for (const value of reviewThreads.nodes) {
       const thread = requireRecord(value, "Review-thread query returned an invalid thread");
-      if (typeof thread.id !== "string" || typeof thread.isResolved !== "boolean" || seenIds.has(thread.id)) {
+      if (typeof thread.id !== "string" || !MONITOR_FEEDBACK_ID.test(thread.id)
+        || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean" || seenIds.has(thread.id)) {
         throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread query returned an invalid or duplicate thread");
       }
       const comments = requireRecord(thread.comments, "Review-thread query omitted thread comments");
       if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread query returned invalid comments");
       const commentPageInfo = requireRecord(comments.pageInfo, "Review-thread query omitted comment pagination");
-      if (typeof commentPageInfo.hasNextPage !== "boolean" || commentPageInfo.hasNextPage) {
+      if (typeof commentPageInfo.hasNextPage !== "boolean" || commentPageInfo.hasNextPage
+        || (commentPageInfo.endCursor !== null && commentPageInfo.endCursor !== undefined && typeof commentPageInfo.endCursor !== "string")) {
         throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread comments were not completely paginated");
       }
       seenIds.add(thread.id);
       nodes.push(thread);
     }
+    if (nodes.length > MONITOR_MAX_FEEDBACK_ITEMS) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread pagination exceeded its bounded item limit");
 
     if (!pageInfo.hasNextPage) return { nodes, pageInfo: { hasNextPage: false, endCursor: null } };
     if (typeof pageInfo.endCursor !== "string" || !pageInfo.endCursor || pageInfo.endCursor === endCursor) {
@@ -999,18 +1468,375 @@ async function githubReviewThreads(prNumber: number): Promise<{ nodes: Array<Rec
   }
   throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread pagination exceeded the safe page limit");
 }
+async function githubReviewThreadWithBodies(threadId: string): Promise<Record<string, unknown>> {
+  const response = parseGithubGraphql(
+    await githubCommand([
+      "api", "graphql",
+      "-f", "query=query($id:ID!){node(id:$id){... on PullRequestReviewThread{id isResolved isOutdated comments(first:100){nodes{id body url author{login __typename} pullRequestReviewThread{id}} pageInfo{hasNextPage endCursor}}}}}",
+      "-f", `id=${threadId}`,
+    ]),
+    "Review-thread body query",
+  );
+  const data = requireRecord(response.data, "Review-thread body query omitted data");
+  const node = requireRecord(data.node, "Review-thread body query omitted exact thread node");
+  if (node.id !== threadId || typeof node.isResolved !== "boolean" || typeof node.isOutdated !== "boolean") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread body query returned the wrong thread node");
+  }
+  const comments = requireRecord(node.comments, "Review-thread body query omitted comments");
+  if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread body query returned invalid comments");
+  const pageInfo = requireRecord(comments.pageInfo, "Review-thread body query omitted pagination");
+  if (pageInfo.hasNextPage !== false || (pageInfo.endCursor !== null && pageInfo.endCursor !== undefined)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review-thread body query was not completely paginated");
+  }
+  return node;
+}
+
+function compactMonitorFeedback(value: unknown): Record<string, unknown> {
+  const item = requireRecord(value, "PR feedback item is invalid");
+  const id = compactMonitorFeedbackId(item.id, "PR feedback item");
+  if (typeof item.body !== "string" || Buffer.byteLength(item.body, "utf8") > MONITOR_MAX_FEEDBACK_BYTES) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR feedback body is missing or unbounded");
+  }
+  const autoReplyMarker = compactMonitorAutoReplyMarker(item.body);
+  const marker = autoReplyMarker;
+  const compact: Record<string, unknown> = {
+    ...(marker ? { marker } : {}),
+    ...(autoReplyMarker ? { markerChannel: "auto-response" } : {}),
+    id,
+    author: compactMonitorAuthor(item.author, "PR feedback"),
+    feedbackIdentity: marker ?? compactMonitorBodyIdentity(item.body),
+  };
+  if (item.authorAssociation !== undefined && item.authorAssociation !== null) {
+    compact.authorAssociation = compactMonitorField(item.authorAssociation, "PR feedback authorAssociation");
+  }
+  if (item.state !== undefined && item.state !== null) {
+    compact.state = compactMonitorField(item.state, "PR feedback state");
+  } else if (item.state === null) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR feedback state is invalid");
+  }
+  return compact;
+}
+
+function compactMonitorThreads(
+  value: { nodes: Array<Record<string, unknown>>; pageInfo: { hasNextPage: false; endCursor: null } },
+  headOid: string,
+): { nodes: Array<Record<string, unknown>> } {
+  const pageInfo = requireRecord(value.pageInfo, "Review thread pagination is invalid");
+  if (pageInfo.hasNextPage !== false || (pageInfo.endCursor !== null && pageInfo.endCursor !== undefined)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread pagination is incomplete");
+  }
+  if (!Array.isArray(value.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread nodes are invalid");
+  return {
+    nodes: value.nodes.map((threadValue) => {
+      const thread = requireRecord(threadValue, "Review thread is invalid");
+      if (typeof thread.id !== "string" || !MONITOR_FEEDBACK_ID.test(thread.id)
+        || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread bounded fields are invalid");
+      }
+      const comments = requireRecord(thread.comments, "Review thread comments are invalid");
+      if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comments are invalid");
+      const commentPageInfo = requireRecord(comments.pageInfo, "Review thread comment pagination is invalid");
+      if (commentPageInfo.hasNextPage !== false) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comments are incompletely paginated");
+      const seenCommentIds = new Set<string>();
+      return {
+        id: thread.id,
+        isResolved: thread.isResolved,
+        isOutdated: thread.isOutdated,
+        comments: {
+          nodes: comments.nodes.map((raw) => {
+            const comment = requireRecord(raw, "Review thread comment is invalid");
+            const id = compactMonitorFeedbackId(comment.id, "Review thread comment");
+            const idKey = String(id);
+            if (seenCommentIds.has(idKey)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread contains duplicate comments");
+            seenCommentIds.add(idKey);
+            if (typeof comment.body !== "string" || Buffer.byteLength(comment.body, "utf8") > MONITOR_MAX_FEEDBACK_BYTES) {
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comment body is missing or unbounded");
+            }
+            const autoReplyMarker = compactMonitorAutoReplyMarker(comment.body);
+            const marker = autoReplyMarker;
+            const compact: Record<string, unknown> = {
+              id,
+              author: compactMonitorAuthor(comment.author, "Review thread comment"),
+              feedbackIdentity: marker ?? compactMonitorBodyIdentity(comment.body),
+              ...(marker ? { marker } : {}),
+              ...(autoReplyMarker ? { markerChannel: "auto-response" } : {}),
+            };
+            if (comment.authorAssociation !== undefined && comment.authorAssociation !== null) {
+              compact.authorAssociation = compactMonitorField(comment.authorAssociation, "Review thread comment authorAssociation");
+            }
+            if (comment.outdated !== undefined && comment.outdated !== null) {
+              if (typeof comment.outdated !== "boolean") throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comment outdated is invalid");
+              compact.outdated = comment.outdated;
+            }
+            if (comment.path !== undefined && comment.path !== null) {
+              if (typeof comment.path !== "string" || comment.path.length < 1 || comment.path.length > 240 || /[\u0000-\u001f\u007f]/u.test(comment.path)) {
+                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comment path is invalid");
+              }
+              compact.path = comment.path;
+            }
+            for (const [key, rawLine] of [["startLine", comment.startLine], ["line", comment.line]] as const) {
+              if (rawLine === undefined || rawLine === null) continue;
+              if (typeof rawLine !== "number" || !Number.isSafeInteger(rawLine) || rawLine < 1) {
+                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Review thread comment ${key} is invalid`);
+              }
+              compact[key] = rawLine;
+            }
+            if (comment.commit !== undefined && comment.commit !== null) {
+              const commit = requireRecord(comment.commit, "Review thread comment commit is invalid");
+              if (typeof commit.oid !== "string" || !SAFE_SHA.test(commit.oid)) {
+                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comment commit is invalid");
+              }
+              compact.commit = { oid: commit.oid };
+            }
+            const replacement = compactMonitorSuggestionReplacement(comment.body, "Review thread comment");
+            if (replacement !== undefined) {
+              if (typeof id !== "string" || !MONITOR_FEEDBACK_ID.test(id)
+                || !compactMonitorActorIsHuman(compact.author)
+                || compact.author === null || typeof (compact.author as Record<string, unknown>).login !== "string"
+                || typeof compact.authorAssociation !== "string"
+                || typeof compact.path !== "string" || typeof compact.line !== "number"
+                || typeof compact.commit !== "object" || compact.commit === null
+                || (compact.commit as Record<string, unknown>).oid !== headOid) {
+                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread suggestion metadata is incomplete or stale");
+              }
+              compact.replacement = replacement;
+              const expectedOriginal = compactMonitorExpectedOriginal(comment.diffHunk, Number(compact.startLine ?? compact.line), Number(compact.line));
+              if (expectedOriginal === undefined || Buffer.byteLength(expectedOriginal, "utf8") < 1 || Buffer.byteLength(expectedOriginal, "utf8") > MONITOR_MAX_REPLACEMENT_BYTES) {
+                throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread suggestion expected original is missing or invalid");
+              }
+              compact.expectedOriginal = expectedOriginal;
+            }
+            return compact;
+          }),
+        },
+      };
+    }),
+  };
+}
 
 async function githubPrSnapshot(prNumber: number): Promise<Record<string, unknown>> {
-  const stdout = await githubCommand([
-    "pr", "view", String(prNumber), "--repo", GITHUB_PR_REPOSITORY, "--json",
-    "number,url,state,author,headRefName,headRefOid,reviewRequests,reviews,comments,latestReviews,statusCheckRollup",
-  ]);
-  const snapshot = JSON.parse(stdout) as Record<string, unknown>;
-  if (snapshot.state !== "OPEN" || (snapshot.author as { login?: string } | undefined)?.login !== GITHUB_PR_AUTHOR) {
+  const raw = parseGithubRestRecord(
+    await githubCommand([
+      "pr", "view", String(prNumber), "--repo", GITHUB_PR_REPOSITORY, "--json",
+      "number,url,state,author,baseRefName,baseRefOid,headRepository,headRefName,headRefOid,reviewRequests,reviews,comments,latestReviews,statusCheckRollup",
+    ]),
+    "PR snapshot",
+  );
+  if (typeof raw.number !== "number" || !Number.isSafeInteger(raw.number) || raw.number !== prNumber || raw.state !== "OPEN") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR is not the exact open PR requested");
+  }
+  const author = requireRecord(raw.author, "PR snapshot author is invalid");
+  if (author.login !== GITHUB_PR_AUTHOR) {
     throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR is not an open PR authored by twoimo");
   }
-  snapshot.reviewThreads = await githubReviewThreads(prNumber);
-  return snapshot;
+  const headRepository = requireRecord(raw.headRepository, "PR snapshot omitted head repository");
+  const headRepositoryKeys = Object.keys(headRepository).sort();
+  if (
+    headRepositoryKeys.length !== 3
+    || headRepositoryKeys[0] !== "id"
+    || headRepositoryKeys[1] !== "name"
+    || headRepositoryKeys[2] !== "nameWithOwner"
+    || typeof headRepository.id !== "string"
+    || !/^[A-Za-z0-9_:-]{1,200}$/u.test(headRepository.id)
+    || typeof headRepository.name !== "string"
+    || !/^[A-Za-z0-9_.-]{1,100}$/u.test(headRepository.name)
+    || headRepository.name !== "gajae-code"
+    || headRepository.nameWithOwner !== GITHUB_PR_REPOSITORY
+  ) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR snapshot head repository is outside the approved topology");
+  }
+  const baseRepository = { nameWithOwner: GITHUB_PR_REPOSITORY };
+  if (GITHUB_PR_REPOSITORY !== "Yeachan-Heo/gajae-code") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR targets an unexpected base repository");
+  }
+  const baseRefName = raw.baseRefName;
+  const baseRefOid = raw.baseRefOid;
+  const headRefName = raw.headRefName;
+  const headRefOid = raw.headRefOid;
+  if (typeof baseRefName !== "string" || !safeMonitorHeadRef(baseRefName)
+    || typeof baseRefOid !== "string" || !SAFE_SHA.test(baseRefOid)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR snapshot base ref context is invalid");
+  }
+  if (typeof raw.url !== "string" || raw.url !== `https://github.com/${GITHUB_PR_REPOSITORY}/pull/${prNumber}`
+    || typeof headRefName !== "string" || !safeMonitorHeadRef(headRefName)
+    || typeof headRefOid !== "string" || !SAFE_SHA.test(headRefOid)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR snapshot head identity is invalid");
+  }
+  const reviewRequestsRaw = raw.reviewRequests;
+  const commentsRaw = raw.comments;
+  const reviewsRaw = raw.reviews;
+  const latestReviewsRaw = raw.latestReviews;
+  const statusCheckRollupRaw = raw.statusCheckRollup;
+  const arrays = [
+    ["reviewRequests", reviewRequestsRaw],
+    ["comments", commentsRaw],
+    ["reviews", reviewsRaw],
+    ["latestReviews", latestReviewsRaw],
+    ["statusCheckRollup", statusCheckRollupRaw],
+  ] as const;
+  for (const [key, value] of arrays) {
+    if (!Array.isArray(value)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `PR snapshot omitted ${key}`);
+    if (value.length > MONITOR_MAX_FEEDBACK_ITEMS) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `PR snapshot ${key} exceeds its bounded item limit`);
+  }
+  const reviewRequests = (reviewRequestsRaw as unknown[]).map((value) => {
+    const request = requireRecord(value, "PR snapshot review request is invalid");
+    if (typeof request.login !== "string" || !MONITOR_FEEDBACK_LOGIN.test(request.login)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR snapshot review request login is invalid");
+    }
+    return { login: request.login };
+  });
+  const compactStatusChecks = (statusCheckRollupRaw as unknown[]).map((value) => {
+    const check = requireRecord(value, "PR status check is invalid");
+    const compact: Record<string, unknown> = {};
+    for (const key of ["conclusion", "state", "status"] as const) {
+      if (check[key] === undefined) continue;
+      compact[key] = check[key] === null
+        ? null
+        : compactMonitorField(check[key], `PR status check ${key}`);
+    }
+    return compact;
+  });
+  const reviewThreadsRaw = await githubReviewThreads(prNumber);
+  const reviewThreads = compactMonitorThreads(reviewThreadsRaw, headRefOid);
+  const url = raw.url as string;
+  const comments = (commentsRaw as unknown[]).map(compactMonitorFeedback);
+  const reviews = (reviewsRaw as unknown[]).map(compactMonitorFeedback);
+  const latestReviews = (latestReviewsRaw as unknown[]).map(compactMonitorFeedback);
+  type FeedbackSource = "comments" | "reviews" | "latestReviews" | "threadComments";
+  type FeedbackRecord = { source: FeedbackSource; item: Record<string, unknown> };
+  const feedbackIds = new Map<string, FeedbackRecord>();
+  const feedbackIdentities = new Map<string, FeedbackRecord>();
+  const isExactReviewProjection = (source: FeedbackSource, previous: FeedbackRecord, item: Record<string, unknown>): boolean =>
+    source === "latestReviews"
+    && previous.source === "reviews"
+    && monitorCanonicalJson(previous.item) === monitorCanonicalJson(item);
+  const registerFeedback = (source: FeedbackSource, item: Record<string, unknown>): void => {
+    const key = String(item.id);
+    const previousId = feedbackIds.get(key);
+    const exactProjection = previousId !== undefined && isExactReviewProjection(source, previousId, item);
+    if (previousId && !exactProjection) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR snapshot contains duplicate or conflicting feedback identities");
+    }
+    if (!previousId) feedbackIds.set(key, { source, item });
+
+    const identity = String(item.feedbackIdentity);
+    const previousIdentity = feedbackIdentities.get(identity);
+    const exactIdentityProjection = previousIdentity !== undefined && isExactReviewProjection(source, previousIdentity, item);
+    if (previousIdentity && !exactIdentityProjection) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR snapshot contains duplicate or conflicting feedback identities");
+    }
+    if (!previousIdentity) feedbackIdentities.set(identity, { source, item });
+  };
+  for (const item of comments) registerFeedback("comments", item);
+  for (const item of reviews) registerFeedback("reviews", item);
+  for (const item of latestReviews) registerFeedback("latestReviews", item);
+  for (const thread of reviewThreads.nodes) {
+    const comments = requireRecord(thread.comments, "Review thread comments are invalid");
+    if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Review thread comments are invalid");
+    for (const item of comments.nodes) registerFeedback("threadComments", requireRecord(item, "Review thread comment is invalid"));
+  }
+  return {
+    number: prNumber,
+    url,
+    state: "OPEN",
+    author: { login: GITHUB_PR_AUTHOR },
+    headRepository: structuredClone(headRepository),
+    baseRepository: { nameWithOwner: GITHUB_PR_REPOSITORY },
+    baseRefName,
+    baseRefOid,
+    headRefName,
+    headRefOid,
+    reviewRequests,
+    comments,
+    reviews,
+    latestReviews,
+    statusCheckRollup: compactStatusChecks,
+    reviewThreads,
+  };
+}
+function monitorFeedbackWithId(snapshot: Record<string, unknown>, triggerId: string, threadId: string, allowResolved = false): Record<string, unknown> {
+  const threads = requireRecord(snapshot.reviewThreads, "Current PR snapshot omitted review threads");
+  const nodes = threads.nodes;
+  if (!Array.isArray(nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot omitted review threads");
+  const target = nodes.filter((value) => requireRecord(value, "Review thread is invalid").id === threadId);
+  if (target.length !== 1) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve trigger thread is missing or ambiguous");
+  const thread = requireRecord(target[0], "Review thread is invalid");
+  if (thread.isOutdated !== false || (!allowResolved && thread.isResolved !== false)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve trigger thread is stale or already resolved");
+  }
+  const comments = requireRecord(thread.comments, "Current PR snapshot omitted thread comments");
+  if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot omitted thread comments");
+  const matches = comments.nodes
+    .map((value) => requireRecord(value, "Current PR snapshot returned an invalid thread comment"))
+    .filter((item) => String(item.id) === triggerId || item.feedbackIdentity === triggerId);
+  if (matches.length !== 1) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve trigger is missing, stale, or unrelated to the target thread");
+  }
+  const trigger = matches[0]!;
+  const author = trigger.author;
+  if (!author || typeof author !== "object" || Array.isArray(author)
+    || (author as Record<string, unknown>).login === GITHUB_PR_AUTHOR
+    || !compactMonitorActorIsHuman(author)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve trigger must be an exact human-authored current PR review or comment");
+  }
+  return trigger;
+}
+
+async function requireConsumedReplyReceipt(
+  ctx: ToolContext,
+  input: Record<string, unknown>,
+  authorization: MonitorAuthorizationBindingV1,
+): Promise<StoredActionReceipt> {
+  const replyReceiptId = input.replyReceiptId;
+  if (typeof replyReceiptId !== "string" || !MONITOR_DIGEST.test(replyReceiptId)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "resolve_thread requires a bounded replyReceiptId");
+  }
+  const expectedThreadId = input.threadId;
+  if (typeof expectedThreadId !== "string" || !SAFE_ID.test(expectedThreadId)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "resolve_thread requires an exact threadId");
+  }
+  const stored = await receiptAuthority(ctx).exactById(replyReceiptId, "monitor-action", ["consumed"]);
+  const response = requireRecord(stored.response, "Resolve reply receipt is invalid");
+  const structured = requireRecord(response.structuredContent, "Resolve reply receipt omitted structured content");
+  const toolCall = requireRecord(response.toolCall, "Resolve reply receipt omitted toolCall");
+  const replyInput = requireRecord(toolCall.input, "Resolve reply receipt omitted its exact input");
+  const expectedTriggerId = input.triggerId;
+  if (
+    typeof expectedTriggerId !== "string"
+    || structured.threadId !== expectedThreadId
+    || replyInput.threadId !== expectedThreadId
+    || structured.triggerId !== expectedTriggerId
+    || replyInput.triggerId !== expectedTriggerId
+  ) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve reply receipt does not bind the exact threadId and triggerId");
+  }
+  if (
+    response.ok !== true
+    || response.tool !== "github_pr_monitor_mutate"
+    || structured.receiptId !== replyReceiptId
+    || structured.operation !== "post_reply"
+    || structured.effectKind !== "post_reply"
+    || typeof structured.replyMarker !== "string"
+    || structured.replyMarker !== `<!-- gjc:auto-response:v1:${String(structured.effectIdentity)} -->`
+    || structured.repository !== GITHUB_PR_REPOSITORY
+    || structured.author !== GITHUB_PR_AUTHOR
+    || structured.runId !== input.runId
+    || structured.actionPlanId !== input.actionPlanId
+    || structured.prNumber !== input.prNumber
+    || String(structured.expectedHeadSha).toLowerCase() !== String(input.expectedHeadSha).toLowerCase()
+    || replyInput.operation !== "post_reply"
+    || replyInput.repository !== GITHUB_PR_REPOSITORY
+    || replyInput.author !== GITHUB_PR_AUTHOR
+    || replyInput.prNumber !== input.prNumber
+    || String(replyInput.expectedHeadSha).toLowerCase() !== String(input.expectedHeadSha).toLowerCase()
+    || replyInput.threadId !== input.threadId
+    || replyInput.triggerId !== input.triggerId
+  ) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve reply receipt is stale, mismatched, human-authored, or unrelated");
+  }
+  relatedMonitorAuthorizationBinding(structured, authorization);
+  relatedMonitorAuthorizationBinding(replyInput, authorization);
+  return stored;
 }
 async function githubOpenAuthoredPrNumbers(): Promise<number[]> {
   const listed = JSON.parse(await githubCommand([
@@ -1037,9 +1863,6 @@ function githubRepositoryRemoteIsAllowed(remote: string): boolean {
   return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)Yeachan-Heo\/gajae-code(?:\.git)?\s*$/.test(remote.trim());
 }
 
-function githubForkRemoteIsAllowed(remote: string): boolean {
-  return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)twoimo\/gajae-code(?:\.git)?\s*$/.test(remote.trim());
-}
 
 function safeMonitorHeadRef(headRef: string): boolean {
   return SAFE_REF.test(headRef) && !headRef.startsWith("-") && !headRef.includes("..");
@@ -1059,12 +1882,18 @@ interface IssuedVerificationReceipt extends IssuedActionReceipt {
   args: string[];
   headSha: string;
   treeSha: string;
+  artifactDir: string;
+  bundleSha256: string;
+  baseTreeSha: string;
+  taskDigest: string;
+  logicalIdentity: string;
+  changedPaths: string[];
   phase: ActionReceiptPhase;
 }
 
 interface ReceiptLifecycleClaim {
   receiptId: string;
-  kind: "monitor-read" | "monitor-action";
+  kind: "verification" | "monitor-read" | "monitor-action";
   pending: ActionReceiptPhase;
   rollback: ActionReceiptPhase;
   success: ActionReceiptPhase;
@@ -1084,8 +1913,18 @@ function receiptAuthority(ctx: ToolContext): ActionReceiptAuthority {
 }
 
 function expectedActionResponse(tool: string, issued: IssuedActionReceipt): Record<string, unknown> {
+  const requestDigest = monitorFingerprint(issued.input);
+  const structured = {
+    ...issued.structured,
+    protocolVersion: 1,
+    schemaVersion: 4,
+    requestDigest,
+  };
   return {
     ok: true,
+    protocolVersion: 1,
+    schemaVersion: 4,
+    requestDigest,
     tool,
     toolCall: {
       ...toolCallProof(tool, true),
@@ -1094,7 +1933,10 @@ function expectedActionResponse(tool: string, issued: IssuedActionReceipt): Reco
     },
     text: issued.text,
     imageMarkdownList: [],
-    structuredContent: addToolCallProof(issued.structured, tool, true),
+    structuredContent: {
+      ...structured,
+      chatgpt2codexToolCall: toolCallProof(tool, true),
+    },
   };
 }
 
@@ -1126,7 +1968,7 @@ function monitorMutationOutcomeBinding(
     expectedHeadSha: string;
     operation: MonitorActionOperation;
   },
-  phase: "prepare" | "mutate",
+  phase: "prepare" | "execute" | "mutate",
   operationFields: Record<string, unknown>,
   claim: MonitorActionClaimReceipt,
 ): MutationOutcomeBinding {
@@ -1146,11 +1988,12 @@ function monitorMutationOutcomeBinding(
     operation: input.operation,
     operationFields: structuredClone(operationFields),
     input: structuredClone(input),
+    authorization: monitorAuthorizationBinding(input, input.effectKey === undefined ? "optional" : "required"),
   };
 }
 
 function toolResultFromDurableActionResponse(
-  tool: "github_pr_monitor_prepare" | "github_pr_monitor_mutate",
+  tool: "github_pr_monitor_prepare" | "github_pr_monitor_execute" | "github_pr_monitor_mutate",
   response: Record<string, unknown>,
 ): ToolResult<Record<string, unknown>> {
   const structured = requireRecord(response.structuredContent, "Durable Action outcome omitted structured content");
@@ -1166,7 +2009,7 @@ type DurableMutationInspection =
 
 async function inspectDurableMutationOutcome(
   ctx: ToolContext,
-  tool: "github_pr_monitor_prepare" | "github_pr_monitor_mutate",
+  tool: "github_pr_monitor_prepare" | "github_pr_monitor_execute" | "github_pr_monitor_mutate",
   binding: MutationOutcomeBinding,
   claimStatus: MonitorActionClaimReceipt["claimStatus"],
 ): Promise<DurableMutationInspection | undefined> {
@@ -1182,7 +2025,7 @@ async function persistDurableMutationOutcome(
   ctx: ToolContext,
   binding: MutationOutcomeBinding,
   outcomeKey: string,
-  tool: "github_pr_monitor_prepare" | "github_pr_monitor_mutate",
+  tool: "github_pr_monitor_prepare" | "github_pr_monitor_execute" | "github_pr_monitor_mutate",
   receiptId: string,
   issued: IssuedActionReceipt,
   metadata: Record<string, unknown>,
@@ -1268,12 +2111,18 @@ async function claimIssuedMonitorActionReceipt(
 ): Promise<PreparedMonitorState> {
   const receiptId = receiptIdFromActionResponse(value);
   if (!receiptId) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${command} requires an exact server-issued Action receipt`);
+  const response = requireRecord(value, "Action receipt response must be an object");
+  const kind = response.tool === "github_pr_monitor_execute" ? "verification" as const : "monitor-action" as const;
   const rollback: ActionReceiptPhase = command === "record-side-effect" ? "issued" : "recorded";
   const pending: ActionReceiptPhase = command === "record-side-effect" ? "record-pending" : "reconcile-pending";
-  const success: ActionReceiptPhase = command === "record-side-effect" ? "recorded" : "consumed";
-  const stored = await receiptAuthority(ctx).exact(receiptId, "monitor-action", value, [rollback, pending]);
+  const success: ActionReceiptPhase = command === "record-side-effect" || kind === "verification" ? "recorded" : "consumed";
+  const stored = await receiptAuthority(ctx).exact(receiptId, kind, value, [rollback, pending]);
   const structured = requireRecord(stored.response.structuredContent, "Action receipt omitted structured content");
+  const callInput = requireRecord(requireRecord(stored.response.toolCall, "Action receipt omitted toolCall").input, "Action receipt omitted toolCall input");
   const claim = requireRecord(stored.metadata.claim, "Action receipt omitted its durable claim");
+  const effects = structured.effectKey === undefined ? "optional" : "required";
+  const authorization = exactMonitorAuthorizationBinding(structured, callInput, effects);
+  exactMonitorAuthorizationBinding(authorization, claim, effects);
   const bindingIsExact = structured.repository === GITHUB_PR_REPOSITORY
     && structured.author === GITHUB_PR_AUTHOR
     && stored.metadata.runId === structured.runId
@@ -1301,6 +2150,7 @@ async function claimIssuedMonitorActionReceipt(
         claimId: monitorBoundString(structured.claimId, "claimId"),
         payloadDigest: String(structured.payloadDigest),
         payload: { receiptId: structured.receiptId },
+        ...authorization,
       }
     : { evidence: [value] };
   if (!MONITOR_DIGEST.test(String(structured.payloadDigest))) {
@@ -1316,7 +2166,7 @@ async function claimIssuedMonitorActionReceipt(
     claimId: monitorBoundString(structured.claimId, "claimId"),
     claimPayloadDigest: String(structured.payloadDigest),
   };
-  const lifecycle = { receiptId, kind: "monitor-action" as const, pending, rollback, success, recovery };
+  const lifecycle = { receiptId, kind, pending, rollback, success, recovery };
   const recovered = await beginReceiptLifecycle(ctx, lifecycle, value, stored.phase);
   return { lifecycle, stateInput, actionResponse: value, coordinationId: recovery.coordinationId, ...(recovered ? { recovered } : {}) };
 }
@@ -1417,6 +2267,24 @@ async function successfulVerificationReceipt(
   }
   const structured = requireRecord(stored.response.structuredContent, "Verification receipt omitted structured content");
   const metadata = stored.metadata;
+  const executeBindingIsExact = expectedPushBinding === undefined || (
+    stored.response.tool === "github_pr_monitor_execute"
+    && structured.operation === "apply_suggestions"
+    && structured.runId === expectedPushBinding.runId
+    && structured.actionPlanId === expectedPushBinding.actionPlanId
+    && structured.repository === expectedPushBinding.repository
+    && structured.prNumber === expectedPushBinding.prNumber
+    && String(structured.expectedHeadSha).toLowerCase() === expectedPushBinding.expectedHeadSha
+    && structured.worktreePath === expectedPushBinding.worktreePath
+    && structured.headRef === expectedPushBinding.headRef
+    && (stored.phase !== "consumed"
+      || monitorCanonicalJson(metadata.pushBinding) === monitorCanonicalJson(expectedPushBinding))
+  );
+  const artifactDir = typeof structured.artifactDir === "string" ? structured.artifactDir : "";
+  const artifactRoot = path.join(ctx.stateDir, "monitor-artifacts");
+  const artifactRelative = path.relative(artifactRoot, artifactDir);
+  const changedPaths = Array.isArray(structured.changedPaths) && structured.changedPaths.every((value) => typeof value === "string")
+    ? structured.changedPaths as string[] : undefined;
   if (metadata.projectId !== expectedProjectId
     || metadata.riskTier !== "verify"
     || structured.exitCode !== 0
@@ -1426,10 +2294,20 @@ async function successfulVerificationReceipt(
     || !metadata.args.every((arg) => typeof arg === "string")
     || typeof metadata.headSha !== "string"
     || typeof metadata.treeSha !== "string"
-    || (stored.phase === "consumed" && (
-      !expectedPushBinding
-      || monitorCanonicalJson(metadata.pushBinding) !== monitorCanonicalJson(expectedPushBinding)
-    ))) return undefined;
+    || metadata.artifactDir !== artifactDir
+    || metadata.bundleSha256 !== structured.bundleSha256
+    || metadata.baseTreeSha !== structured.baseTreeSha
+    || !artifactDir
+    || !path.isAbsolute(artifactDir)
+    || path.resolve(artifactDir) !== artifactDir
+    || path.dirname(artifactRelative) !== "."
+    || !MONITOR_DIGEST.test(path.basename(artifactRelative))
+    || !MONITOR_DIGEST.test(String(structured.bundleSha256))
+    || !SAFE_SHA.test(String(structured.baseTreeSha))
+    || !MONITOR_DIGEST.test(String(structured.taskDigest))
+    || !MONITOR_DIGEST.test(String(structured.logicalIdentity))
+    || !changedPaths
+    || !executeBindingIsExact) return undefined;
   return {
     structured,
     input: requireRecord(requireRecord(stored.response.toolCall, "Verification receipt omitted toolCall").input, "Verification receipt omitted toolCall input"),
@@ -1441,6 +2319,12 @@ async function successfulVerificationReceipt(
     args: metadata.args as string[],
     headSha: metadata.headSha,
     treeSha: metadata.treeSha,
+    artifactDir,
+    bundleSha256: String(structured.bundleSha256),
+    baseTreeSha: String(structured.baseTreeSha),
+    taskDigest: String(structured.taskDigest),
+    logicalIdentity: String(structured.logicalIdentity),
+    changedPaths,
     phase: stored.phase,
   };
 }
@@ -1478,10 +2362,51 @@ function monitorReceiptId(input: Record<string, unknown>): string {
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
+const TRUSTED_GIT_CONFIG = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"] as const;
+
 async function gitOutput(cwd: string, args: string[]): Promise<string> {
-  const result = await execFileAsync("git", ["-C", cwd, ...args], { maxBuffer: 1024 * 1024 });
+  const result = await execFileAsync("git", ["-C", cwd, ...TRUSTED_GIT_CONFIG, ...args], { maxBuffer: 1024 * 1024 });
   return result.stdout;
 }
+async function gitOutputWithEnv(cwd: string, args: string[], env: NodeJS.ProcessEnv): Promise<string> {
+  const result = await execFileAsync("git", ["-C", cwd, ...TRUSTED_GIT_CONFIG, ...args], {
+    maxBuffer: 64 * 1024 * 1024,
+    env: { PATH: process.env.PATH ?? "", ...env },
+  });
+  return result.stdout;
+}
+function deterministicMonitorGitDate(logicalIdentity: string, taskDigest: string): string {
+  const seed = createHash("sha256").update(`${logicalIdentity}:${taskDigest}`, "utf8").digest().readUInt32BE(0);
+  const timestamp = 946684800 + (seed % 946080000);
+  return `@${timestamp} +0000`;
+}
+
+async function createTrustedSuggestionCommitObject(
+  worktreePath: string,
+  treeSha: string,
+  expectedHeadSha: string,
+  logicalIdentity: string,
+  taskDigest: string,
+  gitDate: string,
+): Promise<string> {
+  const message = `Apply authorized PR suggestions\n\nGJC-Logical-Identity: ${logicalIdentity}\nGJC-Plan-Digest: ${taskDigest}\n`;
+  const result = await execFileAsync("git", ["-C", worktreePath, ...TRUSTED_GIT_CONFIG, "commit-tree", treeSha, "-p", expectedHeadSha, "-m", message], {
+    maxBuffer: 1024 * 1024,
+    env: {
+      PATH: process.env.PATH ?? "",
+      GIT_AUTHOR_NAME: "gajae-code[bot]",
+      GIT_AUTHOR_EMAIL: "gajae-code[bot]@users.noreply.github.com",
+      GIT_AUTHOR_DATE: gitDate,
+      GIT_COMMITTER_NAME: "gajae-code[bot]",
+      GIT_COMMITTER_EMAIL: "gajae-code[bot]@users.noreply.github.com",
+      GIT_COMMITTER_DATE: gitDate,
+    },
+  });
+  const headSha = result.stdout.trim().toLowerCase();
+  if (!SAFE_SHA.test(headSha)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Trusted git commit creation returned an invalid object id");
+  return headSha;
+}
+
 async function verificationGitIdentity(cwd: string): Promise<{ headSha: string; treeSha: string } | undefined> {
   try {
     const [head, tree] = await Promise.all([
@@ -1495,6 +2420,293 @@ async function verificationGitIdentity(cwd: string): Promise<{ headSha: string; 
     return undefined;
   }
 }
+
+const MONITOR_OCI_IMAGE = /^sha256:[0-9a-f]{64}$/u;
+const MONITOR_SOURCE_DIGEST = /^[0-9a-f]{64}$/u;
+const MONITOR_TEST_ARGV = ["bun", "test"] as const;
+const MONITOR_MAX_SUGGESTIONS = 10;
+const MONITOR_MAX_REPLACEMENT_BYTES = 64 * 1024;
+
+interface MonitorSuggestion {
+  threadId: string;
+  commentId: string;
+  reviewer: string;
+  path: string;
+  startLine: number;
+  line: number;
+  expectedOriginal: string;
+  replacement: string;
+  sourceDigest: string;
+}
+
+function normalizedMonitorSuggestionPath(value: string): string {
+  if (!value || value.includes("\\") || value.includes("\0") || path.posix.isAbsolute(value)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion path must be a normalized repository-relative POSIX path");
+  }
+  const normalized = path.posix.normalize(value);
+  const segments = value.split("/");
+  if (/[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion path cannot contain control characters");
+  }
+  if (normalized !== value || segments.some((segment) => !segment || segment === "." || segment === "..") || segments[0] === ".git") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion path must be normalized and cannot address .git or a parent path");
+  }
+  return normalized;
+}
+
+async function assertRegularMonitorFile(worktreePath: string, relativePath: string): Promise<string> {
+  const target = path.join(worktreePath, ...relativePath.split("/"));
+  let current = worktreePath;
+  for (const segment of relativePath.split("/")) {
+    current = path.join(current, segment);
+    const stat = await fs.lstat(current);
+    if (stat.isSymbolicLink()) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion path contains a symlink");
+    if (current !== target && !stat.isDirectory()) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion path parent is not a directory");
+    if (current === target && !stat.isFile()) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target must be a regular file");
+  }
+  const staged = (await gitOutput(worktreePath, ["ls-files", "--stage", "--", relativePath])).trim();
+  const match = staged.match(/^(\d{6}) [0-9a-f]{40} 0\t(.+)$/u);
+  if (!match || match[2] !== relativePath || !["100644", "100755"].includes(match[1] ?? "")) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target must be one tracked regular file, not a submodule or special entry");
+  }
+  if (await fs.realpath(target) !== target) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target must resolve to its exact prepared-worktree path");
+  return target;
+}
+
+function exactLineSlice(text: string, startLine: number, endLine: number): { start: number; end: number; value: string } {
+  const starts = [0];
+  for (let index = 0; index < text.length; index += 1) if (text.charCodeAt(index) === 10) starts.push(index + 1);
+  const lineCount = text.endsWith("\n") ? starts.length - 1 : starts.length;
+  if (startLine < 1 || endLine < startLine || endLine > lineCount) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion line range is not current in the prepared worktree");
+  }
+  const start = starts[startLine - 1] as number;
+  const next = starts[endLine];
+  const end = next === undefined ? text.length : next - 1;
+  return { start, end, value: text.slice(start, end) };
+}
+
+function validateSuggestionRanges(suggestions: readonly MonitorSuggestion[]): string[] {
+  if (suggestions.length < 1 || suggestions.length > MONITOR_MAX_SUGGESTIONS) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions requires between one and ten exact suggestions");
+  }
+  const byPath = new Map<string, MonitorSuggestion[]>();
+  for (const suggestion of suggestions) {
+    if (typeof suggestion.path !== "string") {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion path is invalid");
+    }
+    if (!MONITOR_FEEDBACK_ID.test(suggestion.threadId) || !MONITOR_FEEDBACK_ID.test(suggestion.commentId)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion thread and comment identities are invalid");
+    }
+    if (typeof suggestion.reviewer !== "string" || !MONITOR_FEEDBACK_LOGIN.test(suggestion.reviewer)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion reviewer identity is invalid");
+    }
+    if (typeof suggestion.expectedOriginal !== "string"
+      || Buffer.byteLength(suggestion.expectedOriginal, "utf8") < 1
+      || Buffer.byteLength(suggestion.expectedOriginal, "utf8") > MONITOR_MAX_REPLACEMENT_BYTES
+      || suggestion.expectedOriginal.includes("\r")
+      || suggestion.expectedOriginal.includes("\0")) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion expected original is invalid");
+    }
+    if (typeof suggestion.sourceDigest !== "string" || !MONITOR_SOURCE_DIGEST.test(suggestion.sourceDigest)) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion sourceDigest is invalid");
+    }
+    if (!Number.isSafeInteger(suggestion.startLine) || !Number.isSafeInteger(suggestion.line)
+      || suggestion.startLine < 1 || suggestion.line < suggestion.startLine) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion line range is invalid");
+    }
+    if (typeof suggestion.replacement !== "string") {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion replacement is invalid");
+    }
+    const relativePath = normalizedMonitorSuggestionPath(suggestion.path);
+    if (Buffer.byteLength(suggestion.replacement, "utf8") > MONITOR_MAX_REPLACEMENT_BYTES) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion replacement exceeds 64KiB");
+    }
+    if (suggestion.replacement.includes("\r") || suggestion.replacement.includes("\0")) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestions must use unambiguous LF text");
+    }
+    const list = byPath.get(relativePath) ?? [];
+    list.push(suggestion);
+    byPath.set(relativePath, list);
+  }
+  if (byPath.size > 10) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions exceeds ten changed files");
+  for (const list of byPath.values()) {
+    list.sort((left, right) => right.startLine - left.startLine || right.line - left.line);
+    for (let index = 1; index < list.length; index += 1) {
+      const previous = list[index - 1] as MonitorSuggestion;
+      const current = list[index] as MonitorSuggestion;
+      if (current.line >= previous.startLine) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestions contain overlapping line ranges");
+    }
+  }
+  return [...byPath.keys()].sort();
+}
+function editMonitorSuggestionText(original: string, suggestions: readonly MonitorSuggestion[]): string {
+  if (original.includes("\r") || original.includes("\0")) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target must be LF UTF-8 text");
+  }
+  let edited = original;
+  const ordered = [...suggestions].sort((left, right) => right.startLine - left.startLine || right.line - left.line);
+  for (const suggestion of ordered) {
+    const slice = exactLineSlice(edited, suggestion.startLine, suggestion.line);
+    if (slice.value !== suggestion.expectedOriginal) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion expectedOriginal does not match the exact current line slice");
+    }
+    const sourceDigest = createHash("sha256").update(Buffer.from(slice.value, "utf8")).digest("hex");
+    if (sourceDigest !== suggestion.sourceDigest) {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion sourceDigest does not match the exact current line slice");
+    }
+    edited = `${edited.slice(0, slice.start)}${suggestion.replacement}${edited.slice(slice.end)}`;
+  }
+  if (edited === original) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion set must change every allowlisted file");
+  return edited;
+}
+
+async function expectedSuggestionTree(
+  worktreePath: string,
+  expectedHeadSha: string,
+  suggestions: readonly MonitorSuggestion[],
+): Promise<string> {
+  const changedPaths = validateSuggestionRanges(suggestions);
+  const temporaryRoot = await fs.mkdtemp(path.join(tmpdir(), "chatgpt2codex-monitor-tree-"));
+  const indexPath = path.join(temporaryRoot, "index");
+  const env = { GIT_INDEX_FILE: indexPath };
+  try {
+    await gitOutputWithEnv(worktreePath, ["read-tree", expectedHeadSha], env);
+    for (const [index, relativePath] of changedPaths.entries()) {
+      const listed = await gitOutputWithEnv(worktreePath, ["ls-tree", "-z", expectedHeadSha, "--", relativePath], env);
+      const entries = listed.split("\0").filter(Boolean);
+      const match = entries.length === 1
+        ? entries[0]?.match(/^(100644|100755) blob ([0-9a-f]{40})\t(.+)$/u)
+        : undefined;
+      if (!match || match[3] !== relativePath) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target is not an exact tracked regular file in the planned parent commit");
+      }
+      const mode = match[1] as string;
+      const parentBlob = match[2] as string;
+      const original = await gitOutputWithEnv(worktreePath, ["cat-file", "blob", parentBlob], env);
+      const originalPath = path.join(temporaryRoot, `original-${index}`);
+      await fs.writeFile(originalPath, original, "utf8");
+      const reproducedBlob = (await gitOutputWithEnv(worktreePath, ["hash-object", "--", originalPath], env)).trim().toLowerCase();
+      if (reproducedBlob !== parentBlob) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target in the planned parent commit is not unambiguous UTF-8 text");
+      }
+      const edited = editMonitorSuggestionText(
+        original,
+        suggestions.filter((suggestion) => suggestion.path === relativePath),
+      );
+      const editedPath = path.join(temporaryRoot, `edited-${index}`);
+      await fs.writeFile(editedPath, edited, "utf8");
+      const blob = (await gitOutputWithEnv(worktreePath, ["hash-object", "-w", "--", editedPath], env)).trim().toLowerCase();
+      if (!SAFE_SHA.test(blob)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Trusted expected-tree blob creation returned an invalid object id");
+      await gitOutputWithEnv(worktreePath, ["update-index", "--cacheinfo", `${mode},${blob},${relativePath}`], env);
+    }
+    const treeSha = (await gitOutputWithEnv(worktreePath, ["write-tree"], env)).trim().toLowerCase();
+    if (!SAFE_SHA.test(treeSha)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Trusted expected-tree creation returned an invalid object id");
+    return treeSha;
+  } finally {
+    await fs.rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+async function applyExactMonitorSuggestions(worktreePath: string, suggestions: readonly MonitorSuggestion[]): Promise<string[]> {
+  const changedPaths = validateSuggestionRanges(suggestions);
+  const writes = new Map<string, { target: string; content: string }>();
+  for (const relativePath of changedPaths) {
+    const target = await assertRegularMonitorFile(worktreePath, relativePath);
+    const bytes = await fs.readFile(target);
+    let original: string;
+    try {
+      original = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target is not valid UTF-8");
+    }
+    const edited = editMonitorSuggestionText(
+      original,
+      suggestions.filter((suggestion) => suggestion.path === relativePath),
+    );
+    writes.set(relativePath, { target, content: edited });
+  }
+  for (const { target, content } of writes.values()) {
+    const file = await fs.open(target, "r+");
+    try {
+      await file.truncate(0);
+      await file.writeFile(content, "utf8");
+    } finally {
+      await file.close();
+    }
+  }
+  return changedPaths;
+}
+async function assertCurrentMonitorSuggestionSources(
+  worktreePath: string,
+  suggestions: readonly MonitorSuggestion[],
+): Promise<void> {
+  const changedPaths = validateSuggestionRanges(suggestions);
+  for (const relativePath of changedPaths) {
+    const target = await assertRegularMonitorFile(worktreePath, relativePath);
+    const bytes = await fs.readFile(target);
+    let original: string;
+    try {
+      original = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target is not valid UTF-8");
+    }
+    editMonitorSuggestionText(
+      original,
+      suggestions.filter((suggestion) => suggestion.path === relativePath),
+    );
+  }
+}
+
+async function assertExactCommittedMonitorWorktree(
+  worktreePath: string,
+  expectedHeadSha: string,
+  expectedTreeSha: string,
+): Promise<void> {
+  const head = await gitOutput(worktreePath, ["rev-parse", "HEAD"]);
+  const headTree = await gitOutput(worktreePath, ["rev-parse", "HEAD^{tree}"]);
+  const indexTree = await gitOutput(worktreePath, ["write-tree"]);
+  const status = await gitOutput(worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"]);
+  const indexChanges = await gitOutput(worktreePath, ["diff", "--cached", "--name-only", "-z", "HEAD"]);
+  const flags = await gitOutput(worktreePath, ["ls-files", "-v", "-z"]);
+  const unsafeFlags = flags.split("\0").filter(Boolean).some((entry) => !entry.startsWith("H "));
+  if (head.trim().toLowerCase() !== expectedHeadSha
+    || headTree.trim().toLowerCase() !== expectedTreeSha
+    || indexTree.trim().toLowerCase() !== expectedTreeSha
+    || status.length > 0
+    || indexChanges.length > 0
+    || unsafeFlags) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Prepared worktree has index, flag, ignored, untracked, HEAD, or tree drift");
+  }
+}
+
+async function createTrustedSuggestionCommit(
+  worktreePath: string,
+  expectedHeadSha: string,
+  changedPaths: readonly string[],
+  expectedTreeSha: string,
+  expectedCommitSha: string,
+): Promise<{ headSha: string; treeSha: string }> {
+  for (const relativePath of changedPaths) {
+    const target = await assertRegularMonitorFile(worktreePath, relativePath);
+    const entry = (await gitOutput(worktreePath, ["ls-files", "--stage", "--", relativePath])).trim();
+    const match = entry.match(/^(100644|100755) [0-9a-f]{40} 0\t/u);
+    if (!match) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Suggestion target lost its exact regular-file index entry");
+    const blob = (await gitOutput(worktreePath, ["hash-object", "-w", "--", relativePath])).trim().toLowerCase();
+    if (!SAFE_SHA.test(blob)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Trusted git blob creation returned an invalid object id");
+    await gitOutput(worktreePath, ["update-index", "--cacheinfo", `${match[1]},${blob},${relativePath}`]);
+  }
+  const staged = (await gitOutput(worktreePath, ["diff", "--cached", "--name-only", "-z"])).split("\0").filter(Boolean).sort();
+  if (monitorCanonicalJson(staged) !== monitorCanonicalJson([...changedPaths].sort())) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Git index contains paths outside the exact suggestion allowlist");
+  }
+  const treeSha = (await gitOutput(worktreePath, ["write-tree"])).trim().toLowerCase();
+  if (treeSha !== expectedTreeSha) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Trusted git tree does not equal the exact planned tree");
+  await gitOutput(worktreePath, ["update-ref", "HEAD", expectedCommitSha, expectedHeadSha]);
+  await assertExactCommittedMonitorWorktree(worktreePath, expectedCommitSha, expectedTreeSha);
+  return { headSha: expectedCommitSha, treeSha };
+}
+
 function registeredMonitorRepository(ctx: ToolContext): ProjectRegistryEntry {
   const matches = ctx.registry.filter((entry) => entry.name === "gajae-code");
   const match = matches[0];
@@ -1514,8 +2726,8 @@ async function resolveMonitorRepository(ctx: ToolContext): Promise<string> {
     gitOutput(repositoryRoot, ["remote", "get-url", "origin"]),
     gitOutput(repositoryRoot, ["remote", "get-url", "upstream"]),
   ]);
-  if (!githubForkRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream)) {
-    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Registry checkout must use twoimo/gajae-code origin and Yeachan-Heo/gajae-code upstream");
+  if (!githubRepositoryRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Registry checkout must use canonical Yeachan-Heo/gajae-code origin and upstream");
   }
   return repositoryRoot;
 }
@@ -1562,17 +2774,18 @@ async function ensureMonitorParentTopology(repositoryRoot: string, monitorRoot: 
 }
 
 async function assertCleanMonitorWorktree(worktreePath: string, expectedHeadSha: string): Promise<void> {
-  const [topLevel, origin, upstream, status, head] = await Promise.all([
+  const [topLevel, origin, upstream, tree] = await Promise.all([
     gitOutput(worktreePath, ["rev-parse", "--show-toplevel"]),
     gitOutput(worktreePath, ["remote", "get-url", "origin"]),
     gitOutput(worktreePath, ["remote", "get-url", "upstream"]),
-    gitOutput(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
-    gitOutput(worktreePath, ["rev-parse", "HEAD"]),
+    gitOutput(worktreePath, ["rev-parse", "HEAD^{tree}"]),
   ]);
-  if (path.resolve(topLevel.trim()) !== worktreePath || !githubForkRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream) || head.trim().toLowerCase() !== expectedHeadSha.toLowerCase() || status.trim()) {
-    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Existing monitor worktree is not clean, exact, or fixed-remote");
+  if (path.resolve(topLevel.trim()) !== worktreePath || !githubRepositoryRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Existing monitor worktree is not exact or fixed-remote");
   }
+  await assertExactCommittedMonitorWorktree(worktreePath, expectedHeadSha.toLowerCase(), tree.trim().toLowerCase());
 }
+
 
 async function localGitObjectExists(repositoryRoot: string, sha: string): Promise<boolean> {
   try {
@@ -2093,11 +3306,24 @@ async function guardSecretPath(ctx: ToolContext, absPath: string, toolName: stri
  * command_*, git_*) against the given server instance, wiring handlers to
  * ctx (PRD §8 full tool catalog).
  */
-export function registerTools(server: unknown, ctx: ToolContext): void {
+export function registerTools(
+  server: unknown,
+  ctx: ToolContext,
+  options: { monitorOnly?: boolean } = {},
+): void {
+  const monitorOnly = options.monitorOnly === true;
+  const monitorToolNames = new Set([
+    "github_pr_monitor_read",
+    "github_pr_monitor_state",
+    "github_pr_monitor_prepare",
+    "github_pr_monitor_execute",
+    "github_pr_monitor_mutate",
+  ]);
   const s = server as McpServer;
   const rawRegisterTool = s.registerTool.bind(s);
-  const registerTool = ((name: string, config: Record<string, unknown>, handler: unknown) =>
-    rawRegisterTool(
+  const registerTool = ((name: string, config: Record<string, unknown>, handler: unknown) => {
+    if (monitorOnly && !monitorToolNames.has(name)) return s;
+    return rawRegisterTool(
       name,
       {
         securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
@@ -2118,29 +3344,32 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         return (handler as (...handlerArgs: unknown[]) => unknown)(...args);
       }) as never,
-    )) as unknown as McpServer["registerTool"];
+    );
+  }) as unknown as McpServer["registerTool"];
 
-  const widgetMeta = e2eWidgetResourceMeta(ctx.config.publicUrl);
-  s.registerResource(
-    "e2e-screenshots-widget",
-    E2E_SCREENSHOT_WIDGET_URI,
-    {
-      title: "E2E screenshot gallery",
-      description: "Renders captured E2E screenshots inline in ChatGPT.",
-      mimeType: E2E_SCREENSHOT_WIDGET_MIME,
-      _meta: widgetMeta,
-    },
-    async () => ({
-      contents: [
-        {
-          uri: E2E_SCREENSHOT_WIDGET_URI,
-          mimeType: E2E_SCREENSHOT_WIDGET_MIME,
-          text: E2E_SCREENSHOT_WIDGET_HTML,
-          _meta: widgetMeta,
-        },
-      ],
-    }),
-  );
+  if (!monitorOnly) {
+    const widgetMeta = e2eWidgetResourceMeta(ctx.config.publicUrl);
+    s.registerResource(
+      "e2e-screenshots-widget",
+      E2E_SCREENSHOT_WIDGET_URI,
+      {
+        title: "E2E screenshot gallery",
+        description: "Renders captured E2E screenshots inline in ChatGPT.",
+        mimeType: E2E_SCREENSHOT_WIDGET_MIME,
+        _meta: widgetMeta,
+      },
+      async () => ({
+        contents: [
+          {
+            uri: E2E_SCREENSHOT_WIDGET_URI,
+            mimeType: E2E_SCREENSHOT_WIDGET_MIME,
+            text: E2E_SCREENSHOT_WIDGET_HTML,
+            _meta: widgetMeta,
+          },
+        ],
+      }),
+    );
+  }
 
   // -------------------------------------------------------------------
   // 8.1 Workspace tools
@@ -3782,7 +5011,19 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       },
     },
     async (input) => withErrorMapping(ctx, "github_pr_monitor_state", input, async () => {
+      if (monitorRolloutMode() === "off" && input.command !== "status") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Monitor rollout is off; state writes are disabled");
+      }
       const requested = input.input ?? {};
+      const allowedRequestedKeys = input.command === "plan-cycle"
+        ? ["receipt", "prs"]
+        : input.command === "ingest" || input.command === "record-side-effect" || input.command === "reconcile"
+          ? ["receipt"]
+          : [];
+      const unexpectedRequestedKeys = Object.keys(requested).filter((key) => !allowedRequestedKeys.includes(key));
+      if (unexpectedRequestedKeys.length > 0) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${input.command} input contains unsupported field(s): ${unexpectedRequestedKeys.join(",")}`);
+      }
       const actionReceipt = requested.receipt;
       if (actionReceipt !== undefined
         && input.command !== "ingest"
@@ -3838,6 +5079,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       }
       const stdout = execution.stdout;
       const receipt = Object.freeze({
+        protocolVersion: 1,
+        schemaVersion: 4,
         receiptId: monitorReceiptId({ tool: "github_pr_monitor_state", command: input.command, runId: input.runId, actionPlanId: input.actionPlanId, input: input.input ?? {} }),
         namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_state", operation: input.command, ok: true,
         runId: input.runId, actionPlanId: input.actionPlanId, command: input.command, stdout,
@@ -3868,6 +5111,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         nonce: randomUUID(),
       });
       const receipt = Object.freeze({
+        protocolVersion: 1,
+        schemaVersion: 4,
         receiptId,
         namespace: "ChatGPT_To_Codex",
         tool: "github_pr_monitor_read",
@@ -3879,7 +5124,6 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         author: GITHUB_PR_AUTHOR,
         prs: snapshots,
         observedAt,
-        issuedAt,
       });
       const text = "Read authored open PR state.";
       const issued = {
@@ -3897,24 +5141,196 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   );
 
   registerTool(
+    "github_pr_monitor_execute",
+    {
+      title: "Apply and verify exact authored PR suggestions",
+      description: "Apply only the exact externally planned suggestions in the prepared fixed-repository worktree, commit with trusted git plumbing, and run bun test in a pinned networkless OCI sandbox.",
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Applying exact PR suggestions...", "Exact PR suggestions verified"),
+      inputSchema: monitorMutationInputSchema({
+        runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), idempotencyKey: z.string().regex(SAFE_ID), eventId: z.string().regex(SAFE_ID),
+        repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive(),
+        expectedHeadSha: z.string().regex(SAFE_SHA), operation: z.literal("apply_suggestions"),
+        worktreePath: z.string().min(1), headRef: z.string().regex(SAFE_REF), ociImageDigest: z.string().regex(MONITOR_OCI_IMAGE),
+        suggestions: z.array(z.object({
+          threadId: z.string().regex(SAFE_ID), commentId: z.string().regex(SAFE_ID),
+          reviewer: z.string().regex(MONITOR_FEEDBACK_LOGIN),
+          path: z.string().min(1),
+          startLine: z.number().int().positive(), line: z.number().int().positive(),
+          expectedOriginal: z.string().min(1).max(MONITOR_MAX_REPLACEMENT_BYTES).regex(/^[^\0]*$/u),
+          replacement: z.string().max(MONITOR_MAX_REPLACEMENT_BYTES).regex(/^[^\0]*$/u),
+          sourceDigest: z.string().regex(MONITOR_SOURCE_DIGEST),
+        }).strict()).min(1).max(MONITOR_MAX_SUGGESTIONS),
+      }, "required"),
+    },
+    async (input) => withErrorMapping(ctx, "github_pr_monitor_execute", input, async () => {
+      requireGithubPrIdentity(input.repository, input.author, input.prNumber);
+      const rollout = monitorRolloutMode();
+      const configuredImage = process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
+      if (rollout !== "enabled") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions requires enabled monitor rollout");
+      }
+      if (!configuredImage || !MONITOR_OCI_IMAGE.test(configuredImage) || input.ociImageDigest !== configuredImage) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions requires the exact configured pinned OCI image");
+      }
+      if (!safeMonitorHeadRef(input.headRef)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions requires a safe headRef");
+      const repositoryRoot = await resolveMonitorRepository(ctx);
+      const expectedWorktreePath = monitorWorktreePath(repositoryRoot, input.prNumber, input.expectedHeadSha);
+      if (input.worktreePath !== expectedWorktreePath) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions requires the exact prepared monitor worktree path");
+      }
+      const suggestions = input.suggestions as MonitorSuggestion[];
+      const changedPaths = validateSuggestionRanges(suggestions);
+      const authorization = monitorAuthorizationBinding(input, "required");
+      const taskDigest = monitorFingerprint({
+        ...structuredClone(input),
+        expectedHeadSha: input.expectedHeadSha.toLowerCase(),
+      });
+      const operationFields = {
+        worktreePath: input.worktreePath,
+        headRef: input.headRef,
+        ociImageDigest: input.ociImageDigest,
+        suggestions: structuredClone(suggestions),
+      };
+      const claim = await claimMonitorAction(ctx, {
+        runId: input.runId,
+        actionPlanId: input.actionPlanId,
+        idempotencyKey: input.idempotencyKey,
+        repository: GITHUB_PR_REPOSITORY,
+        prNumber: input.prNumber,
+        headSha: input.expectedHeadSha.toLowerCase(),
+        phase: "execute",
+        operation: "apply_suggestions",
+        operationFields,
+        ...authorization,
+      });
+      const commitLogicalIdentity = authorization.logicalIdentity;
+      const outcomeBinding = monitorMutationOutcomeBinding(input, "execute", operationFields, claim);
+      let inspection = await inspectDurableMutationOutcome(ctx, "github_pr_monitor_execute", outcomeBinding, claim.claimStatus);
+      if (inspection?.state === "completed") return inspection.result;
+
+      await requireGithubAuthenticatedAuthor();
+      const snapshot = await githubPrSnapshot(input.prNumber);
+      if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase() || snapshot.headRefName !== input.headRef) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote PR head no longer matches the exact execute plan");
+      }
+      for (const reviewer of new Set(suggestions.map((suggestion) => suggestion.reviewer))) {
+        if (reviewer === GITHUB_PR_AUTHOR) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "apply_suggestions cannot authorize the monitored PR author as reviewer");
+        }
+        requireHumanSuggestionReviewerFromSnapshot(snapshot, reviewer);
+      }
+      await assertMonitorWorktreePath(expectedWorktreePath);
+      if (!inspection) {
+        await assertCleanMonitorWorktree(expectedWorktreePath, input.expectedHeadSha);
+        await receiptAuthority(ctx).beginMutationOutcome(outcomeBinding);
+        inspection = await inspectDurableMutationOutcome(ctx, "github_pr_monitor_execute", outcomeBinding, claim.claimStatus);
+      }
+      if (!inspection || inspection.state !== "intent") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Exact durable execute intent was not established");
+      }
+      const { outcomeKey, startedAt } = inspection;
+      const baseTreeSha = (await gitOutput(expectedWorktreePath, ["rev-parse", `${input.expectedHeadSha}^{tree}`])).trim().toLowerCase();
+      if (!SAFE_SHA.test(baseTreeSha)) {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Prepared worktree base tree identity is invalid");
+      }
+      await assertCurrentMonitorSuggestionSources(expectedWorktreePath, suggestions);
+      const artifactTask: MonitorOciArtifactTask = {
+        expectedHeadSha: input.expectedHeadSha.toLowerCase(),
+        expectedTreeSha: baseTreeSha,
+        logicalIdentity: commitLogicalIdentity,
+        taskDigest,
+        suggestions,
+      };
+      const artifact = await createVerifiedMonitorArtifact({
+        imageDigest: input.ociImageDigest,
+        worktreePath: expectedWorktreePath,
+        stateDir: ctx.stateDir,
+        task: artifactTask,
+        renew: () => renewMonitorAuthorizationLease(authorization),
+      });
+      await assertCleanMonitorWorktree(expectedWorktreePath, input.expectedHeadSha);
+
+      const timestamp = new Date(startedAt).toISOString();
+      const projectId = path.basename(expectedWorktreePath);
+      const remoteObject = {
+        kind: "oci_git_bundle",
+        artifactDir: artifact.artifactDir,
+        bundleSha256: artifact.bundleSha256,
+        baseHeadSha: artifact.baseHeadSha,
+        headSha: artifact.headSha,
+        treeSha: artifact.treeSha,
+      };
+      const receipt = Object.freeze({
+        receiptId: monitorReceiptId({ tool: "github_pr_monitor_execute", operation: input.operation, outcomeKey, taskDigest, headSha: artifact.headSha, treeSha: artifact.treeSha, bundleSha256: artifact.bundleSha256 }),
+        namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_execute", operation: input.operation, ok: true,
+        runId: input.runId, actionPlanId: input.actionPlanId, idempotencyKey: input.idempotencyKey, eventId: input.eventId,
+        repository: GITHUB_PR_REPOSITORY, author: GITHUB_PR_AUTHOR, prNumber: input.prNumber,
+        expectedHeadSha: input.expectedHeadSha, oldHeadSha: input.expectedHeadSha, newHeadSha: artifact.headSha,
+        worktreePath: expectedWorktreePath, headRef: input.headRef, ociImageDigest: input.ociImageDigest,
+        taskDigest, changedPaths: artifact.changedPaths,
+        artifactDir: artifact.artifactDir, bundleSha256: artifact.bundleSha256, baseTreeSha,
+        projectId, commandId: "github_pr_monitor_execute", riskTier: "verify",
+        args: [...MONITOR_TEST_ARGV], exitCode: 0, headSha: artifact.headSha, treeSha: artifact.treeSha,
+        ...authorization,
+        claimId: claim.claimId, claimedAt: claim.claimedAt, payloadDigest: claim.payloadDigest,
+        remoteObject, timestamp,
+      });
+      const text = `Applied and verified ${suggestions.length} exact suggestion(s) for PR #${input.prNumber} in the pinned OCI executor.`;
+      const issued = { structured: receipt, input: structuredClone(input), text, issuedAt: startedAt };
+      await persistDurableMutationOutcome(
+        ctx,
+        outcomeBinding,
+        outcomeKey,
+        "github_pr_monitor_execute",
+        receipt.receiptId,
+        issued,
+        {
+          claim: structuredClone(claim),
+          runId: input.runId,
+          actionPlanId: input.actionPlanId,
+          idempotencyKey: input.idempotencyKey,
+          projectId,
+          commandId: "github_pr_monitor_execute",
+          riskTier: "verify",
+          args: [...MONITOR_TEST_ARGV],
+          headSha: artifact.headSha,
+          treeSha: artifact.treeSha,
+          artifactDir: artifact.artifactDir,
+          bundleSha256: artifact.bundleSha256,
+          baseTreeSha,
+          executeBinding: { taskDigest, logicalIdentity: commitLogicalIdentity, ociImageDigest: input.ociImageDigest },
+        },
+      );
+      return makeResult(receipt, text);
+    }),
+  );
+
+  registerTool(
     "github_pr_monitor_prepare",
     {
       title: "Prepare or quarantine fixed-repository PR worktree",
       description: "Create or quarantine only the exact monitor-owned detached worktree for an open Yeachan-Heo/gajae-code PR authored by twoimo.",
       annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing authored PR worktree...", "Authored PR worktree prepared"),
-      inputSchema: {
+      inputSchema: monitorMutationInputSchema({
         runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), idempotencyKey: z.string().regex(SAFE_ID), eventId: z.string().regex(SAFE_ID),
         repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive(),
         expectedHeadSha: z.string().regex(SAFE_SHA), operation: z.enum(["create", "quarantine"]),
         headRef: z.string().regex(SAFE_REF).optional(),
-      },
+      }, "optional"),
     },
     async (input) => withErrorMapping(ctx, "github_pr_monitor_prepare", input, async () => {
+      const rollout = monitorRolloutMode();
+      if (rollout !== "prepare" && rollout !== "enabled") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Worktree preparation requires prepare or enabled monitor rollout");
+      }
       requireGithubPrIdentity(input.repository, input.author, input.prNumber);
       if (input.operation === "create" && (!input.headRef || !safeMonitorHeadRef(input.headRef))) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "create requires a safe headRef");
       if (input.operation === "quarantine" && input.headRef !== undefined) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "quarantine does not accept headRef");
       registeredMonitorRepository(ctx);
+      const authorization = monitorAuthorizationBinding(input, "optional");
+      await renewMonitorAuthorizationLease(authorization);
       const claim = await claimMonitorAction(ctx, {
         runId: input.runId,
         actionPlanId: input.actionPlanId,
@@ -3925,6 +5341,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         phase: "prepare",
         operation: input.operation,
         operationFields: input.operation === "create" ? { headRef: input.headRef } : {},
+        ...authorization,
       });
       const outcomeBinding = monitorMutationOutcomeBinding(
         input,
@@ -4040,6 +5457,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         repository: GITHUB_PR_REPOSITORY, author: GITHUB_PR_AUTHOR, prNumber: input.prNumber,
         expectedHeadSha: input.expectedHeadSha, oldHeadSha: input.expectedHeadSha, newHeadSha: input.expectedHeadSha,
         claimId: claim.claimId, claimedAt: claim.claimedAt, payloadDigest: claim.payloadDigest,
+        ...authorization,
         ...(input.headRef ? { headRef: input.headRef } : {}),
         worktreePath: prepared.worktreePath,
         ...(prepared.quarantinedPath ? { quarantinedPath: prepared.quarantinedPath } : {}),
@@ -4059,6 +5477,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         text,
         issuedAt: startedAt,
       };
+      await renewMonitorAuthorizationLease(authorization);
       await persistDurableMutationOutcome(
         ctx,
         outcomeBinding,
@@ -4083,37 +5502,70 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       description: "Post one marked reply, resolve one thread, re-request one reviewer, or normal-push a prepared monitor worktree after remote-head proof. Fixed repository and author only; no merge, approval, force push, settings, or credentials.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Applying bounded PR response...", "Bounded PR response applied"),
-      inputSchema: {
+      inputSchema: monitorMutationInputSchema({
         runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), idempotencyKey: z.string().regex(SAFE_ID), eventId: z.string().regex(SAFE_ID),
         repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive(),
         expectedHeadSha: z.string().regex(SAFE_SHA), operation: z.enum(["post_reply", "resolve_thread", "rerequest_reviewer", "push_prepared_worktree"]),
-        body: z.string().min(1).max(6000).optional(), threadId: z.string().regex(SAFE_ID).optional(), reviewer: z.string().regex(/^[A-Za-z0-9-]{1,39}$/).optional(),
+        body: z.string().min(1).max(6000).optional(), threadId: z.string().regex(SAFE_ID).optional(), triggerId: z.string().regex(SAFE_ID).optional(), replyReceiptId: z.string().regex(MONITOR_DIGEST).optional(), reviewer: z.string().regex(/^[A-Za-z0-9-]{1,39}$/).optional(),
         worktreePath: z.string().optional(), headRef: z.string().regex(SAFE_REF).optional(),
         verificationReceipt: z.record(z.string(), z.unknown()).optional(),
-      },
+      }, "required"),
     },
     async (input) => withErrorMapping(ctx, "github_pr_monitor_mutate", input, async () => {
+      if (monitorRolloutMode() !== "enabled") {
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR mutation requires enabled monitor rollout");
+      }
       requireGithubPrIdentity(input.repository, input.author, input.prNumber);
       let verification: IssuedVerificationReceipt | undefined;
       let pushBinding: Record<string, unknown> | undefined;
       let operationFields: Record<string, unknown>;
+      const authorization = monitorAuthorizationBinding(input, "required");
       if (input.operation === "post_reply") {
-        if (!input.body || input.threadId !== undefined || input.reviewer !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "post_reply accepts only its exact body field");
+        if (
+          !input.body
+          || input.body.includes("gajae-code-pr-monitor:")
+          || input.body.includes("gjc:auto-response:")
+          || typeof input.threadId !== "string"
+          || !SAFE_ID.test(input.threadId)
+          || input.triggerId !== undefined && !SAFE_ID.test(input.triggerId)
+          || input.replyReceiptId !== undefined
+          || input.reviewer !== undefined
+          || input.worktreePath !== undefined
+          || input.headRef !== undefined
+          || input.verificationReceipt !== undefined
+          || Object.hasOwn(input, "remoteUrl")
+        ) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "post_reply accepts only its exact body, threadId, and optional triggerId fields");
         }
-        operationFields = { body: input.body };
+        operationFields = {
+          body: input.body,
+          threadId: input.threadId,
+          ...(input.triggerId === undefined ? {} : { triggerId: input.triggerId }),
+        };
       } else if (input.operation === "resolve_thread") {
-        if (!input.threadId || input.body !== undefined || input.reviewer !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "resolve_thread accepts only its exact threadId field");
+        if (
+          !input.threadId
+          || !input.triggerId
+          || !SAFE_ID.test(input.triggerId)
+          || !input.replyReceiptId
+          || !MONITOR_DIGEST.test(input.replyReceiptId)
+          || input.body !== undefined
+          || input.reviewer !== undefined
+          || input.worktreePath !== undefined
+          || input.headRef !== undefined
+          || input.verificationReceipt !== undefined
+          || Object.hasOwn(input, "remoteUrl")
+        ) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "resolve_thread accepts only its exact threadId, triggerId, and replyReceiptId fields");
         }
-        operationFields = { threadId: input.threadId };
+        operationFields = { threadId: input.threadId, triggerId: input.triggerId, replyReceiptId: input.replyReceiptId };
       } else if (input.operation === "rerequest_reviewer") {
-        if (!input.reviewer || input.body !== undefined || input.threadId !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined) {
+        if (!input.reviewer || input.body !== undefined || input.threadId !== undefined || input.triggerId !== undefined || input.replyReceiptId !== undefined || input.worktreePath !== undefined || input.headRef !== undefined || input.verificationReceipt !== undefined || Object.hasOwn(input, "remoteUrl")) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "rerequest_reviewer accepts only its exact reviewer field");
         }
         operationFields = { reviewer: input.reviewer };
       } else {
-        if (!input.worktreePath || !input.headRef || !safeMonitorHeadRef(input.headRef) || !input.verificationReceipt || input.body !== undefined || input.threadId !== undefined || input.reviewer !== undefined) {
+        if (!input.worktreePath || !input.headRef || !safeMonitorHeadRef(input.headRef) || !input.verificationReceipt || input.body !== undefined || input.threadId !== undefined || input.triggerId !== undefined || input.replyReceiptId !== undefined || input.reviewer !== undefined || Object.hasOwn(input, "remoteUrl")) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push accepts only its exact worktree, headRef, and verification fields");
         }
         const registeredRepository = registeredMonitorRepository(ctx);
@@ -4134,10 +5586,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           ctx,
           input.verificationReceipt,
           path.basename(locallyExpectedPath),
-          ["issued", "consumed"],
+          ["issued", "recorded", "consumed"],
           pushBinding,
         );
-        if (!verification) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires a fresh, exact, successful verify-tier command_run ActionToolResponse");
+        if (!verification) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires the exact github_pr_monitor_execute verification ActionToolResponse");
         operationFields = {
           worktreePath: input.worktreePath,
           headRef: input.headRef,
@@ -4150,9 +5602,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             headSha: verification.headSha,
             treeSha: verification.treeSha,
             issuedAt: verification.issuedAt,
+            artifactDir: verification.artifactDir,
+            bundleSha256: verification.bundleSha256,
+            baseTreeSha: verification.baseTreeSha,
+            taskDigest: verification.taskDigest,
+            logicalIdentity: verification.logicalIdentity,
+            changedPaths: verification.changedPaths,
           },
         };
       }
+      await renewMonitorAuthorizationLease(authorization);
       const claim = await claimMonitorAction(ctx, {
         runId: input.runId,
         actionPlanId: input.actionPlanId,
@@ -4163,6 +5622,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         phase: "mutate",
         operation: input.operation,
         operationFields,
+        ...authorization,
       });
       const outcomeBinding = monitorMutationOutcomeBinding(input, "mutate", operationFields, claim);
       let inspection = await inspectDurableMutationOutcome(
@@ -4207,35 +5667,88 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has ambiguous remote-head evidence");
         }
-        const body = `${input.body}\n\n<!-- chatgpt2codex-idempotency:${input.idempotencyKey} -->`;
-        const parsedComments = JSON.parse(await githubCommand(["api", `repos/${GITHUB_PR_REPOSITORY}/issues/${input.prNumber}/comments`, "--paginate"])) as unknown;
-        if (!Array.isArray(parsedComments)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "PR comments pagination returned an invalid response");
-        const matches = parsedComments
-          .map((value) => requireRecord(value, "PR comments pagination returned an invalid comment"))
-          .filter((comment) => comment.body === body);
-        if (matches.length > 1) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has duplicate exact idempotency evidence");
+        const body = `${input.body}\n\n<!-- gjc:auto-response:v1:${authorization.effectIdentity} -->`;
+        const threads = requireRecord(snapshot.reviewThreads, "Current PR snapshot omitted review threads");
+        const nodes = threads.nodes;
+        if (!Array.isArray(nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot omitted review threads");
+        const threadMatches = nodes.filter((threadValue) => {
+          const thread = requireRecord(threadValue, "Current PR snapshot returned an invalid review thread");
+          return thread.id === input.threadId;
+        });
+        if (threadMatches.length !== 1) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has no unique exact thread target");
+        const thread = requireRecord(threadMatches[0], "Current PR snapshot returned an invalid review thread");
+        if (thread.isResolved !== false || thread.isOutdated !== false) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent targets a resolved or outdated thread");
         }
-        const existing = matches[0];
+        const bodyThread = await githubReviewThreadWithBodies(input.threadId!);
+        if (bodyThread.isResolved !== false || bodyThread.isOutdated !== false) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent targets a stale exact thread node");
+        }
+        const comments = requireRecord(bodyThread.comments, "Current PR snapshot omitted exact thread comments");
+        if (!Array.isArray(comments.nodes)) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Current PR snapshot returned invalid thread comments");
+        const commentMatches = comments.nodes
+          .map((value) => requireRecord(value, "Current PR snapshot returned an invalid thread comment"))
+          .filter((comment) => {
+            const author = comment.author;
+            return comment.body === body
+              && author !== null
+              && typeof author === "object"
+              && !Array.isArray(author)
+              && (author as Record<string, unknown>).login === GITHUB_PR_AUTHOR
+              && (author as Record<string, unknown>).__typename === "User";
+          });
+        if (commentMatches.length > 1) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has duplicate exact thread-reply evidence");
+        }
+        const existing = commentMatches[0];
         if (existing) {
-          if (!Number.isSafeInteger(existing.id) || typeof existing.html_url !== "string") {
-            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has malformed exact remote evidence");
+          if (
+            (typeof existing.id !== "string" && !(typeof existing.id === "number" && Number.isSafeInteger(existing.id)))
+            || typeof existing.body !== "string"
+          ) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending reply intent has malformed exact thread-reply evidence");
           }
-          remoteObject = { id: existing.id, html_url: existing.html_url };
+          remoteObject = { id: existing.id, html_url: String(snapshot.url), threadId: input.threadId };
         } else {
-          const created = parseGithubRestRecord(
-            await githubCommand(["api", `repos/${GITHUB_PR_REPOSITORY}/issues/${input.prNumber}/comments`, "-f", `body=${body}`]),
-            "Post-reply mutation",
+          const response = parseGithubGraphql(
+            await githubCommand([
+              "api", "graphql",
+              "-f", "query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id body url author{login __typename} pullRequestReviewThread{id}}}}",
+              "-f", `threadId=${input.threadId}`,
+              "-f", `body=${body}`,
+            ]),
+            "Post-review-thread-reply mutation",
           );
-          if (!Number.isSafeInteger(created.id) || typeof created.html_url !== "string") {
-            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Post-reply mutation did not return an exact remote object");
+          const data = requireRecord(response.data, "Post-review-thread-reply mutation omitted data");
+          const payload = requireRecord(data.addPullRequestReviewThreadReply, "Post-review-thread-reply mutation omitted payload");
+          const comment = requireRecord(payload.comment, "Post-review-thread-reply mutation omitted returned comment");
+          const author = requireRecord(comment.author, "Post-review-thread-reply mutation omitted returned author");
+          const returnedThread = requireRecord(comment.pullRequestReviewThread, "Post-review-thread-reply mutation omitted returned thread");
+          if (
+            (typeof comment.id !== "string" && !(typeof comment.id === "number" && Number.isSafeInteger(comment.id)))
+            || comment.body !== body
+            || author.login !== GITHUB_PR_AUTHOR
+            || author.__typename !== "User"
+            || returnedThread.id !== input.threadId
+            || typeof comment.url !== "string"
+            || !new RegExp(`^https://github\\.com/${GITHUB_PR_REPOSITORY.replace("/", "\\/")}/pull/${input.prNumber}#[A-Za-z0-9_-]+$`).test(comment.url)
+          ) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Post-review-thread-reply mutation did not return exact comment, author, thread, body, and URL proof");
           }
-          remoteObject = { id: created.id, html_url: created.html_url };
+          remoteObject = { id: comment.id, html_url: comment.url, threadId: input.threadId };
         }
       } else if (input.operation === "resolve_thread") {
         if (String(snapshot.headRefOid).toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Pending resolve intent has ambiguous remote-head evidence");
         }
+        if (typeof input.triggerId !== "string") {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve trigger is missing or invalid");
+        }
+        if (typeof input.threadId !== "string") {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Resolve thread is missing or invalid");
+        }
+        monitorFeedbackWithId(snapshot, input.triggerId, input.threadId, recoveringIntent);
+        await requireConsumedReplyReceipt(ctx, input, authorization);
         const threads = (snapshot.reviewThreads as { nodes: Array<{ id?: string; isResolved?: boolean }> }).nodes;
         const matchingThreads = threads.filter((thread) => thread.id === input.threadId);
         if (matchingThreads.length !== 1 || typeof matchingThreads[0]?.isResolved !== "boolean") {
@@ -4304,28 +5817,39 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       } else {
         const pushVerification = verification;
         const exactPushBinding = pushBinding;
-        if (!pushVerification || !exactPushBinding) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires an exact verification receipt");
+        if (!pushVerification || !exactPushBinding || !input.headRef) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires an exact verification receipt");
+        }
         const repositoryRoot = await resolveMonitorRepository(ctx);
         const expectedPath = monitorWorktreePath(repositoryRoot, input.prNumber, input.expectedHeadSha);
         if (input.worktreePath !== expectedPath) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires the exact prepared monitor worktree path");
         await assertMonitorWorktreePath(expectedPath);
-        const [topLevel, origin, upstream, localHead, localTree] = await Promise.all([
-          gitOutput(expectedPath, ["rev-parse", "--show-toplevel"]),
-          gitOutput(expectedPath, ["remote", "get-url", "origin"]),
-          gitOutput(expectedPath, ["remote", "get-url", "upstream"]),
-          gitOutput(expectedPath, ["rev-parse", "HEAD"]),
-          gitOutput(expectedPath, ["rev-parse", "HEAD^{tree}"]),
-        ]);
-        const normalizedHead = localHead.trim().toLowerCase();
-        const normalizedTree = localTree.trim().toLowerCase();
-        if (topLevel.trim() !== expectedPath || !githubForkRemoteIsAllowed(origin) || !githubRepositoryRemoteIsAllowed(upstream) || normalizedHead === input.expectedHeadSha.toLowerCase()) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push requires a new local commit in the exact fixed-remote worktree");
+        await assertCleanMonitorWorktree(expectedPath, input.expectedHeadSha);
+        const artifactSuggestions = pushVerification.input.suggestions as MonitorSuggestion[];
+        const artifactChangedPaths = validateSuggestionRanges(artifactSuggestions);
+        if (monitorCanonicalJson(artifactChangedPaths) !== monitorCanonicalJson(pushVerification.changedPaths)) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push verification changed paths do not bind the exact execute input");
         }
-        if (normalizedHead !== pushVerification.headSha || normalizedTree !== pushVerification.treeSha) {
-          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push verification is stale because the prepared worktree HEAD or tree changed after command_run");
-        }
+        const artifactTask: MonitorOciArtifactTask = {
+          expectedHeadSha: input.expectedHeadSha.toLowerCase(),
+          expectedTreeSha: pushVerification.baseTreeSha,
+          logicalIdentity: pushVerification.logicalIdentity,
+          taskDigest: pushVerification.taskDigest,
+          suggestions: artifactSuggestions,
+        };
+        const artifact: VerifiedMonitorArtifact = {
+          artifactDir: pushVerification.artifactDir,
+          bundlePath: path.join(pushVerification.artifactDir, "result.bundle"),
+          bundleSha256: pushVerification.bundleSha256,
+          baseHeadSha: input.expectedHeadSha.toLowerCase(),
+          headSha: pushVerification.headSha,
+          treeSha: pushVerification.treeSha,
+          changedPaths: pushVerification.changedPaths,
+          taskDigest: pushVerification.taskDigest,
+          logicalIdentity: pushVerification.logicalIdentity,
+        };
         const remoteHead = String(snapshot.headRefOid).toLowerCase();
-        if (recoveringIntent && remoteHead === normalizedHead) {
+        if (recoveringIntent && remoteHead === artifact.headSha) {
           if (snapshot.headRefName !== input.headRef) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Recovered push does not bind the exact PR headRef");
           remoteObject = { url: snapshot.url, headRefOid: snapshot.headRefOid, headRefName: snapshot.headRefName };
         } else {
@@ -4336,35 +5860,65 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           if (receiptAgeAtIntent < 0 || receiptAgeAtIntent > ACTION_RECEIPT_TTL_MS) {
             throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "push verification receipt was stale when the durable intent began");
           }
-          if (pushVerification.phase === "issued") {
+          if (pushVerification.phase === "issued" || pushVerification.phase === "recorded") {
             await receiptAuthority(ctx).transitionExact(
               String(pushVerification.structured.receiptId),
               "verification",
               input.verificationReceipt,
-              ["issued"],
+              [pushVerification.phase],
               "consumed",
               { pushBinding: exactPushBinding },
             );
           }
-          await gitOutput(expectedPath, ["push", "origin", `HEAD:refs/heads/${input.headRef}`]);
+          await pushVerifiedMonitorArtifact({
+            worktreePath: expectedPath,
+            artifact,
+            expectedTask: artifactTask,
+            headRef: input.headRef,
+            renew: () => renewMonitorAuthorizationLease(authorization),
+          });
           snapshot = await githubPrSnapshot(input.prNumber);
-          if (String(snapshot.headRefOid).toLowerCase() !== normalizedHead || snapshot.headRefName !== input.headRef) {
-            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote PR head does not equal the pushed local commit");
+          if (String(snapshot.headRefOid).toLowerCase() !== artifact.headSha || snapshot.headRefName !== input.headRef) {
+            throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote PR head does not equal the pushed OCI artifact commit");
           }
           remoteObject = { url: snapshot.url, headRefOid: snapshot.headRefOid, headRefName: snapshot.headRefName };
         }
       }
 
+      await renewMonitorAuthorizationLease(authorization);
       if (!remoteObject) throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Mutation did not produce exact operation-specific evidence");
       const timestamp = new Date(startedAt).toISOString();
+      const replyMarker = input.operation === "post_reply"
+        ? `<!-- gjc:auto-response:v1:${authorization.effectIdentity} -->`
+        : undefined;
       const receipt = Object.freeze({
-        receiptId: monitorReceiptId({ tool: "github_pr_monitor_mutate", operation: input.operation, idempotencyKey: input.idempotencyKey, prNumber: input.prNumber, oldHeadSha, remoteObject }),
+        receiptId: monitorReceiptId({
+          tool: "github_pr_monitor_mutate",
+          operation: input.operation,
+          idempotencyKey: input.idempotencyKey,
+          prNumber: input.prNumber,
+          oldHeadSha,
+          remoteObject,
+          ...(replyMarker === undefined ? {} : { replyMarker }),
+          ...(input.operation === "post_reply" && input.threadId !== undefined ? { threadId: input.threadId } : {}),
+          ...(input.operation === "post_reply" && input.triggerId !== undefined ? { triggerId: input.triggerId } : {}),
+          ...(input.operation === "resolve_thread"
+            ? { threadId: input.threadId, triggerId: input.triggerId, replyReceiptId: input.replyReceiptId }
+            : {}),
+        }),
         namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_mutate", operation: input.operation, ok: true,
         runId: input.runId, actionPlanId: input.actionPlanId, idempotencyKey: input.idempotencyKey, eventId: input.eventId,
         repository: GITHUB_PR_REPOSITORY, author: GITHUB_PR_AUTHOR, prNumber: input.prNumber, expectedHeadSha: input.expectedHeadSha,
+        ...authorization,
         claimId: claim.claimId, claimedAt: claim.claimedAt, payloadDigest: claim.payloadDigest,
         oldHeadSha, newHeadSha: input.operation === "push_prepared_worktree" ? String(remoteObject.headRefOid) : oldHeadSha,
         remoteObject, timestamp,
+        ...(replyMarker === undefined ? {} : { replyMarker }),
+        ...(input.operation === "post_reply" && input.threadId !== undefined ? { threadId: input.threadId } : {}),
+        ...(input.operation === "post_reply" && input.triggerId !== undefined ? { triggerId: input.triggerId } : {}),
+        ...(input.operation === "resolve_thread"
+          ? { threadId: input.threadId, triggerId: input.triggerId, replyReceiptId: input.replyReceiptId }
+          : {}),
       });
       const text = `Applied ${input.operation} to PR #${input.prNumber}.`;
       const issued = {

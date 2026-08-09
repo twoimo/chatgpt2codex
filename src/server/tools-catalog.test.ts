@@ -1,13 +1,21 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
+import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "./mcp-server.js";
 import { ActionReceiptAuthority } from "./action-receipts.js";
 import type { ProjectRegistryEntry, ToolContext } from "../types.js";
 
+const execFileAsync = promisify(execFile);
+
+async function fixtureGit(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): Promise<string> {
+  const result = await execFileAsync("git", ["-C", cwd, ...args], { env: { ...process.env, ...env } });
+  return result.stdout.trim();
+}
 const CONTROL_TOOL_NAMES = ["computer_screenshot", "computer_request_action", "computer_action_status", "computer_kill_switch"];
 
 function makeCtx(): ToolContext {
@@ -45,34 +53,90 @@ function canonicalTestJson(value: unknown): string {
   return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalTestJson(record[key])}`).join(",")}}`;
 }
 
+type MonitorEffectKind = "prepare_create" | "prepare_quarantine" | "post_reply" | "resolve_thread" | "rerequest_reviewer" | "commit" | "normal_push";
+
+function testDigest(value: unknown): string {
+  return createHash("sha256").update(canonicalTestJson(value)).digest("hex");
+}
+
+function monitorAuthorization(
+  input: Record<string, unknown>,
+  effectKind?: MonitorEffectKind,
+): Record<string, unknown> {
+  const operationHeadSha = String(input.expectedHeadSha ?? input.headSha);
+  const identity = {
+    runId: input.runId,
+    actionPlanId: input.actionPlanId,
+    prNumber: input.prNumber,
+    operation: input.operation,
+    operationHeadSha,
+  };
+  const digest = (kind: string) => testDigest({ kind, ...identity });
+  const unsigned = {
+    protocolVersion: 1,
+    schemaVersion: 4,
+    ownerId: String(input.runId),
+    leaseKey: `pr:Yeachan-Heo/gajae-code:${String(input.prNumber)}`,
+    fence: 1,
+    logicalIdentity: digest("logicalIdentity"),
+    operationKey: digest("operationKey"),
+    operationHeadSha,
+    effectIdentity: digest("effectIdentity"),
+    ...(effectKind === undefined ? {} : { effectKey: digest(`effectKey:${effectKind}`), effectKind }),
+    targetDigest: digest("targetDigest"),
+    policyDigest: digest("policyDigest"),
+  };
+  return { ...unsigned, bindingDigest: testDigest(unsigned) };
+}
+
+function authorizedMonitorInput<T extends Record<string, unknown>>(input: T): T & Record<string, unknown> {
+  const effectKind = input.operation === "post_reply"
+    ? "post_reply"
+    : input.operation === "resolve_thread"
+      ? "resolve_thread"
+      : input.operation === "rerequest_reviewer"
+        ? "rerequest_reviewer"
+        : input.operation === "apply_suggestions"
+          ? "commit"
+          : input.operation === "push_prepared_worktree"
+            ? "normal_push"
+            : undefined;
+  return { ...input, ...monitorAuthorization(input, effectKind) };
+}
+
 function durableOutcomeBinding(
   index: number,
-  overrides: { idempotencyKey?: string; claimId?: string; body?: string } = {},
+  overrides: { idempotencyKey?: string; claimId?: string; body?: string; threadId?: string } = {},
 ) {
   const idempotencyKey = overrides.idempotencyKey ?? `idem-retention-${index}`;
   const body = overrides.body ?? `reply-${index}`;
-  const claim = {
+  const threadId = overrides.threadId ?? `thread-retention-${index}`;
+  const input = {
     runId: `run-retention-${index}`,
     actionPlanId: `plan-retention-${index}`,
     idempotencyKey,
-    repository: "Yeachan-Heo/gajae-code" as const,
-    prNumber: 7,
-    headSha: "0123456789abcdef0123456789abcdef01234567",
-    phase: "mutate" as const,
-    operation: "post_reply" as const,
-    operationFields: { body },
-  };
-  const input = {
-    runId: claim.runId,
-    actionPlanId: claim.actionPlanId,
-    idempotencyKey,
     eventId: `event-retention-${index}`,
-    repository: claim.repository,
+    repository: "Yeachan-Heo/gajae-code" as const,
     author: "twoimo" as const,
-    prNumber: claim.prNumber,
-    expectedHeadSha: claim.headSha,
-    operation: claim.operation,
+    prNumber: 7,
+    expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
+    operation: "post_reply" as const,
     body,
+    threadId,
+  };
+  const authorization = monitorAuthorization(input, "post_reply");
+  const authorizedInput = { ...input, ...authorization };
+  const claim = {
+    runId: input.runId,
+    actionPlanId: input.actionPlanId,
+    idempotencyKey,
+    repository: input.repository,
+    prNumber: input.prNumber,
+    headSha: input.expectedHeadSha,
+    phase: "mutate" as const,
+    operation: input.operation,
+    operationFields: { body, threadId },
+    ...authorization,
   };
   return {
     runId: claim.runId,
@@ -80,43 +144,47 @@ function durableOutcomeBinding(
     actionPlanId: claim.actionPlanId,
     idempotencyKey,
     claimId: overrides.claimId ?? `claim-retention-${index}`,
-    claimPayloadDigest: createHash("sha256").update(canonicalTestJson(claim)).digest("hex"),
+    claimPayloadDigest: testDigest(claim),
     repository: claim.repository,
-    author: "twoimo" as const,
+    author: input.author,
     prNumber: claim.prNumber,
     expectedHeadSha: claim.headSha,
     eventId: input.eventId,
     phase: claim.phase,
     operation: claim.operation,
     operationFields: claim.operationFields,
-    input,
+    input: authorizedInput,
+    authorization,
   };
 }
 
 function durableReviewerBinding(index: number, reviewer = `reviewer-${index}`) {
   const idempotencyKey = `idem-reviewer-retention-${index}`;
-  const claim = {
+  const input = {
     runId: `run-reviewer-retention-${index}`,
     actionPlanId: `plan-reviewer-retention-${index}`,
     idempotencyKey,
-    repository: "Yeachan-Heo/gajae-code" as const,
-    prNumber: 7,
-    headSha: "0123456789abcdef0123456789abcdef01234567",
-    phase: "mutate" as const,
-    operation: "rerequest_reviewer" as const,
-    operationFields: { reviewer },
-  };
-  const input = {
-    runId: claim.runId,
-    actionPlanId: claim.actionPlanId,
-    idempotencyKey,
     eventId: `event-reviewer-retention-${index}`,
-    repository: claim.repository,
+    repository: "Yeachan-Heo/gajae-code" as const,
     author: "twoimo" as const,
-    prNumber: claim.prNumber,
-    expectedHeadSha: claim.headSha,
-    operation: claim.operation,
+    prNumber: 7,
+    expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
+    operation: "rerequest_reviewer" as const,
     reviewer,
+  };
+  const authorization = monitorAuthorization(input, "rerequest_reviewer");
+  const authorizedInput = { ...input, ...authorization };
+  const claim = {
+    runId: input.runId,
+    actionPlanId: input.actionPlanId,
+    idempotencyKey,
+    repository: input.repository,
+    prNumber: input.prNumber,
+    headSha: input.expectedHeadSha,
+    phase: "mutate" as const,
+    operation: input.operation,
+    operationFields: { reviewer },
+    ...authorization,
   };
   return {
     runId: claim.runId,
@@ -124,16 +192,17 @@ function durableReviewerBinding(index: number, reviewer = `reviewer-${index}`) {
     actionPlanId: claim.actionPlanId,
     idempotencyKey,
     claimId: `claim-reviewer-retention-${index}`,
-    claimPayloadDigest: createHash("sha256").update(canonicalTestJson(claim)).digest("hex"),
+    claimPayloadDigest: testDigest(claim),
     repository: claim.repository,
-    author: "twoimo" as const,
+    author: input.author,
     prNumber: claim.prNumber,
     expectedHeadSha: claim.headSha,
     eventId: input.eventId,
     phase: claim.phase,
     operation: claim.operation,
     operationFields: claim.operationFields,
-    input,
+    input: authorizedInput,
+    authorization,
   };
 }
 interface TestSqliteStatement {
@@ -218,6 +287,7 @@ const canonical = (value) => {
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
   return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
 };
+const authorizationKeys = ["protocolVersion", "schemaVersion", "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey", "operationHeadSha", "effectIdentity", "effectKey", "effectKind", "targetDigest", "policyDigest", "bindingDigest"];
 let payload = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { payload += chunk; });
@@ -228,7 +298,29 @@ process.stdin.on("end", () => {
     console.log(JSON.stringify({ ok: true, command, ...input, committed: false }));
     return;
   }
+  if (command === "lease-renew") {
+    const serverTime = "2026-07-27T00:00:00.000Z";
+    console.log(JSON.stringify({
+      ok: true,
+      command,
+      protocolVersion: 1,
+      schemaVersion: 4,
+      requestDigest: crypto.createHash("sha256").update(canonical(input)).digest("hex"),
+      result: {
+        protocolVersion: 1,
+        schemaVersion: 4,
+        leaseKey: input.leaseKey,
+        ownerId: input.ownerId,
+        runId: input.runId,
+        fence: input.fence,
+        serverTime,
+        expiresAt: "2026-07-27T00:00:30.000Z"
+      }
+    }));
+    return;
+  }
   console.log(JSON.stringify({
+    ...Object.fromEntries(authorizationKeys.flatMap((key) => input[key] === undefined ? [] : [[key, input[key]]])),
     command: "claim-action",
     ok: true,
     claimId: "claim-" + input.idempotencyKey,
@@ -243,6 +335,12 @@ process.stdin.on("end", () => {
 `;
 
 describe("tool catalog", () => {
+  beforeEach(() => {
+    process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = "enabled";
+  });
+  afterEach(() => {
+    delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+  });
   it("keeps the one-shot E2E tool out of destructive/open-world routing", async () => {
     const server = await createServer(makeCtx());
     const tools = (
@@ -920,8 +1018,12 @@ describe("tool catalog", () => {
   });
 
   describe("ChatGPT confirm-model exposure (CHATGPT2CODEX_CONTROL_CHATGPT)", () => {
+    beforeEach(() => {
+      process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = "enabled";
+    });
     afterEach(() => {
       delete process.env.CHATGPT2CODEX_CONTROL_CHATGPT;
+      delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
     });
 
     async function toolsListNames(): Promise<string[]> {
@@ -993,13 +1095,27 @@ describe("tool catalog", () => {
     });
     it("registers fixed-repository PR monitor tools with bounded mutation input", async () => {
       const server = await createServer(makeCtx());
-      const tools = (server as unknown as { _registeredTools?: Record<string, { annotations?: Record<string, unknown>; inputSchema?: { shape?: Record<string, unknown> } }> })._registeredTools;
+      const tools = (server as unknown as { _registeredTools?: Record<string, { annotations?: Record<string, unknown>; inputSchema?: { shape?: Record<string, unknown>; safeParse?: (value: unknown) => { success: boolean } } }> })._registeredTools;
       expect(tools?.github_pr_monitor_read?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
       expect(tools?.github_pr_monitor_prepare?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
       expect(tools?.github_pr_monitor_prepare?.inputSchema?.shape?.operation).toBeDefined();
       expect(tools?.github_pr_monitor_prepare?.inputSchema?.shape?.expectedHeadSha).toBeDefined();
       expect(tools?.github_pr_monitor_prepare?.inputSchema?.shape?.headRef).toBeDefined();
       expect(tools?.github_pr_monitor_prepare?.inputSchema?.shape?.repository).toBeDefined();
+      expect(tools?.github_pr_monitor_execute?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
+      expect(tools?.github_pr_monitor_execute?.inputSchema?.shape?.operation).toBeDefined();
+      expect(tools?.github_pr_monitor_execute?.inputSchema?.shape?.ociImageDigest).toBeDefined();
+      expect(tools?.github_pr_monitor_execute?.inputSchema?.shape?.suggestions).toBeDefined();
+      expect(tools?.github_pr_monitor_execute?.inputSchema?.safeParse?.({
+        runId: "run", actionPlanId: "plan", idempotencyKey: "idem", eventId: "event",
+        repository: "Yeachan-Heo/gajae-code", author: "twoimo", prNumber: 1,
+        expectedHeadSha: "0".repeat(40), operation: "apply_suggestions",
+        worktreePath: "/tmp/worktree", headRef: "feature/test", ociImageDigest: `sha256:${"a".repeat(64)}`,
+        suggestions: [{
+          threadId: "thread", commentId: "comment", reviewer: "reviewer", path: "src/a.ts", startLine: 1, line: 1,
+          expectedOriginal: "old", replacement: "unsafe\0replacement", sourceDigest: "b".repeat(64),
+        }],
+      }).success).toBe(false);
       expect(tools?.github_pr_monitor_state?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
       expect(tools?.github_pr_monitor_state?.inputSchema?.shape?.command).toBeDefined();
       expect(tools?.github_pr_monitor_state?.inputSchema?.shape?.input).toBeDefined();
@@ -1007,6 +1123,213 @@ describe("tool catalog", () => {
       expect(tools?.github_pr_monitor_mutate?.inputSchema?.shape?.operation).toBeDefined();
       expect(tools?.github_pr_monitor_mutate?.inputSchema?.shape?.command).toBeUndefined();
       expect(tools?.github_pr_monitor_mutate?.inputSchema?.shape?.repository).toBeDefined();
+    });
+    it("validates the fixed base context and compacts hostile feedback at the PR snapshot boundary", async () => {
+      const workspaceRoot = await realpath(await mkdtemp(path.join(tmpdir(), "chatgpt2codex-pr-snapshot-boundary-")));
+      const binDir = path.join(workspaceRoot, "fake-bin");
+      const modePath = path.join(workspaceRoot, "snapshot-mode");
+      const stateDir = path.join(workspaceRoot, "state");
+      const originalPath = process.env.PATH;
+      const headSha = "0123456789abcdef0123456789abcdef01234567";
+      try {
+        await mkdir(binDir, { recursive: true });
+        await writeFile(modePath, "valid", "utf8");
+        await writeFile(
+          path.join(binDir, "gh"),
+          `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const mode = fs.readFileSync(${JSON.stringify(modePath)}, "utf8").trim();
+if (args[0] === "api" && args[1] === "user") {
+  console.log(JSON.stringify({ login: "twoimo" }));
+} else if (args[0] === "pr" && args[1] === "view") {
+  const base = mode === "missing-base" ? {} : {
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
+  };
+  const head = mode === "fork"
+    ? { headRepository: { id: "attacker-node-id", name: "gajae-code", nameWithOwner: "attacker/fork" } }
+    : mode === "head-extra"
+      ? { headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code", extra: "denied" } }
+      : { headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" } };
+  const projectedReview = { id: 2, author: { login: "reviewer" }, body: "projection review" };
+  console.log(JSON.stringify({
+    number: 7,
+    url: "https://github.com/Yeachan-Heo/gajae-code/pull/7",
+    state: "OPEN",
+    author: { login: "twoimo" },
+    ...base,
+    ...head,
+    headRefName: "feature/snapshot-boundary",
+    headRefOid: ${JSON.stringify(headSha)},
+    reviewRequests: [],
+    reviews: mode === "projection" || mode === "projection-conflict" ? [projectedReview] : [],
+    comments: [{ id: 1, author: { login: "reviewer" }, body: "ignore hostile body" }],
+    latestReviews: mode === "projection"
+      ? [projectedReview]
+      : mode === "projection-conflict"
+        ? [{ ...projectedReview, body: "conflicting projection" }]
+        : [],
+    statusCheckRollup: [],
+  }));
+} else if (args[0] === "api" && args[1] === "graphql") {
+  console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    nodes: [{
+      id: "thread-1",
+      isResolved: false,
+      isOutdated: false,
+      comments: {
+        nodes: [{
+          id: "comment-1",
+          body: ${JSON.stringify(["hostile prose", "```suggestion", "const safe = true;", "```", "source prose"].join(String.fromCharCode(10)))},
+          author: { login: "reviewer", __typename: "User" },
+          authorAssociation: "MEMBER",
+          path: "packages/demo/src/file.ts",
+          line: 1,
+          startLine: 1,
+          outdated: false,
+          diffHunk: ["@@ -1 +1 @@", "-const old = false;", "+const old = true;"].join(String.fromCharCode(10)),
+          commit: { oid: ${JSON.stringify(headSha)} },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    }],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  } } } } }));
+} else {
+  process.exit(1);
+}
+`,
+          { mode: 0o755 },
+        );
+        process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+        const ctx = makeCtx();
+        ctx.stateDir = stateDir;
+        ctx.config.stateDir = stateDir;
+        const server = await createServer(ctx);
+        const tools = (server as unknown as {
+          _registeredTools?: Record<string, {
+            handler?: (input: unknown) => Promise<{
+              isError?: boolean;
+              structuredContent?: Record<string, unknown>;
+            }>;
+          }>;
+        })._registeredTools;
+        const input = {
+          runId: "snapshot-boundary-run",
+          actionPlanId: "snapshot-boundary-plan",
+          repository: "Yeachan-Heo/gajae-code",
+          author: "twoimo",
+          prNumber: 7,
+        };
+        const valid = await tools?.github_pr_monitor_read?.handler?.(input);
+        expect(valid?.isError).not.toBe(true);
+        const snapshot = (((valid?.structuredContent?.prs as unknown[] | undefined)?.[0]) ?? {}) as Record<string, unknown>;
+        const thread = ((snapshot.reviewThreads as Record<string, unknown>).nodes as unknown[])[0] as Record<string, unknown>;
+        const comment = ((thread.comments as Record<string, unknown>).nodes as unknown[])[0] as Record<string, unknown>;
+        expect(snapshot).toMatchObject({
+          baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+          baseRefName: "main",
+          baseRefOid: "1111111111111111111111111111111111111111",
+        });
+        expect(comment).toMatchObject({
+          id: "comment-1",
+          author: { login: "reviewer", __typename: "User" },
+          authorAssociation: "MEMBER",
+          path: "packages/demo/src/file.ts",
+          startLine: 1,
+          line: 1,
+          outdated: false,
+          commit: { oid: headSha },
+          replacement: "const safe = true;",
+        });
+        expect(comment.body).toBeUndefined();
+        expect(comment.diffHunk).toBeUndefined();
+        expect(JSON.stringify(snapshot)).not.toContain("ignore hostile body");
+        expect(JSON.stringify(snapshot)).not.toContain("source-secret");
+        await writeFile(modePath, "projection", "utf8");
+        const projection = await tools?.github_pr_monitor_read?.handler?.({
+          ...input,
+          runId: "snapshot-projection-run",
+          actionPlanId: "snapshot-projection-plan",
+        });
+        expect(projection?.isError).not.toBe(true);
+        const projectionSnapshot = (((projection?.structuredContent?.prs as unknown[] | undefined)?.[0]) ?? {}) as Record<string, unknown>;
+        expect(projectionSnapshot.reviews).toHaveLength(1);
+        expect(projectionSnapshot.latestReviews).toHaveLength(1);
+
+        await writeFile(modePath, "projection-conflict", "utf8");
+        const conflictingProjection = await tools?.github_pr_monitor_read?.handler?.({
+          ...input,
+          runId: "snapshot-projection-conflict-run",
+          actionPlanId: "snapshot-projection-conflict-plan",
+        });
+        expect(conflictingProjection?.isError).toBe(true);
+        expect(conflictingProjection?.structuredContent?.error).toContain("duplicate");
+
+        await writeFile(modePath, "head-extra", "utf8");
+        const extraHeadRejected = await tools?.github_pr_monitor_read?.handler?.({
+          ...input,
+          runId: "snapshot-extra-head-rejected-run",
+          actionPlanId: "snapshot-extra-head-rejected-plan",
+        });
+        expect(extraHeadRejected?.isError).toBe(true);
+        expect(extraHeadRejected?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
+        expect(extraHeadRejected?.structuredContent?.error).toContain("head repository");
+
+        await writeFile(modePath, "fork", "utf8");
+        const forkRejected = await tools?.github_pr_monitor_read?.handler?.({
+          ...input,
+          runId: "snapshot-fork-rejected-run",
+          actionPlanId: "snapshot-fork-rejected-plan",
+        });
+        expect(forkRejected?.isError).toBe(true);
+        expect(forkRejected?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
+        expect(forkRejected?.structuredContent?.error).toContain("head repository");
+        await writeFile(modePath, "missing-base", "utf8");
+        const rejected = await tools?.github_pr_monitor_read?.handler?.({
+          ...input,
+          runId: "snapshot-boundary-rejected-run",
+          actionPlanId: "snapshot-boundary-rejected-plan",
+        });
+        expect(rejected?.isError).toBe(true);
+        expect(rejected?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
+        expect(rejected?.structuredContent?.error).toContain("base");
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        await rm(workspaceRoot, { recursive: true, force: true });
+      }
+    });
+    it.each([undefined, "invalid"])("fails closed for absent or unknown monitor rollout (%s)", async (rollout) => {
+      if (rollout === undefined) delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+      else process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = rollout;
+      const server = await createServer(makeCtx());
+      const tools = (server as unknown as {
+        _registeredTools?: Record<string, {
+          handler?: (input: unknown) => Promise<{ isError?: boolean; structuredContent?: Record<string, unknown> }>;
+        }>;
+      })._registeredTools;
+      const identity = {
+        runId: "run-rollout", actionPlanId: "plan-rollout", idempotencyKey: "idem-rollout", eventId: "event-rollout",
+        repository: "Yeachan-Heo/gajae-code", author: "twoimo", prNumber: 1, expectedHeadSha: "0".repeat(40),
+      };
+      const results = await Promise.all([
+        tools?.github_pr_monitor_state?.handler?.({ ...identity, command: "ingest", input: {} }),
+        tools?.github_pr_monitor_prepare?.handler?.({ ...identity, operation: "create", headRef: "feature/test" }),
+        tools?.github_pr_monitor_execute?.handler?.({
+          ...identity, operation: "apply_suggestions", worktreePath: "/tmp/worktree", headRef: "feature/test",
+          ociImageDigest: `sha256:${"a".repeat(64)}`, suggestions: [],
+        }),
+        tools?.github_pr_monitor_mutate?.handler?.({ ...identity, operation: "post_reply", body: "bounded" }),
+      ]);
+      expect(results).toHaveLength(4);
+      for (const result of results) {
+        expect(result?.isError).toBe(true);
+        expect(result?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
+        expect(String(result?.structuredContent?.error)).toMatch(/rollout|requires enabled/);
+      }
     });
     it("rejects a symlinked monitor parent before creating through it", async () => {
       const workspaceRoot = await realpath(await mkdtemp(path.join(tmpdir(), "chatgpt2codex-monitor-parent-")));
@@ -1038,8 +1361,17 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/7",
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/strict-actions",
-    headRefOid: "0123456789abcdef0123456789abcdef01234567"
+    headRefOid: "0123456789abcdef0123456789abcdef01234567",
+    reviewRequests: [],
+    reviews: [],
+    comments: [],
+    latestReviews: [],
+    statusCheckRollup: [],
   }));
 } else {
   console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
@@ -1055,7 +1387,7 @@ if (args[0] === "api" && args[1] === "user") {
 const args = process.argv.slice(2);
 if (args.includes("get-url")) {
   console.log(args.at(-1) === "origin"
-    ? "git@github.com:twoimo/gajae-code.git"
+    ? "git@github.com:Yeachan-Heo/gajae-code.git"
     : "https://github.com/Yeachan-Heo/gajae-code.git");
 }
 `,
@@ -1076,7 +1408,7 @@ if (args.includes("get-url")) {
             handler?: (input: unknown) => Promise<{ isError?: boolean; structuredContent?: Record<string, unknown> }>;
           }>;
         })._registeredTools;
-        const result = await tools?.github_pr_monitor_prepare?.handler?.({
+        const result = await tools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput({
           runId: "run-symlink-parent",
           actionPlanId: "plan-symlink-parent",
           idempotencyKey: "idem-symlink-parent",
@@ -1087,7 +1419,7 @@ if (args.includes("get-url")) {
           expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
           operation: "create",
           headRef: "feature/strict-actions",
-        });
+        }));
 
         expect(result?.isError).toBe(true);
         expect(result?.structuredContent?.error).toContain("parent topology");
@@ -1132,8 +1464,17 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/" + args[2],
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/strict-actions",
-    headRefOid: ${JSON.stringify(expectedHeadSha)}
+    headRefOid: ${JSON.stringify(expectedHeadSha)},
+    reviewRequests: [],
+    reviews: [],
+    comments: [],
+    latestReviews: [],
+    statusCheckRollup: [],
   }));
 } else {
   console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
@@ -1149,7 +1490,7 @@ if (args[0] === "api" && args[1] === "user") {
 const args = process.argv.slice(2);
 if (args.includes("get-url")) {
   console.log(args.at(-1) === "origin"
-    ? "git@github.com:twoimo/gajae-code.git"
+    ? "git@github.com:Yeachan-Heo/gajae-code.git"
     : "https://github.com/Yeachan-Heo/gajae-code.git");
 }
 `,
@@ -1175,7 +1516,7 @@ if (args.includes("get-url")) {
         })._registeredTools;
         const quarantine = async (prNumber: number) => {
           await seedPlanBinding(ctx.stateDir, `run-quarantine-${prNumber}`, `plan-quarantine-${prNumber}`);
-          return tools?.github_pr_monitor_prepare?.handler?.({
+          return tools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput({
             runId: `run-quarantine-${prNumber}`,
             actionPlanId: `plan-quarantine-${prNumber}`,
             idempotencyKey: `idem-quarantine-${prNumber}`,
@@ -1185,7 +1526,7 @@ if (args.includes("get-url")) {
             prNumber,
             expectedHeadSha,
             operation: "quarantine",
-          });
+          }));
         };
 
         const moved = await quarantine(7);
@@ -1213,7 +1554,7 @@ if (args.includes("get-url")) {
             }>;
           }>;
         })._registeredTools;
-        const recoveredMoved = await restartedTools?.github_pr_monitor_prepare?.handler?.({
+        const recoveredMoved = await restartedTools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput({
           runId: "run-quarantine-7",
           actionPlanId: "plan-quarantine-7",
           idempotencyKey: "idem-quarantine-7",
@@ -1223,7 +1564,7 @@ if (args.includes("get-url")) {
           prNumber: 7,
           expectedHeadSha,
           operation: "quarantine",
-        });
+        }));
         expect(recoveredMoved?.isError).not.toBe(true);
         expect(recoveredMoved?.structuredContent).toEqual(moved?.structuredContent);
         expect(recoveredMoved?.content).toEqual(moved?.content);
@@ -1264,7 +1605,7 @@ if (args.includes("get-url")) {
           }
           return originalComplete.apply(this, args);
         };
-        const lostPrepareResponse = await tools?.github_pr_monitor_prepare?.handler?.(crashInput);
+        const lostPrepareResponse = await tools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(crashInput));
         ActionReceiptAuthority.prototype.completeMutationOutcome = originalComplete;
         expect(lostPrepareResponse?.isError).toBe(true);
         await expect(lstat(crashWorktree)).rejects.toMatchObject({ code: "ENOENT" });
@@ -1279,8 +1620,8 @@ if (args.includes("get-url")) {
             }>;
           }>;
         })._registeredTools;
-        const recoveredPrepare = await crashRestartTools?.github_pr_monitor_prepare?.handler?.(crashInput);
-        const replayedPrepare = await crashRestartTools?.github_pr_monitor_prepare?.handler?.(crashInput);
+        const recoveredPrepare = await crashRestartTools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(crashInput));
+        const replayedPrepare = await crashRestartTools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(crashInput));
         expect(recoveredPrepare?.isError).toBeUndefined();
         expect(replayedPrepare?.structuredContent).toEqual(recoveredPrepare?.structuredContent);
         expect(replayedPrepare?.content).toEqual(recoveredPrepare?.content);
@@ -1298,6 +1639,7 @@ if (args.includes("get-url")) {
       const workspaceRoot = await realpath(await mkdtemp(path.join(tmpdir(), "chatgpt2codex-monitor-create-recovery-")));
       const repositoryRoot = path.join(workspaceRoot, "gajae-code");
       const expectedHeadSha = "0123456789abcdef0123456789abcdef01234567";
+      const expectedTreeSha = "1111111111111111111111111111111111111111";
       const monitorRepositoryRoot = path.join(
         workspaceRoot,
         "gajae-code-pr-monitor-pr-worktrees",
@@ -1325,8 +1667,17 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/" + args[2],
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/strict-actions",
-    headRefOid: ${JSON.stringify(expectedHeadSha)}
+    headRefOid: ${JSON.stringify(expectedHeadSha)},
+    reviewRequests: [],
+    reviews: [],
+    comments: [],
+    latestReviews: [],
+    statusCheckRollup: [],
   }));
 } else {
   console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
@@ -1345,15 +1696,17 @@ const cwd = args[args.indexOf("-C") + 1];
 fs.appendFileSync(${JSON.stringify(gitLog)}, JSON.stringify(args) + "\\n");
 if (args.includes("get-url")) {
   console.log(args.at(-1) === "origin"
-    ? "git@github.com:twoimo/gajae-code.git"
+    ? "git@github.com:Yeachan-Heo/gajae-code.git"
     : "https://github.com/Yeachan-Heo/gajae-code.git");
 } else if (args.includes("--show-toplevel")) {
   console.log(cwd);
 } else if (args.includes("status")) {
-  console.log(fs.readFileSync(${JSON.stringify(dirtyState)}, "utf8"));
+  process.stdout.write(fs.readFileSync(${JSON.stringify(dirtyState)}, "utf8"));
 } else if (args.includes("cat-file")) {
   process.exit(0);
-} else if (args.at(-1) === "HEAD") {
+} else if (args.at(-1) === "HEAD^{tree}" || args.includes("write-tree")) {
+  console.log(${JSON.stringify(expectedTreeSha)});
+} else if (args.includes("rev-parse") && args.at(-1) === "HEAD") {
   console.log(${JSON.stringify(expectedHeadSha)});
 } else if (args.includes("worktree") && args.includes("add")) {
   fs.mkdirSync(args[args.indexOf("--detach") + 1], { recursive: true });
@@ -1415,14 +1768,14 @@ if (args.includes("get-url")) {
         const recoveredWorktree = path.join(monitorRepositoryRoot, `pr-7-${expectedHeadSha}`);
         await seedPlanBinding(ctx.stateDir, "run-create-7", "plan-create-7");
         strandNextOutcome("injected crash after worktree add before outcome completion");
-        const lostCreate = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(createInput(7));
+        const lostCreate = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(createInput(7)));
         ActionReceiptAuthority.prototype.completeMutationOutcome = originalComplete;
         expect(lostCreate?.isError).toBe(true);
         expect((await lstat(recoveredWorktree)).isDirectory()).toBe(true);
         expect(await worktreeAddCount(7)).toBe(1);
 
         const restartedTools = await monitorTools();
-        const recoveredCreate = await restartedTools?.github_pr_monitor_prepare?.handler?.(createInput(7));
+        const recoveredCreate = await restartedTools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(createInput(7)));
         expect(recoveredCreate?.isError, JSON.stringify(recoveredCreate?.structuredContent)).toBeUndefined();
         expect(recoveredCreate?.structuredContent).toMatchObject({
           operation: "create",
@@ -1433,7 +1786,7 @@ if (args.includes("get-url")) {
         });
         expect(recoveredCreate?.content?.[0]?.text).toBe("Prepared monitor worktree for PR #7.");
         expect(await worktreeAddCount(7)).toBe(1);
-        const replayedCreate = await restartedTools?.github_pr_monitor_prepare?.handler?.(createInput(7));
+        const replayedCreate = await restartedTools?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(createInput(7)));
         expect(replayedCreate?.structuredContent).toEqual(recoveredCreate?.structuredContent);
         expect(replayedCreate?.content).toEqual(recoveredCreate?.content);
         expect(await worktreeAddCount(7)).toBe(1);
@@ -1441,13 +1794,13 @@ if (args.includes("get-url")) {
         // Non-exact worktree evidence must never be accepted as the intent's effect.
         await seedPlanBinding(ctx.stateDir, "run-create-8", "plan-create-8");
         strandNextOutcome("injected crash after worktree add before outcome completion");
-        const lostAmbiguous = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(createInput(8));
+        const lostAmbiguous = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(createInput(8)));
         ActionReceiptAuthority.prototype.completeMutationOutcome = originalComplete;
         expect(lostAmbiguous?.isError).toBe(true);
         expect(await worktreeAddCount(8)).toBe(1);
 
         await writeFile(dirtyState, " M src/changed.ts\n", "utf8");
-        const ambiguousCreate = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(createInput(8));
+        const ambiguousCreate = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(createInput(8)));
         expect(ambiguousCreate?.isError).toBe(true);
         expect(ambiguousCreate?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
         expect(ambiguousCreate?.structuredContent?.error).toBe(
@@ -1490,8 +1843,17 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/" + args[2],
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/strict-actions",
-    headRefOid: ${JSON.stringify(expectedHeadSha)}
+    headRefOid: ${JSON.stringify(expectedHeadSha)},
+    reviewRequests: [],
+    reviews: [],
+    comments: [],
+    latestReviews: [],
+    statusCheckRollup: [],
   }));
 } else {
   console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
@@ -1507,7 +1869,7 @@ if (args[0] === "api" && args[1] === "user") {
 const args = process.argv.slice(2);
 if (args.includes("get-url")) {
   console.log(args.at(-1) === "origin"
-    ? "git@github.com:twoimo/gajae-code.git"
+    ? "git@github.com:Yeachan-Heo/gajae-code.git"
     : "https://github.com/Yeachan-Heo/gajae-code.git");
 }
 `,
@@ -1560,7 +1922,7 @@ if (args.includes("get-url")) {
             }
             return originalComplete.apply(this, args);
           };
-          const lost = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(quarantineInput(prNumber));
+          const lost = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(quarantineInput(prNumber)));
           ActionReceiptAuthority.prototype.completeMutationOutcome = originalComplete;
           expect(lost?.isError, `strand pr-${prNumber}`).toBe(true);
           await expect(lstat(source)).rejects.toMatchObject({ code: "ENOENT" });
@@ -1571,8 +1933,7 @@ if (args.includes("get-url")) {
 
         const conflicting = await strand(11);
         await mkdir(conflicting.source, { recursive: true });
-        const conflictingResult = await (await monitorTools())
-          ?.github_pr_monitor_prepare?.handler?.(quarantineInput(11));
+        const conflictingResult = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(quarantineInput(11)));
         expect(conflictingResult?.isError).toBe(true);
         expect(conflictingResult?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
         expect(conflictingResult?.structuredContent?.error).toBe(
@@ -1584,8 +1945,7 @@ if (args.includes("get-url")) {
         const nonDirectory = await strand(12);
         await rm(nonDirectory.destination, { recursive: true, force: true });
         await writeFile(nonDirectory.destination, "not a worktree", "utf8");
-        const nonDirectoryResult = await (await monitorTools())
-          ?.github_pr_monitor_prepare?.handler?.(quarantineInput(12));
+        const nonDirectoryResult = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(quarantineInput(12)));
         expect(nonDirectoryResult?.isError).toBe(true);
         expect(nonDirectoryResult?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
         expect(nonDirectoryResult?.structuredContent?.error).toBe(
@@ -1595,8 +1955,7 @@ if (args.includes("get-url")) {
 
         const absent = await strand(13);
         await rm(absent.destination, { recursive: true, force: true });
-        const absentResult = await (await monitorTools())
-          ?.github_pr_monitor_prepare?.handler?.(quarantineInput(13));
+        const absentResult = await (await monitorTools())?.github_pr_monitor_prepare?.handler?.(authorizedMonitorInput(quarantineInput(13)));
         expect(absentResult?.isError).toBe(true);
         expect(absentResult?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
         expect(absentResult?.structuredContent?.error).toBe(
@@ -1614,44 +1973,124 @@ if (args.includes("get-url")) {
     it("binds verification to the exact fresh Action response and tested HEAD/tree, consumes it, then recovers a stranded push without pushing twice", async () => {
       const workspaceRoot = await realpath(await mkdtemp(path.join(tmpdir(), "chatgpt2codex-verification-receipt-")));
       const repositoryRoot = path.join(workspaceRoot, "gajae-code");
-      const remoteHeadSha = "0123456789abcdef0123456789abcdef01234567";
-      const testedHeadSha = "1111111111111111111111111111111111111111";
-      const testedTreeSha = "2222222222222222222222222222222222222222";
-      const changedHeadSha = "3333333333333333333333333333333333333333";
-      const changedTreeSha = "4444444444444444444444444444444444444444";
-      const projectId = `pr-7-${remoteHeadSha}`;
-      const monitorRoot = path.join(
-        workspaceRoot,
-        "gajae-code-pr-monitor-pr-worktrees",
-        "Yeachan-Heo--gajae-code",
-        projectId,
-      );
+      const preparedRoot = path.join(workspaceRoot, "prepared");
+      const stateDir = path.join(workspaceRoot, "state");
       const binDir = path.join(workspaceRoot, "fake-bin");
-      const headState = path.join(workspaceRoot, "head-state");
-      const treeState = path.join(workspaceRoot, "tree-state");
       const remoteHeadState = path.join(workspaceRoot, "remote-head-state");
       const pushLog = path.join(workspaceRoot, "push-invocations.jsonl");
+      const stagingRefState = path.join(workspaceRoot, "staging-ref-state");
       const originalPath = process.env.PATH;
       const originalDateNow = Date.now;
       const originalComplete = ActionReceiptAuthority.prototype.completeMutationOutcome;
 
       try {
         await mkdir(repositoryRoot, { recursive: true });
-        await mkdir(monitorRoot, { recursive: true });
+        await fixtureGit(repositoryRoot, ["init", "--quiet"]);
+        await fixtureGit(repositoryRoot, ["remote", "add", "origin", "git@github.com:Yeachan-Heo/gajae-code.git"]);
+        await fixtureGit(repositoryRoot, ["remote", "add", "upstream", "https://github.com/Yeachan-Heo/gajae-code.git"]);
+        await mkdir(path.join(preparedRoot, "packages", "fixture"), { recursive: true });
         await mkdir(binDir, { recursive: true });
-        await writeFile(headState, testedHeadSha, "utf8");
-        await writeFile(treeState, testedTreeSha, "utf8");
-        await writeFile(remoteHeadState, remoteHeadSha, "utf8");
+        await fixtureGit(preparedRoot, ["init", "--quiet"]);
+        await writeFile(path.join(preparedRoot, "packages", "fixture", "value.ts"), "old\n", "utf8");
         await writeFile(
-          path.join(monitorRoot, "package.json"),
+          path.join(preparedRoot, "package.json"),
           JSON.stringify({ scripts: { test: "node -e \"process.exit(0)\"", inspect: "node -e \"process.exit(0)\"" } }),
           "utf8",
         );
+        await fixtureGit(preparedRoot, ["add", "-A"]);
+        await fixtureGit(preparedRoot, ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "base"]);
+        await fixtureGit(preparedRoot, ["remote", "add", "origin", "git@github.com:Yeachan-Heo/gajae-code.git"]);
+        await fixtureGit(preparedRoot, ["remote", "add", "upstream", "https://github.com/Yeachan-Heo/gajae-code.git"]);
+        const remoteHeadSha = await fixtureGit(preparedRoot, ["rev-parse", "HEAD"]);
+        const baseTreeSha = await fixtureGit(preparedRoot, ["rev-parse", "HEAD^{tree}"]);
+        const projectId = `pr-7-${remoteHeadSha}`;
+        const monitorRoot = path.join(
+          workspaceRoot,
+          "gajae-code-pr-monitor-pr-worktrees",
+          "Yeachan-Heo--gajae-code",
+          projectId,
+        );
+        await mkdir(path.dirname(monitorRoot), { recursive: true });
+        await rename(preparedRoot, monitorRoot);
+
+        const taskDigest = "c".repeat(64);
+        const logicalIdentity = "d".repeat(64);
+        const changedPaths = ["packages/fixture/value.ts"];
+        const suggestions = [{
+          threadId: "thread-7",
+          commentId: "comment-7",
+          reviewer: "reviewer-7",
+          path: changedPaths[0],
+          startLine: 1,
+          line: 1,
+          expectedOriginal: "old",
+          replacement: "new",
+          sourceDigest: createHash("sha256").update("old").digest("hex"),
+        }];
+        await writeFile(path.join(monitorRoot, changedPaths[0]), "new\n", "utf8");
+        await fixtureGit(monitorRoot, ["add", "--", changedPaths[0]]);
+        const testedTreeSha = await fixtureGit(monitorRoot, ["write-tree"]);
+        const commitSeed = createHash("sha256").update(`${logicalIdentity}:${taskDigest}`, "utf8").digest();
+        const commitDate = `@${946_684_800 + (commitSeed.readUInt32BE(0) % 946_080_000)} +0000`;
+        const message = `Apply authorized PR suggestions\n\nGJC-Logical-Identity: ${logicalIdentity}\nGJC-Plan-Digest: ${taskDigest}`;
+        const testedHeadSha = await fixtureGit(monitorRoot, ["commit-tree", testedTreeSha, "-p", remoteHeadSha, "-m", message], {
+          GIT_AUTHOR_NAME: "gajae-code[bot]",
+          GIT_AUTHOR_EMAIL: "gajae-code[bot]@users.noreply.github.com",
+          GIT_AUTHOR_DATE: commitDate,
+          GIT_COMMITTER_NAME: "gajae-code[bot]",
+          GIT_COMMITTER_EMAIL: "gajae-code[bot]@users.noreply.github.com",
+          GIT_COMMITTER_DATE: commitDate,
+        });
+        const changedHeadSha = await fixtureGit(monitorRoot, ["commit-tree", baseTreeSha, "-p", remoteHeadSha, "-m", "drift"], {
+          GIT_AUTHOR_NAME: "test",
+          GIT_AUTHOR_EMAIL: "test@example.invalid",
+          GIT_AUTHOR_DATE: "@1000000001 +0000",
+          GIT_COMMITTER_NAME: "test",
+          GIT_COMMITTER_EMAIL: "test@example.invalid",
+          GIT_COMMITTER_DATE: "@1000000001 +0000",
+        });
+        const changedTreeSha = "4".repeat(40);
+        await fixtureGit(monitorRoot, ["update-ref", "refs/heads/artifact", testedHeadSha]);
+        const artifactDir = path.join(stateDir, "monitor-artifacts", "a".repeat(64));
+        await mkdir(artifactDir, { recursive: true });
+        const bundlePath = path.join(artifactDir, "result.bundle");
+        await fixtureGit(monitorRoot, ["bundle", "create", bundlePath, "refs/heads/artifact", `^${remoteHeadSha}`]);
+        const bundleSha256 = createHash("sha256").update(await readFile(bundlePath)).digest("hex");
+        await writeFile(path.join(artifactDir, "manifest.json"), `${JSON.stringify({
+          version: 1,
+          headSha: testedHeadSha,
+          treeSha: testedTreeSha,
+          baseHeadSha: remoteHeadSha,
+          changedPaths,
+          taskDigest,
+          logicalIdentity,
+          bundleSha256,
+        })}\n`, "utf8");
+        await fixtureGit(monitorRoot, ["reset", "--hard", remoteHeadSha]);
+        await writeFile(remoteHeadState, remoteHeadSha, "utf8");
+
         await writeFile(
           path.join(binDir, "gh"),
           `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
+const graphqlArg = args.find((arg) => arg.startsWith("query="));
+if (args.includes("graphql")) {
+  const query = graphqlArg ?? args.join(" ");
+  if (query.includes("updateRefs")) {
+    const target = query.match(/afterOid:"([0-9a-f]{40})"/);
+    if (!target) process.exit(2);
+    fs.writeFileSync(${JSON.stringify(remoteHeadState)}, target[1]);
+    fs.rmSync(${JSON.stringify(stagingRefState)}, { force: true });
+    console.log(JSON.stringify({ data: { updateRefs: { clientMutationId: null } } }));
+  } else if (query.includes("reviewThreads")) {
+    console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      nodes: [], pageInfo: { hasNextPage: false, endCursor: null }
+    } } } } }));
+  } else {
+    console.log(JSON.stringify({ data: { repository: { id: "repo-node-id" } } }));
+  }
+} else
 if (args[0] === "api" && args[1] === "user") {
   console.log(JSON.stringify({ login: "twoimo" }));
 } else if (args[0] === "pr" && args[1] === "view") {
@@ -1660,8 +2099,17 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/7",
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/strict-actions",
-    headRefOid: fs.readFileSync(${JSON.stringify(remoteHeadState)}, "utf8").trim()
+    headRefOid: fs.readFileSync(${JSON.stringify(remoteHeadState)}, "utf8").trim(),
+    reviewRequests: [],
+    reviews: [],
+    comments: [],
+    latestReviews: [],
+    statusCheckRollup: [],
   }));
 } else {
   console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
@@ -1671,41 +2119,49 @@ if (args[0] === "api" && args[1] === "user") {
 `,
           { mode: 0o755 },
         );
+        const realGit = (await execFileAsync("/usr/bin/which", ["git"])).stdout.trim();
         await writeFile(
           path.join(binDir, "git"),
           `#!/usr/bin/env node
 const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
-const cwd = args[args.indexOf("-C") + 1];
-if (args.includes("get-url")) {
-  console.log(args.at(-1) === "origin"
-    ? "git@github.com:twoimo/gajae-code.git"
-    : "https://github.com/Yeachan-Heo/gajae-code.git");
-} else if (args.includes("--show-toplevel")) {
-  console.log(cwd);
-} else if (args.at(-1) === "HEAD^{tree}") {
-  console.log(fs.readFileSync(${JSON.stringify(treeState)}, "utf8").trim());
-} else if (args.at(-1) === "HEAD") {
-  console.log(fs.readFileSync(${JSON.stringify(headState)}, "utf8").trim());
-} else if (args.includes("push")) {
-  fs.appendFileSync(${JSON.stringify(pushLog)}, JSON.stringify(args) + "\\n");
-  fs.writeFileSync(${JSON.stringify(remoteHeadState)}, fs.readFileSync(${JSON.stringify(headState)}, "utf8"));
+if (args.includes("ls-remote") && args.includes("git@github.com:Yeachan-Heo/gajae-code.git")) {
+  const ref = String(args.at(-1));
+  if (ref.includes("gajae-code-monitor/")) {
+    if (fs.existsSync(${JSON.stringify(stagingRefState)})) {
+      console.log(String(fs.readFileSync(${JSON.stringify(stagingRefState)}, "utf8")).trim() + "\\t" + ref);
+    }
+  } else {
+    console.log(String(fs.readFileSync(${JSON.stringify(remoteHeadState)}, "utf8")).trim() + "\\t" + ref);
+  }
+  process.exit(0);
 }
+if (args.includes("push") && args.includes("git@github.com:Yeachan-Heo/gajae-code.git")) {
+  fs.appendFileSync(${JSON.stringify(pushLog)}, JSON.stringify(args) + "\\n");
+  const refspec = String(args.at(-1));
+  const [head, ref] = refspec.split(":");
+  if (ref.includes("gajae-code-monitor/")) {
+    fs.writeFileSync(${JSON.stringify(stagingRefState)}, head);
+  } else {
+    fs.writeFileSync(${JSON.stringify(remoteHeadState)}, head);
+  }
+  process.exit(0);
+}
+const result = spawnSync(${JSON.stringify("__REAL_GIT__")}.replace("__REAL_GIT__", ${JSON.stringify(realGit)}), args, { stdio: "inherit", env: process.env });
+process.exit(result.status === null ? 1 : result.status);
 `,
           { mode: 0o755 },
         );
-        await writeFile(
-          path.join(binDir, "npm"),
-          MONITOR_CLAIM_FAKE,
-          { mode: 0o755 },
-        );
+        await writeFile(path.join(binDir, "npm"), MONITOR_CLAIM_FAKE, { mode: 0o755 });
         process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+
 
         const ctx = makeCtx();
         ctx.workspaceRoot = workspaceRoot;
         ctx.config.workspaceRoot = workspaceRoot;
-        ctx.stateDir = path.join(workspaceRoot, "state");
-        ctx.config.stateDir = ctx.stateDir;
+        ctx.stateDir = stateDir;
+        ctx.config.stateDir = stateDir;
         ctx.registry = [
           { projectId: "repository", name: "gajae-code", root: repositoryRoot, aliases: [] },
           { projectId, name: projectId, root: monitorRoot, aliases: [] },
@@ -1747,10 +2203,93 @@ if (args.includes("get-url")) {
           worktreePath: monitorRoot,
           headRef: "feature/strict-actions",
         };
+        let executeReceiptSequence = 0;
+        async function issueExecuteReceipt(): Promise<Record<string, unknown>> {
+          executeReceiptSequence += 1;
+          const issuedAt = Date.now();
+          const input = {
+            runId: pushInput.runId,
+            actionPlanId: pushInput.actionPlanId,
+            idempotencyKey: `execute-verification-${executeReceiptSequence}`,
+            eventId: `execute-event-${executeReceiptSequence}`,
+            repository: pushInput.repository,
+            author: pushInput.author,
+            prNumber: pushInput.prNumber,
+            expectedHeadSha: pushInput.expectedHeadSha,
+            operation: "apply_suggestions",
+            worktreePath: pushInput.worktreePath,
+            headRef: pushInput.headRef,
+            ociImageDigest: `sha256:${"a".repeat(64)}`,
+            suggestions,
+          };
+          const receiptId = createHash("sha256").update(`execute:${executeReceiptSequence}:${issuedAt}`).digest("hex");
+          const structuredContent = {
+            receiptId,
+            namespace: "ChatGPT_To_Codex",
+            tool: "github_pr_monitor_execute",
+            operation: "apply_suggestions",
+            ok: true,
+            runId: input.runId,
+            actionPlanId: input.actionPlanId,
+            idempotencyKey: input.idempotencyKey,
+            eventId: input.eventId,
+            repository: input.repository,
+            author: input.author,
+            prNumber: input.prNumber,
+            expectedHeadSha: input.expectedHeadSha,
+            oldHeadSha: input.expectedHeadSha,
+            newHeadSha: testedHeadSha,
+            worktreePath: input.worktreePath,
+            headRef: input.headRef,
+            artifactDir,
+            bundleSha256,
+            baseTreeSha,
+            taskDigest,
+            logicalIdentity,
+            changedPaths,
+            projectId,
+            commandId: "github_pr_monitor_execute",
+            riskTier: "verify",
+            args: ["bun", "test"],
+            exitCode: 0,
+            headSha: testedHeadSha,
+            treeSha: testedTreeSha,
+            remoteObject: { kind: "local_commit", worktreePath: input.worktreePath, headSha: testedHeadSha, treeSha: testedTreeSha },
+            issuedAt,
+            timestamp: new Date(issuedAt).toISOString(),
+          };
+          const response = {
+            ok: true,
+            tool: "github_pr_monitor_execute",
+            toolCall: { namespace: "ChatGPT_To_Codex", ok: true, toolName: "github_pr_monitor_execute", input },
+            text: "Applied and verified exact suggestions.",
+            imageMarkdownList: [],
+            structuredContent,
+          };
+          await new ActionReceiptAuthority(ctx.stateDir).issue({
+            receiptId,
+            kind: "verification",
+            response,
+            input,
+            issuedAt,
+            metadata: {
+              projectId,
+              commandId: "github_pr_monitor_execute",
+              riskTier: "verify",
+              args: ["bun", "test"],
+              headSha: testedHeadSha,
+              treeSha: testedTreeSha,
+              artifactDir,
+              bundleSha256,
+              baseTreeSha,
+            },
+          });
+          return response;
+        }
 
         async function issueVerificationReceipt(command: Record<string, unknown> = commandInput): Promise<Record<string, unknown>> {
           const commandResult = await tools?.command_run?.handler?.(command);
-          expect(commandResult?.isError).toBeUndefined();
+          expect(commandResult?.isError, JSON.stringify(commandResult?.structuredContent)).toBeUndefined();
           const structured = commandResult?.structuredContent as Record<string, unknown>;
           const proof = structured.chatgpt2codexToolCall as Record<string, unknown>;
           return {
@@ -1767,47 +2306,45 @@ if (args.includes("get-url")) {
         async function pushWith(receipt: Record<string, unknown>, replayAttempt?: number) {
           if (replayAttempt === undefined) mutationAttempt += 1;
           const attempt = replayAttempt ?? mutationAttempt;
-          return tools?.github_pr_monitor_mutate?.handler?.({
+          return tools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput({
             ...pushInput,
             idempotencyKey: `${pushInput.idempotencyKey}-${attempt}`,
             eventId: `${pushInput.eventId}-${attempt}`,
             verificationReceipt: receipt,
-          });
+          }));
         }
 
         const nonVerificationReceipt = await issueVerificationReceipt({ projectId, commandId: "npm:inspect" });
         expect(nonVerificationReceipt.structuredContent).toMatchObject({ riskTier: "read" });
         const nonVerificationPush = await pushWith(nonVerificationReceipt);
         expect(nonVerificationPush?.isError).toBe(true);
-        expect(nonVerificationPush?.structuredContent?.error).toContain("verify-tier");
-        const staleReceipt = await issueVerificationReceipt();
+        expect(nonVerificationPush?.structuredContent?.error).toContain("github_pr_monitor_execute verification ActionToolResponse");
+        const staleReceipt = await issueExecuteReceipt();
         const issuedAt = (staleReceipt.structuredContent as Record<string, unknown>).issuedAt as number;
         Date.now = () => issuedAt + 11 * 60 * 1000;
         const staleResult = await pushWith(staleReceipt);
         expect(staleResult?.isError).toBe(true);
-        expect(staleResult?.structuredContent?.error).toContain("fresh");
+        expect(staleResult?.structuredContent?.error).toContain("github_pr_monitor_execute verification ActionToolResponse");
         Date.now = originalDateNow;
 
-        const verificationReceipt = await issueVerificationReceipt();
+        const verificationReceipt = await issueExecuteReceipt();
         expect(verificationReceipt.structuredContent).toMatchObject({
           headSha: testedHeadSha,
           treeSha: testedTreeSha,
           riskTier: "verify",
-          args: [],
+          args: ["bun", "test"],
           issuedAt: expect.any(Number),
         });
-        for (const [label, statePath, changed, restored] of [
-          ["HEAD", headState, changedHeadSha, testedHeadSha],
-          ["tree", treeState, changedTreeSha, testedTreeSha],
-        ] as const) {
-          await writeFile(statePath, changed, "utf8");
-          const changedResult = await pushWith(verificationReceipt);
-          expect(changedResult?.isError, label).toBe(true);
-          expect(changedResult?.structuredContent?.error, label).toMatch(
-            /exact prepared monitor worktree path|HEAD or tree changed/,
-          );
-          await writeFile(statePath, restored, "utf8");
-        }
+        await fixtureGit(monitorRoot, ["update-ref", "HEAD", changedHeadSha]);
+        const changedHeadResult = await pushWith(verificationReceipt);
+        expect(changedHeadResult?.isError, "HEAD").toBe(true);
+        expect(changedHeadResult?.structuredContent?.error, "HEAD").toMatch(/HEAD|tree drift/);
+        await fixtureGit(monitorRoot, ["update-ref", "HEAD", remoteHeadSha]);
+        await writeFile(path.join(monitorRoot, changedPaths[0]), "dirty\n", "utf8");
+        const changedTreeResult = await pushWith(verificationReceipt);
+        expect(changedTreeResult?.isError, "tree").toBe(true);
+        expect(changedTreeResult?.structuredContent?.error, "tree").toMatch(/HEAD|tree drift/);
+        await fixtureGit(monitorRoot, ["checkout", "--", changedPaths[0]]);
 
         for (const [label, rewrite] of [
           ["outer.text", (receipt: Record<string, unknown>) => { receipt.text = "forged"; }],
@@ -1848,8 +2385,6 @@ if (args.includes("get-url")) {
           database.prepare("UPDATE receipts SET document = ? WHERE receipt_id = ?")
             .run(JSON.stringify(tamperedVerificationDocument), verificationReceiptId);
         });
-        await writeFile(headState, changedHeadSha, "utf8");
-        await writeFile(treeState, changedTreeSha, "utf8");
         const metadataTamperResult = await pushWith(verificationReceipt);
         expect(metadataTamperResult?.isError).toBe(true);
         expect(metadataTamperResult?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
@@ -1860,8 +2395,6 @@ if (args.includes("get-url")) {
           database.prepare("UPDATE receipts SET document = ? WHERE receipt_id = ?")
             .run(pristineVerificationDocument, verificationReceiptId);
         });
-        await writeFile(headState, testedHeadSha, "utf8");
-        await writeFile(treeState, testedTreeSha, "utf8");
 
         const pushed = await pushWith(verificationReceipt);
         expect(pushed?.isError, JSON.stringify(pushed?.structuredContent)).toBeUndefined();
@@ -1877,7 +2410,7 @@ if (args.includes("get-url")) {
         const reboundIdentity = await pushWith(verificationReceipt);
         expect(reboundIdentity?.isError, JSON.stringify(reboundIdentity?.structuredContent)).toBe(true);
         expect(reboundIdentity?.structuredContent?.code).toBe("APPROVAL_REQUIRED");
-        expect(reboundIdentity?.structuredContent?.error).toContain("verify-tier");
+        expect(reboundIdentity?.structuredContent?.error).toContain("github_pr_monitor_execute verification ActionToolResponse");
         const pushCount = async (): Promise<number> =>
           (await readFile(pushLog, "utf8").catch(() => ""))
             .split("\n")
@@ -1895,7 +2428,7 @@ if (args.includes("get-url")) {
 
         // The push landed on the fixed remote, then the durable outcome was lost.
         expect(await readFile(remoteHeadState, "utf8")).toBe(remoteHeadSha);
-        const recoveryReceipt = await issueVerificationReceipt();
+        const recoveryReceipt = await issueExecuteReceipt();
         const beforeStrandedPush = await pushCount();
         strandNextOutcome();
         const lostPush = await pushWith(recoveryReceipt);
@@ -1930,7 +2463,7 @@ if (args.includes("get-url")) {
         // A remote head equal to neither the pushed local commit nor the
         // expected pre-push head is not evidence of this intent's push.
         await writeFile(remoteHeadState, remoteHeadSha, "utf8");
-        const ambiguousReceipt = await issueVerificationReceipt();
+        const ambiguousReceipt = await issueExecuteReceipt();
         const beforeAmbiguousPush = await pushCount();
         strandNextOutcome();
         const lostAmbiguousPush = await pushWith(ambiguousReceipt);
@@ -1979,6 +2512,7 @@ const canonical = (value) => {
   return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
 };
 const digest = (value) => crypto.createHash("sha256").update(canonical(value)).digest("hex");
+const authorizationKeys = ["protocolVersion", "schemaVersion", "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey", "operationHeadSha", "effectIdentity", "effectKey", "effectKind", "targetDigest", "policyDigest", "bindingDigest"];
 let payload = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { payload += chunk; });
@@ -1993,8 +2527,28 @@ process.stdin.on("end", () => {
           sideEffectId: "effect-recovered", committedAt: "2026-07-27T12:05:00.000Z"
         }
       : { ok: true, command, ...input, committed: false }) + "\\n");
+  } else if (command === "lease-renew") {
+    const serverTime = "2026-07-27T12:00:00.000Z";
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      command,
+      protocolVersion: 1,
+      schemaVersion: 4,
+      requestDigest: digest(input),
+      result: {
+        protocolVersion: 1,
+        schemaVersion: 4,
+        leaseKey: input.leaseKey,
+        ownerId: input.ownerId,
+        runId: input.runId,
+        fence: input.fence,
+        serverTime,
+        expiresAt: "2026-07-27T12:00:30.000Z"
+      }
+    }) + "\\n");
   } else if (command === "claim-action") {
     process.stdout.write(JSON.stringify({
+      ...Object.fromEntries(authorizationKeys.flatMap((key) => input[key] === undefined ? [] : [[key, input[key]]])),
       command,
       ok: true,
       claimId: "claim-" + input.idempotencyKey,
@@ -2007,6 +2561,7 @@ process.stdin.on("end", () => {
     }) + "\\n");
   } else if (command === "record-side-effect") {
     process.stdout.write(JSON.stringify({
+      protocolVersion: 1, schemaVersion: 4,
       ok: true, command, runId: "run-claim-lifecycle", coordinationId: "bootstrap",
       actionPlanId: input.actionPlanId, idempotencyKey: input.idempotencyKey,
       claimId: input.claimId, claimPayloadDigest: input.payloadDigest,
@@ -2015,6 +2570,7 @@ process.stdin.on("end", () => {
   } else if (command === "reconcile") {
     const receipt = input.evidence[0].structuredContent;
     process.stdout.write(JSON.stringify({
+      protocolVersion: 1, schemaVersion: 4,
       ok: true, command, runId: receipt.runId, coordinationId: "bootstrap",
       actionPlanId: receipt.actionPlanId, idempotencyKey: receipt.idempotencyKey,
       requestDigest: digest(input), result: { reconciled: 1 }
@@ -2033,6 +2589,7 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(path.join(workspaceRoot, "gh-invocations.jsonl"))}, JSON.stringify(args) + "\\n");
 const commentsPath = ${JSON.stringify(path.join(workspaceRoot, "comments.json"))};
+const threadRepliesPath = commentsPath + ".threads";
 const comments = fs.existsSync(commentsPath) ? JSON.parse(fs.readFileSync(commentsPath, "utf8")) : [];
 if (args[0] === "api" && args[1] === "user") {
   console.log(JSON.stringify({ login: "twoimo" }));
@@ -2042,12 +2599,63 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/7",
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/claim-lifecycle",
-    headRefOid: ${JSON.stringify(expectedHeadSha)}
+    headRefOid: ${JSON.stringify(expectedHeadSha)},
+    reviewRequests: [],
+    reviews: [],
+    comments: [],
+    latestReviews: [],
+    statusCheckRollup: [],
+  }));
+} else if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.includes("addPullRequestReviewThreadReply"))) {
+  const threadId = args.find((arg) => arg.startsWith("threadId="))?.slice("threadId=".length);
+  const body = args.find((arg) => arg.startsWith("body="))?.slice("body=".length);
+  const replies = fs.existsSync(threadRepliesPath) ? JSON.parse(fs.readFileSync(threadRepliesPath, "utf8")) : [];
+  replies.push({ id: "reply-" + (replies.length + 42), threadId, body, url: "https://github.com/Yeachan-Heo/gajae-code/pull/7#discussion_r" + (replies.length + 42), author: { login: "twoimo", __typename: "User" } });
+  fs.writeFileSync(threadRepliesPath, JSON.stringify(replies));
+  console.log(JSON.stringify({
+    data: {
+      addPullRequestReviewThreadReply: {
+        comment: {
+          id: "reply-42",
+          body,
+          url: "https://github.com/Yeachan-Heo/gajae-code/pull/7#discussion_r42",
+          author: { login: "twoimo", __typename: "User" },
+          pullRequestReviewThread: { id: threadId },
+        },
+      },
+    },
+  }));
+} else if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.includes("node(id:$id)"))) {
+  const threadId = args.find((arg) => arg.startsWith("id="))?.slice("id=".length);
+  const replies = fs.existsSync(threadRepliesPath) ? JSON.parse(fs.readFileSync(threadRepliesPath, "utf8")) : [];
+  console.log(JSON.stringify({
+    data: {
+      node: {
+        id: threadId,
+        isResolved: false,
+        isOutdated: false,
+        comments: {
+          nodes: replies.filter((reply) => reply.threadId === threadId),
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    },
   }));
 } else if (args[0] === "api" && args[1] === "graphql") {
+  const replies = fs.existsSync(threadRepliesPath) ? JSON.parse(fs.readFileSync(threadRepliesPath, "utf8")) : [];
   console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
-    nodes: [], pageInfo: { hasNextPage: false, endCursor: null }
+    nodes: [{
+      id: "THREAD_CURRENT",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: replies.filter((reply) => reply.threadId === "THREAD_CURRENT"), pageInfo: { hasNextPage: false, endCursor: null } },
+    }],
+    pageInfo: { hasNextPage: false, endCursor: null },
   } } } } }));
 } else if (args.includes("--paginate")) {
   console.log(JSON.stringify(comments));
@@ -2056,7 +2664,8 @@ if (args[0] === "api" && args[1] === "user") {
   const created = {
     id: comments.length + 42,
     html_url: "https://github.com/Yeachan-Heo/gajae-code/pull/7#issuecomment-" + (comments.length + 42),
-    body: bodyArg?.slice(5)
+    body: bodyArg?.slice(5),
+    user: { login: "twoimo" }
   };
   comments.push(created);
   fs.writeFileSync(commentsPath, JSON.stringify(comments));
@@ -2087,7 +2696,9 @@ if (args[0] === "api" && args[1] === "user") {
           expectedHeadSha,
           operation: "post_reply",
           body: "Bounded reply",
+          threadId: "THREAD_CURRENT",
         };
+        const authorizedMutateInput = authorizedMonitorInput(mutateInput);
         const claimInput = {
           runId: mutateInput.runId,
           actionPlanId: mutateInput.actionPlanId,
@@ -2097,7 +2708,8 @@ if (args[0] === "api" && args[1] === "user") {
           headSha: expectedHeadSha,
           phase: "mutate",
           operation: mutateInput.operation,
-          operationFields: { body: mutateInput.body },
+          operationFields: { body: mutateInput.body, threadId: mutateInput.threadId },
+          ...monitorAuthorization(mutateInput, "post_reply"),
         };
         const claimPayload = JSON.stringify(claimInput);
         const payloadDigest = createHash("sha256").update(canonicalTestJson(claimInput)).digest("hex");
@@ -2149,8 +2761,8 @@ if (args[0] === "api" && args[1] === "user") {
             }>;
           }>;
         })._registeredTools;
-        const mutation = await firstTools?.github_pr_monitor_mutate?.handler?.(mutateInput);
-        expect(mutation?.isError).toBeUndefined();
+        const mutation = await firstTools?.github_pr_monitor_mutate?.handler?.(authorizedMutateInput);
+        expect(mutation?.isError, JSON.stringify(mutation?.structuredContent)).toBeUndefined();
         expect(mutation?.structuredContent).toMatchObject({
           claimId: "claim-idem-claim-lifecycle",
           claimedAt: "2026-07-27T12:00:00.000Z",
@@ -2160,8 +2772,11 @@ if (args[0] === "api" && args[1] === "user") {
         const proof = mutation?.structuredContent?.chatgpt2codexToolCall as Record<string, unknown>;
         const actionResponse = {
           ok: true,
+          protocolVersion: 1,
+          schemaVersion: 4,
+          requestDigest: createHash("sha256").update(canonicalTestJson(authorizedMutateInput)).digest("hex"),
           tool: "github_pr_monitor_mutate",
-          toolCall: { ...proof, toolName: "github_pr_monitor_mutate", input: mutateInput },
+          toolCall: { ...proof, toolName: "github_pr_monitor_mutate", input: authorizedMutateInput },
           text: mutation?.content?.[0]?.text,
           imageMarkdownList: [],
           structuredContent: mutation?.structuredContent,
@@ -2176,7 +2791,7 @@ if (args[0] === "api" && args[1] === "user") {
           repository: "Yeachan-Heo/gajae-code",
           author: "twoimo",
           response: actionResponse,
-          inputDigest: createHash("sha256").update(JSON.stringify(mutateInput)).digest("hex"),
+          inputDigest: createHash("sha256").update(JSON.stringify(authorizedMutateInput)).digest("hex"),
           phase: "issued",
           consumedAt: null,
           metadata: {
@@ -2211,7 +2826,7 @@ if (args[0] === "api" && args[1] === "user") {
             phase: "mutate",
             operation: "post_reply",
             operationFields: { body: mutateInput.body },
-            input: mutateInput,
+            input: authorizedMutateInput,
           },
         });
 
@@ -2224,6 +2839,7 @@ if (args[0] === "api" && args[1] === "user") {
           claimId: "claim-idem-claim-lifecycle",
           payloadDigest,
           payload: { receiptId },
+          ...monitorAuthorization(mutateInput, "post_reply"),
         };
         await authority.transitionExact(
           receiptId,
@@ -2265,7 +2881,7 @@ if (args[0] === "api" && args[1] === "user") {
           command: "record-side-effect",
           input: { receipt: actionResponse },
         });
-        expect(recorded?.isError).toBeUndefined();
+        expect(recorded?.isError, JSON.stringify(recorded?.structuredContent)).toBeUndefined();
 
         const recordedDocument = withActionReceiptDatabase(stateDir, (database) =>
           String(database.prepare("SELECT document FROM receipts WHERE receipt_id = ?").get(receiptId)?.document ?? ""));
@@ -2275,7 +2891,9 @@ if (args[0] === "api" && args[1] === "user") {
           args: string[];
           payload: string;
         });
-        expect(JSON.parse(ipcAfterRecord[0]?.payload ?? "{}")).toEqual({
+        const claimRecovery = ipcAfterRecord.find(({ args, payload }) =>
+          args.includes("recover") && JSON.parse(payload).stage === "claim");
+        expect(JSON.parse(claimRecovery?.payload ?? "{}")).toEqual({
           stage: "claim",
           runId: mutateInput.runId,
           coordinationId: "bootstrap",
@@ -2283,14 +2901,16 @@ if (args[0] === "api" && args[1] === "user") {
           actionPlanId: mutateInput.actionPlanId,
           idempotencyKey: mutateInput.idempotencyKey,
         });
-        expect(ipcAfterRecord[1]).toEqual({
+        const claimInvocation = ipcAfterRecord.find(({ args }) => args.includes("claim-action"));
+        expect(claimInvocation).toEqual({
           args: [
             "run", "--silent", "monitor", "--", "claim-action", "--db",
             "/Users/twoimo/Library/Application Support/GajaeCodePRMonitor/.gajae-pr-monitor.sqlite",
           ],
           payload: claimPayload,
         });
-        expect(JSON.parse(ipcAfterRecord[3]?.payload ?? "{}")).toEqual({
+        const recordInvocation = ipcAfterRecord.find(({ args }) => args.includes("record-side-effect"));
+        expect(JSON.parse(recordInvocation?.payload ?? "{}")).toEqual({
           id: receiptId,
           kind: "post_reply",
           idempotencyKey: mutateInput.idempotencyKey,
@@ -2299,6 +2919,7 @@ if (args[0] === "api" && args[1] === "user") {
           claimId: "claim-idem-claim-lifecycle",
           payloadDigest,
           payload: { receiptId },
+          ...monitorAuthorization(mutateInput, "post_reply"),
         });
 
         const recordReplay = await restartedTools?.github_pr_monitor_state?.handler?.({
@@ -2370,24 +2991,26 @@ if (args[0] === "api" && args[1] === "user") {
           args: string[];
           payload: string;
         });
-        expect(finalIpc).toHaveLength(5);
-        expect(JSON.parse(finalIpc[4]?.payload ?? "{}")).toEqual(reconcileRecovery);
+        expect(finalIpc).toHaveLength(7);
+        const reconcileInvocation = finalIpc.filter(({ args, payload }) =>
+          args.includes("recover") && JSON.parse(payload).stage === "reconcile").at(-1);
+        expect(JSON.parse(reconcileInvocation?.payload ?? "{}")).toEqual(reconcileRecovery);
 
-        const recoveredMutation = await restartedTools?.github_pr_monitor_mutate?.handler?.(mutateInput);
+        const recoveredMutation = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(mutateInput));
         expect(recoveredMutation?.isError).toBeUndefined();
         expect(recoveredMutation?.structuredContent).toEqual(mutation?.structuredContent);
 
-        const commentMutationCount = async (idempotencyKey: string): Promise<number> =>
+        const commentMutationCount = async (): Promise<number> =>
           (await readFile(ghLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[])
-            .filter((args) => args[1]?.endsWith("/comments")
-              && !args.includes("--paginate")
-              && args.some((arg) => arg.includes(idempotencyKey))).length;
-        expect(await commentMutationCount(mutateInput.idempotencyKey)).toBe(1);
+            .filter((args) => args[1] === "graphql"
+              && args.some((arg) => arg.includes("addPullRequestReviewThreadReply"))
+              && args.some((arg) => arg.includes("<!-- gjc:auto-response:v1:"))).length;
+        expect(await commentMutationCount()).toBe(1);
 
-        const mismatched = await restartedTools?.github_pr_monitor_mutate?.handler?.({
+        const mismatched = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput({
           ...mutateInput,
           eventId: "event-claim-lifecycle-mismatch",
-        });
+        }));
         expect(mismatched?.isError).toBe(true);
         expect(mismatched?.structuredContent?.error).toMatch(/different exact durable outcome|exact durable/i);
         expect(await commentMutationCount(mutateInput.idempotencyKey)).toBe(1);
@@ -2406,10 +3029,10 @@ if (args[0] === "api" && args[1] === "user") {
             throw new Error("injected failure after durable outcome before ordinary receipt");
           }
         };
-        const crashBoundaryFailure = await restartedTools?.github_pr_monitor_mutate?.handler?.(crashBoundaryInput);
+        const crashBoundaryFailure = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(crashBoundaryInput));
         ActionReceiptAuthority.prototype.completeMutationOutcome = originalComplete;
         expect(crashBoundaryFailure?.isError).toBe(true);
-        const crashBoundaryRecovered = await restartedTools?.github_pr_monitor_mutate?.handler?.(crashBoundaryInput);
+        const crashBoundaryRecovered = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(crashBoundaryInput));
         expect(crashBoundaryRecovered?.isError).toBeUndefined();
         expect(await commentMutationCount(crashBoundaryInput.idempotencyKey)).toBe(1);
         const effectBeforeOutcomeInput = {
@@ -2425,7 +3048,7 @@ if (args[0] === "api" && args[1] === "user") {
           }
           return originalComplete.apply(this, args);
         };
-        const lostResponse = await restartedTools?.github_pr_monitor_mutate?.handler?.(effectBeforeOutcomeInput);
+        const lostResponse = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(effectBeforeOutcomeInput));
         ActionReceiptAuthority.prototype.completeMutationOutcome = originalComplete;
         expect(lostResponse?.isError).toBe(true);
 
@@ -2439,8 +3062,8 @@ if (args[0] === "api" && args[1] === "user") {
             }>;
           }>;
         })._registeredTools;
-        const recoveredEffect = await effectRestartTools?.github_pr_monitor_mutate?.handler?.(effectBeforeOutcomeInput);
-        const replayedEffect = await effectRestartTools?.github_pr_monitor_mutate?.handler?.(effectBeforeOutcomeInput);
+        const recoveredEffect = await effectRestartTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(effectBeforeOutcomeInput));
+        const replayedEffect = await effectRestartTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(effectBeforeOutcomeInput));
         expect(recoveredEffect?.isError).toBeUndefined();
         expect(replayedEffect?.structuredContent).toEqual(recoveredEffect?.structuredContent);
         expect(replayedEffect?.content).toEqual(recoveredEffect?.content);
@@ -2460,10 +3083,10 @@ if (args[0] === "api" && args[1] === "user") {
           }
           return originalMaterialize.call(this, binding);
         };
-        const receiptWriteFailure = await restartedTools?.github_pr_monitor_mutate?.handler?.(receiptFailureInput);
+        const receiptWriteFailure = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(receiptFailureInput));
         ActionReceiptAuthority.prototype.materializeMutationOutcome = originalMaterialize;
         expect(receiptWriteFailure?.isError).toBe(true);
-        const receiptWriteRecovered = await restartedTools?.github_pr_monitor_mutate?.handler?.(receiptFailureInput);
+        const receiptWriteRecovered = await restartedTools?.github_pr_monitor_mutate?.handler?.(authorizedMonitorInput(receiptFailureInput));
         expect(receiptWriteRecovered?.isError).toBeUndefined();
         expect(await commentMutationCount(receiptFailureInput.idempotencyKey)).toBe(1);
 
@@ -2507,7 +3130,7 @@ if (mode === "malformed") process.stdout.write("{");
 else if (mode === "multiple") process.stdout.write("{}\\n{}\\n");
 else if (mode === "oversized") process.stdout.write("x".repeat(257 * 1024));
 else if (mode === "timeout") { process.on("SIGTERM", () => {}); setInterval(() => {}, 60_000); }
-else if (mode === "mismatch") process.stdout.write(JSON.stringify({ command: "terminal-report", proof: "ChatGPT_To_Codex", ok: true, runId: "run-bounds", actionPlanId: "foreign-plan", status: {} }) + "\\n");
+else if (mode === "mismatch") process.stdout.write(JSON.stringify({ command: "terminal-report", proof: "ChatGPT_To_Codex", ok: true, protocolVersion: 1, schemaVersion: 4, requestDigest: ${JSON.stringify(createHash("sha256").update(canonicalTestJson({ runId: "run-bounds", actionPlanId: "plan-bounds" })).digest("hex"))}, runId: "run-bounds", actionPlanId: "foreign-plan", status: {} }) + "\\n");
 `,
           { mode: 0o755 },
         );
@@ -2630,6 +3253,7 @@ else if (mode === "mismatch") process.stdout.write(JSON.stringify({ command: "te
             expectedHeadSha: lastBinding.expectedHeadSha,
             eventId: lastBinding.eventId,
             operation: lastBinding.operation,
+            ...lastBinding.authorization,
           },
         };
         await authority.completeMutationOutcome(outcomeKeys[256]!, lastBinding, {
@@ -2803,6 +3427,90 @@ else if (mode === "mismatch") process.stdout.write(JSON.stringify({ command: "te
             .run(JSON.stringify(tampered), outcomeKey);
         });
 
+        await expect(new ActionReceiptAuthority(stateDir).mutationOutcomeStatus(binding, "claimed"))
+          .rejects.toThrow(/pre-apply evidence/i);
+      } finally {
+        await rm(stateDir, { recursive: true, force: true });
+      }
+    });
+    it("denies legacy receipt state without promoting it into live SQLite tables", async () => {
+      const stateDir = await realpath(await mkdtemp(path.join(tmpdir(), "chatgpt2codex-legacy-denial-")));
+      try {
+        const body = { version: 4, updatedAt: Date.now(), receipts: [], mutationOutcomes: [] };
+        await writeFile(
+          path.join(stateDir, "action-receipts.json"),
+          JSON.stringify({ ...body, integrity: testDigest(body) }),
+          "utf8",
+        );
+        const authority = new ActionReceiptAuthority(stateDir);
+        await expect(authority.issue({
+          receiptId: createHash("sha256").update("legacy-denial").digest("hex"),
+          kind: "verification",
+          response: {},
+          input: {},
+          issuedAt: Date.now(),
+          metadata: {},
+        })).rejects.toThrow(/diagnostics-only.*promoted/i);
+        expect(withActionReceiptDatabase(stateDir, (database) => ({
+          receipts: Number(database.prepare("SELECT COUNT(*) AS count FROM receipts").get()?.count ?? 0),
+          mutationOutcomes: Number(database.prepare("SELECT COUNT(*) AS count FROM mutation_outcomes").get()?.count ?? 0),
+        }))).toEqual({ receipts: 0, mutationOutcomes: 0 });
+      } finally {
+        await rm(stateDir, { recursive: true, force: true });
+      }
+    });
+
+    it("denies completed rerequests without exact pre-apply evidence", async () => {
+      const stateDir = await realpath(await mkdtemp(path.join(tmpdir(), "chatgpt2codex-rerequest-evidence-")));
+      try {
+        const binding = durableReviewerBinding(72);
+        const authority = new ActionReceiptAuthority(stateDir);
+        const outcomeKey = await authority.beginMutationOutcome(binding, { reviewerRequestedBeforeIntent: false });
+        const pristine = withActionReceiptDatabase(stateDir, (database) =>
+          String(database.prepare("SELECT document FROM mutation_outcomes WHERE outcome_key = ?")
+            .get(outcomeKey)?.document ?? ""));
+        const tampered = JSON.parse(pristine) as Record<string, unknown>;
+        const receiptId = createHash("sha256").update("rerequest-missing-evidence").digest("hex");
+        const startedAt = Number(tampered.startedAt);
+        const response = {
+          ok: true,
+          tool: "github_pr_monitor_mutate",
+          toolCall: { toolName: "github_pr_monitor_mutate", input: binding.input },
+          text: "completed",
+          imageMarkdownList: [],
+          structuredContent: {
+            receiptId,
+            runId: binding.runId,
+            actionPlanId: binding.actionPlanId,
+            idempotencyKey: binding.idempotencyKey,
+            claimId: binding.claimId,
+            payloadDigest: binding.claimPayloadDigest,
+            repository: binding.repository,
+            author: binding.author,
+            prNumber: binding.prNumber,
+            expectedHeadSha: binding.expectedHeadSha,
+            eventId: binding.eventId,
+            operation: binding.operation,
+            ...binding.authorization,
+          },
+        };
+        const completed = {
+          ...tampered,
+          state: "completed",
+          intentEvidence: {},
+          response,
+          receiptId,
+          issuedAt: startedAt,
+          completedAt: startedAt,
+          metadata: {},
+        };
+        withActionReceiptDatabase(stateDir, (database) => {
+          database.prepare(`
+            UPDATE mutation_outcomes
+            SET state = 'completed', completed_at = ?, intent_evidence_digest = ?, document = ?
+            WHERE outcome_key = ?
+          `).run(startedAt, testDigest({}), JSON.stringify(completed), outcomeKey);
+        });
         await expect(new ActionReceiptAuthority(stateDir).mutationOutcomeStatus(binding, "claimed"))
           .rejects.toThrow(/pre-apply evidence/i);
       } finally {

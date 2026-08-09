@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Express, Request, Response } from "express";
 import { promises as fs } from "node:fs";
 import { verifyOwnerToken } from "../auth/owner-token.js";
@@ -33,6 +34,7 @@ const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
 const GITHUB_PR_MONITOR_TOOL_NAMES = new Set([
   "github_pr_monitor_read",
   "github_pr_monitor_prepare",
+  "github_pr_monitor_execute",
   "github_pr_monitor_mutate",
   "github_pr_monitor_state",
 ]);
@@ -321,14 +323,6 @@ const ACTION_ROUTES: ActionRoute[] = [
     schema: "ImportChatGptImageUrlInput",
   },
   {
-    path: "/actions/list-images",
-    tool: "list_images",
-    operationId: "list_images",
-    summary: "List saved project images",
-    description: "Lists images already saved under .chatgpt2codex/images for a project.",
-    schema: "ListImagesInput",
-  },
-  {
     path: "/actions/github-pr-monitor-read",
     tool: "github_pr_monitor_read",
     operationId: "github_pr_monitor_read",
@@ -343,6 +337,14 @@ const ACTION_ROUTES: ActionRoute[] = [
     summary: "Prepare a fixed-repository PR worktree",
     description: "Create or quarantine the bounded monitor worktree for an authored Yeachan-Heo/gajae-code PR.",
     schema: "GithubPrMonitorPrepareInput",
+  },
+  {
+    path: "/actions/github-pr-monitor-execute",
+    tool: "github_pr_monitor_execute",
+    operationId: "github_pr_monitor_execute",
+    summary: "Apply and verify exact PR suggestions",
+    description: "Apply exact externally planned suggestions in the prepared worktree, commit with trusted git plumbing, and verify the commit with bun test in pinned OCI.",
+    schema: "GithubPrMonitorExecuteInput",
   },
   {
     path: "/actions/github-pr-monitor-mutate",
@@ -377,7 +379,6 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "command_run",
   "local_shell_run",
   "e2e_start_server",
-  "e2e_open_target",
   "e2e_run_command",
   "e2e_test_and_show_screenshot",
   "e2e_screenshot",
@@ -386,24 +387,46 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "repo_diff_summary",
   "github_pr_monitor_read",
   "github_pr_monitor_prepare",
+  "github_pr_monitor_execute",
   "github_pr_monitor_mutate",
   "github_pr_monitor_state",
   "save_chatgpt_image",
   "save_chatgpt_image_from_url",
-  "list_images",
 ]);
+const GITHUB_PR_AUTHORIZATION_BASE_FIELDS = [
+  "protocolVersion", "schemaVersion", "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey",
+  "operationHeadSha", "effectIdentity", "targetDigest", "policyDigest", "bindingDigest",
+] as const;
+const GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS = ["effectKey", "effectKind"] as const;
+const GITHUB_PR_AUTHORIZATION_FIELDS = [...GITHUB_PR_AUTHORIZATION_BASE_FIELDS, ...GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS] as const;
+const GITHUB_PR_AUTHORIZATION_REQUIRED = new Set<string>(GITHUB_PR_AUTHORIZATION_BASE_FIELDS);
+const GITHUB_PR_MUTATION_COMMON_FIELDS = [
+  "runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation",
+  ...GITHUB_PR_AUTHORIZATION_FIELDS,
+] as const;
+const GITHUB_PR_MUTATE_OPERATION_FIELDS: Record<string, { allowed: readonly string[]; required: readonly string[] }> = {
+  post_reply: { allowed: ["body", "threadId", "triggerId"], required: ["body", "threadId"] },
+  resolve_thread: { allowed: ["threadId", "triggerId", "replyReceiptId"], required: ["threadId", "triggerId", "replyReceiptId"] },
+  rerequest_reviewer: { allowed: ["reviewer"], required: ["reviewer"] },
+  push_prepared_worktree: { allowed: ["worktreePath", "headRef", "verificationReceipt"], required: ["worktreePath", "headRef", "verificationReceipt"] },
+};
+
 const GITHUB_PR_ACTION_FIELDS: Record<string, { allowed: ReadonlySet<string>; required: ReadonlySet<string> }> = {
   github_pr_monitor_read: {
     allowed: new Set(["runId", "actionPlanId", "repository", "author", "prNumber"]),
     required: new Set(["runId", "actionPlanId", "repository", "author"]),
   },
   github_pr_monitor_prepare: {
-    allowed: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", "headRef"]),
-    required: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"]),
+    allowed: new Set([...GITHUB_PR_MUTATION_COMMON_FIELDS, "headRef"]),
+    required: new Set([...GITHUB_PR_MUTATION_COMMON_FIELDS.filter((field) => !GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS.includes(field as "effectKey" | "effectKind"))]),
+  },
+  github_pr_monitor_execute: {
+    allowed: new Set([...GITHUB_PR_MUTATION_COMMON_FIELDS, "worktreePath", "headRef", "ociImageDigest", "suggestions"]),
+    required: new Set([...GITHUB_PR_MUTATION_COMMON_FIELDS, "worktreePath", "headRef", "ociImageDigest", "suggestions"]),
   },
   github_pr_monitor_mutate: {
-    allowed: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", "body", "threadId", "reviewer", "worktreePath", "headRef", "verificationReceipt"]),
-    required: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"]),
+    allowed: new Set([...GITHUB_PR_MUTATION_COMMON_FIELDS, "body", "threadId", "triggerId", "replyReceiptId", "reviewer", "worktreePath", "headRef", "verificationReceipt"]),
+    required: new Set(GITHUB_PR_MUTATION_COMMON_FIELDS),
   },
   github_pr_monitor_state: {
     allowed: new Set(["runId", "actionPlanId", "idempotencyKey", "eventId", "command", "input"]),
@@ -421,6 +444,47 @@ function openApiActionRoutes(mode: ActionsMode): ActionRoute[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function actionCanonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "boolean": return value ? "true" : "false";
+    case "number":
+      if (!Number.isFinite(value)) throw new Error("Action input contains a non-finite number");
+      return JSON.stringify(value);
+    case "string": return JSON.stringify(value);
+    case "object":
+      if (Array.isArray(value)) return `[${value.map(actionCanonicalJson).join(",")}]`;
+      return `{${Object.keys(value as Record<string, unknown>).sort().map((key) =>
+        `${JSON.stringify(key)}:${actionCanonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+    default: throw new Error(`Action input contains unsupported ${typeof value}`);
+  }
+}
+
+function actionRequestDigest(input: unknown): string {
+  return createHash("sha256").update(actionCanonicalJson(input), "utf8").digest("hex");
+}
+function actionProofExact(value: unknown, tool: string, ok: boolean): boolean {
+  if (!isRecord(value)) return false;
+  const expected = toolCallProof(tool, ok);
+  const actualKeys = Object.keys(value).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return actualKeys.length === expectedKeys.length
+    && actualKeys.every((key, index) => key === expectedKeys[index])
+    && Object.entries(expected).every(([key, expectedValue]) => value[key] === expectedValue);
+}
+function actionToolCallExact(value: unknown, tool: string, ok: boolean, input: Record<string, unknown>): boolean {
+  if (!isRecord(value)) return false;
+  const expectedProof = toolCallProof(tool, ok);
+  const expectedKeys = [...Object.keys(expectedProof), "toolName", "input"].sort();
+  const actualKeys = Object.keys(value).sort();
+  return actualKeys.length === expectedKeys.length
+    && actualKeys.every((key, index) => key === expectedKeys[index])
+    && Object.entries(expectedProof).every(([key, expectedValue]) => value[key] === expectedValue)
+    && value.toolName === tool
+    && (() => {
+      try { return actionCanonicalJson(value.input) === actionCanonicalJson(input); } catch { return false; }
+    })();
 }
 
 function actionInput(body: unknown): Record<string, unknown> {
@@ -482,6 +546,27 @@ function strictGithubPrActionInput(
 
   const missing = [...fields.required].filter((key) => body[key] === undefined);
   if (missing.length > 0) return { error: invalidActionInput(route.tool, `missing required field(s): ${missing.join(", ")}`) };
+  if (route.tool === "github_pr_monitor_mutate") {
+    const operation = typeof body.operation === "string" ? body.operation : "";
+    const operationFields = GITHUB_PR_MUTATE_OPERATION_FIELDS[operation];
+    if (!operationFields) return { error: invalidActionInput(route.tool, "operation is not a supported fixed mutation") };
+    const operationExtra = Object.keys(body).filter((key) =>
+      !GITHUB_PR_MUTATION_COMMON_FIELDS.includes(key as (typeof GITHUB_PR_MUTATION_COMMON_FIELDS)[number])
+      && !operationFields.allowed.includes(key),
+    );
+    if (operationExtra.length > 0) {
+      return { error: invalidActionInput(route.tool, `unexpected field(s) for ${operation}: ${operationExtra.join(", ")}`) };
+    }
+  }
+  if (route.tool !== "github_pr_monitor_read" && route.tool !== "github_pr_monitor_state") {
+    if (body.protocolVersion !== 1 || body.schemaVersion !== 4) {
+      return { error: invalidActionInput(route.tool, "protocolVersion=1 and schemaVersion=4 are required") };
+    }
+    const effectFields = GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS.filter((field) => body[field] !== undefined);
+    if (effectFields.length !== 0 && effectFields.length !== GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS.length) {
+      return { error: invalidActionInput(route.tool, "effectKey and effectKind must be provided together") };
+    }
+  }
 
   const input = { ...body };
   if (route.tool === "github_pr_monitor_state" && input.input !== undefined) {
@@ -500,9 +585,117 @@ function strictGithubPrActionInput(
     } catch {
       return { error: invalidActionInput(route.tool, "input must encode valid JSON") };
     }
+    const evidenceError = validateMonitorEvidenceEnvelope(
+      String(input.command),
+      input.input as Record<string, unknown>,
+    );
+    if (evidenceError) return { error: invalidActionInput(route.tool, evidenceError) };
   }
 
   return { input };
+}
+
+function validateMonitorEvidenceEnvelope(command: string, input: Record<string, unknown>): string | undefined {
+  const evidence = input.receipt;
+  if (evidence === undefined) return undefined;
+  if (!isRecord(evidence) || evidence.ok !== true || typeof evidence.tool !== "string") {
+    return `${command} receipt must be a successful typed ActionToolResponse`;
+  }
+  const evidenceKeys = ["ok", "protocolVersion", "schemaVersion", "requestDigest", "tool", "toolCall", "text", "imageMarkdownList", "structuredContent"];
+  if (Object.keys(evidence).some((key) => !evidenceKeys.includes(key))) {
+    return `${command} receipt is not the exact v4 ActionToolResponse shape`;
+  }
+  const call = isRecord(evidence.toolCall) ? evidence.toolCall : undefined;
+  const callInput = call && isRecord(call.input) ? call.input : undefined;
+  const requestDigest = evidence.requestDigest;
+  if (
+    evidence.protocolVersion !== 1
+    || evidence.schemaVersion !== 4
+    || typeof requestDigest !== "string"
+    || !/^[0-9a-f]{64}$/u.test(requestDigest)
+    || !call
+    || !callInput
+    || !actionToolCallExact(call, evidence.tool, true, callInput)
+    || requestDigest !== actionRequestDigest(callInput)
+    || evidence.tool !== call.toolName
+    || call.namespace !== "ChatGPT_To_Codex"
+    || call.tool !== evidence.tool
+    || call.ok !== true
+    || typeof evidence.text !== "string"
+    || !Array.isArray(evidence.imageMarkdownList)
+    || evidence.imageMarkdownList.length !== 0
+  ) {
+    return `${command} receipt must carry the exact v4 ActionToolResponse input binding`;
+  }
+  const structured = evidence.structuredContent;
+  if (!isRecord(structured)
+    || structured.protocolVersion !== 1
+    || structured.schemaVersion !== 4
+    || structured.requestDigest !== requestDigest
+    || structured.ok !== true
+    || !actionProofExact(structured.chatgpt2codexToolCall, evidence.tool, true)
+    || typeof structured.receiptId !== "string"
+    || !/^[0-9a-f]{64}$/u.test(structured.receiptId)) {
+    return `${command} receipt must carry protocolVersion=1, schemaVersion=4, and a bounded receiptId`;
+  }
+  let encodedStructured: string;
+  try {
+    encodedStructured = JSON.stringify(structured);
+  } catch {
+    return `${command} receipt is not JSON-serializable`;
+  }
+  if (Buffer.byteLength(encodedStructured, "utf8") > 256 * 1024) {
+    return `${command} receipt exceeds its bounded 256KiB envelope`;
+  }
+  if (evidence.tool === "github_pr_monitor_read") {
+    const requiredReadKeys = [
+      "chatgpt2codexToolCall", "protocolVersion", "schemaVersion", "requestDigest", "namespace", "tool", "operation", "ok",
+      "runId", "actionPlanId", "repository", "author", "prs", "observedAt", "receiptId",
+    ];
+    if (Object.keys(structured).some((key) => !requiredReadKeys.includes(key))
+      || structured.namespace !== "ChatGPT_To_Codex"
+      || structured.tool !== "github_pr_monitor_read"
+      || structured.operation !== "read"
+      || structured.repository !== "Yeachan-Heo/gajae-code"
+      || structured.author !== "twoimo"
+      || !Array.isArray(structured.prs)
+      || structured.prs.length > 500) {
+      return `${command} read receipt is not the exact fixed-repository envelope`;
+    }
+    for (const snapshotValue of structured.prs) {
+      if (!isRecord(snapshotValue)) return `${command} read receipt contains an invalid PR snapshot`;
+      const snapshotKeys = [
+        "number", "url", "state", "author", "baseRepository", "headRepository", "baseRefName", "baseRefOid",
+        "headRefName", "headRefOid", "reviewRequests", "reviews", "comments", "latestReviews", "statusCheckRollup", "reviewThreads",
+      ];
+      if (Object.keys(snapshotValue).some((key) => !snapshotKeys.includes(key))
+        || Object.hasOwn(snapshotValue, "protocolVersion")
+        || Object.hasOwn(snapshotValue, "schemaVersion")) {
+        return `${command} read receipt contains an unapproved PR snapshot shape`;
+      }
+      const threads = snapshotValue.reviewThreads;
+      if (!isRecord(threads) || Object.keys(threads).some((key) => key !== "nodes") || !Array.isArray(threads.nodes)) {
+        return `${command} read receipt contains an invalid compact thread boundary`;
+      }
+      for (const threadValue of threads.nodes) {
+        if (!isRecord(threadValue)) return `${command} read receipt contains an invalid compact thread`;
+        if (Object.keys(threadValue).some((key) => !["id", "isResolved", "isOutdated", "comments"].includes(key))) {
+          return `${command} read receipt contains an invalid compact thread shape`;
+        }
+        const comments = threadValue.comments;
+        if (!isRecord(comments) || Object.keys(comments).some((key) => key !== "nodes") || !Array.isArray(comments.nodes)) {
+          return `${command} read receipt contains an invalid compact comment boundary`;
+        }
+      }
+    }
+    return undefined;
+  }
+  if (evidence.tool !== "github_pr_monitor_prepare"
+    && evidence.tool !== "github_pr_monitor_execute"
+    && evidence.tool !== "github_pr_monitor_mutate") {
+    return `${command} receipt has an unsupported monitor tool`;
+  }
+  return undefined;
 }
 
 function bearerToken(req: Request): string | undefined {
@@ -641,19 +834,45 @@ async function attachInlineScreenshotShares(
   return { value: await visit(value), markdown };
 }
 
-async function actionResponse(ctx: ToolContext, publicOrigin: string, tool: string, result: CallToolResultLike): Promise<Record<string, unknown>> {
+async function actionResponse(
+  ctx: ToolContext,
+  publicOrigin: string,
+  tool: string,
+  toolCallInput: Record<string, unknown>,
+  result: CallToolResultLike,
+): Promise<Record<string, unknown>> {
   const enriched = await attachInlineScreenshotShares(ctx, publicOrigin, result.structuredContent ?? {});
   const text = resultText(result);
   const inlineText = enriched.markdown.length > 0 ? `${text}\n\n${enriched.markdown.join("\n")}` : text;
   const ok = result.isError !== true;
+  const requestDigest = actionRequestDigest(toolCallInput);
+  const monitor = GITHUB_PR_MONITOR_TOOL_NAMES.has(tool);
+  const structuredContent = monitor
+    ? {
+        ...(isRecord(enriched.value) ? enriched.value : {}),
+        protocolVersion: 1,
+        schemaVersion: 4,
+        requestDigest,
+        chatgpt2codexToolCall: toolCallProof(tool, ok),
+      }
+    : enriched.value;
   return {
     ok,
+    protocolVersion: 1,
+    schemaVersion: 4,
+    requestDigest,
     tool,
-    toolCall: toolCallProof(tool, ok),
+    toolCall: {
+      ...toolCallProof(tool, ok),
+      toolName: tool,
+      input: structuredClone(toolCallInput),
+    },
     text: inlineText,
-    imageMarkdown: enriched.markdown[0],
-    imageMarkdownList: enriched.markdown,
-    structuredContent: enriched.value,
+    ...(monitor ? { imageMarkdownList: enriched.markdown } : {
+      imageMarkdown: enriched.markdown[0],
+      imageMarkdownList: enriched.markdown,
+    }),
+    structuredContent,
     ...(result.isError ? { isError: true } : {}),
   };
 }
@@ -744,8 +963,8 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
       version: "0.1.6",
       description:
         mode === "github-pr-monitor"
-          ? "Monitor-only OpenAPI bridge for the deployed Custom GPT. It exposes only health plus the four dedicated github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_mutate, and github_pr_monitor_state operations. The monitor identity is fixed to repository Yeachan-Heo/gajae-code and author twoimo."
-          : "OpenAPI bridge for Custom GPTs. This compact schema stays within 30 operations and exposes workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing. Dedicated strict PR monitor actions github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_mutate, and github_pr_monitor_state dispatch through their registered MCP tools; they are fixed to Yeachan-Heo/gajae-code and authenticated author twoimo, and return toolCall.namespace=ChatGPT_To_Codex proof. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
+          ? "Monitor-only OpenAPI bridge for the deployed Custom GPT. It exposes only health plus the five dedicated github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_execute, github_pr_monitor_mutate, and github_pr_monitor_state operations. The monitor identity is fixed to repository Yeachan-Heo/gajae-code and author twoimo."
+          : "OpenAPI bridge for Custom GPTs. This compact schema stays within 30 operations and exposes workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing. Dedicated strict PR monitor actions github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_execute, github_pr_monitor_mutate, and github_pr_monitor_state dispatch through their registered MCP tools; they are fixed to Yeachan-Heo/gajae-code and authenticated author twoimo, and return toolCall.namespace=ChatGPT_To_Codex proof. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes(mode).map((route) => route.tool),
@@ -1103,6 +1322,27 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
           required: ["projectId"],
           properties: { projectId: { type: "string" } },
         },
+        MonitorAuthorizationBindingV1: {
+          type: "object",
+          additionalProperties: false,
+          required: [...GITHUB_PR_AUTHORIZATION_BASE_FIELDS],
+          properties: {
+            protocolVersion: { type: "integer", const: 1 },
+            schemaVersion: { type: "integer", const: 4 },
+            ownerId: { type: "string", minLength: 1, maxLength: 300 },
+            leaseKey: { type: "string", minLength: 1, maxLength: 300 },
+            fence: { type: "integer", minimum: 1 },
+            logicalIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            operationKey: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            operationHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$" },
+            effectIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            effectKey: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            effectKind: { type: "string", enum: ["prepare_create", "prepare_quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "commit", "normal_push"] },
+            targetDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            policyDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            bindingDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+          },
+        },
         GithubPrMonitorReadInput: {
           type: "object",
           additionalProperties: false,
@@ -1118,7 +1358,7 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
         GithubPrMonitorPrepareInput: {
           type: "object",
           additionalProperties: false,
-          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"],
+          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", ...GITHUB_PR_AUTHORIZATION_BASE_FIELDS],
           properties: {
             runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
             actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
@@ -1130,12 +1370,62 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
             expectedHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$", minLength: 40, maxLength: 40 },
             operation: { type: "string", enum: ["create", "quarantine"] },
             headRef: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$", maxLength: 241 },
+            protocolVersion: { type: "integer", const: 1 }, schemaVersion: { type: "integer", const: 4 },
+            ownerId: { type: "string", minLength: 1, maxLength: 300 }, leaseKey: { type: "string", minLength: 1, maxLength: 300 }, fence: { type: "integer", minimum: 1 },
+            logicalIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" }, operationKey: { type: "string", pattern: "^[0-9a-f]{64}$" }, operationHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$" },
+            effectIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" }, effectKey: { type: "string", pattern: "^[0-9a-f]{64}$" }, effectKind: { type: "string", enum: ["prepare_create", "prepare_quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "commit", "normal_push"] },
+            targetDigest: { type: "string", pattern: "^[0-9a-f]{64}$" }, policyDigest: { type: "string", pattern: "^[0-9a-f]{64}$" }, bindingDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+          },
+        },
+        GithubPrMonitorExecuteInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", "worktreePath", "headRef", "ociImageDigest", "suggestions", ...GITHUB_PR_AUTHORIZATION_BASE_FIELDS, ...GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS],
+          properties: {
+            runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            idempotencyKey: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            eventId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            repository: { type: "string", const: "Yeachan-Heo/gajae-code" },
+            author: { type: "string", const: "twoimo" },
+            prNumber: { type: "integer", minimum: 1 },
+            expectedHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$", minLength: 40, maxLength: 40 },
+            operation: { type: "string", const: "apply_suggestions" },
+            worktreePath: { type: "string", minLength: 1 },
+            headRef: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$", maxLength: 241 },
+            ociImageDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+            suggestions: {
+              type: "array",
+              minItems: 1,
+              maxItems: 10,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["threadId", "commentId", "reviewer", "path", "startLine", "line", "expectedOriginal", "replacement", "sourceDigest"],
+                properties: {
+                  threadId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+                  commentId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+                  reviewer: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_.\\[\\]-]{0,79}$", maxLength: 80 },
+                  path: { type: "string", minLength: 1 },
+                  startLine: { type: "integer", minimum: 1 },
+                  line: { type: "integer", minimum: 1 },
+                  expectedOriginal: { type: "string", minLength: 1, maxLength: 65536, pattern: "^[^\\u0000]*$" },
+                  replacement: { type: "string", maxLength: 65536, pattern: "^[^\\u0000]*$" },
+                  sourceDigest: { type: "string", pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 },
+                },
+              },
+            },
+            protocolVersion: { type: "integer", const: 1 }, schemaVersion: { type: "integer", const: 4 },
+            ownerId: { type: "string", minLength: 1, maxLength: 300 }, leaseKey: { type: "string", minLength: 1, maxLength: 300 }, fence: { type: "integer", minimum: 1 },
+            logicalIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" }, operationKey: { type: "string", pattern: "^[0-9a-f]{64}$" }, operationHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$" },
+            effectIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" }, effectKey: { type: "string", pattern: "^[0-9a-f]{64}$" }, effectKind: { type: "string", enum: ["prepare_create", "prepare_quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "commit", "normal_push"] },
+            targetDigest: { type: "string", pattern: "^[0-9a-f]{64}$" }, policyDigest: { type: "string", pattern: "^[0-9a-f]{64}$" }, bindingDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
           },
         },
         GithubPrMonitorMutateInput: {
           type: "object",
           additionalProperties: false,
-          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation"],
+          required: ["runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha", "operation", ...GITHUB_PR_AUTHORIZATION_BASE_FIELDS, ...GITHUB_PR_AUTHORIZATION_EFFECT_FIELDS],
           properties: {
             runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
             actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
@@ -1148,10 +1438,17 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
             operation: { type: "string", enum: ["post_reply", "resolve_thread", "rerequest_reviewer", "push_prepared_worktree"] },
             body: { type: "string", minLength: 1, maxLength: 6000 },
             threadId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            triggerId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
+            replyReceiptId: { type: "string", pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 },
             reviewer: { type: "string", pattern: "^[A-Za-z0-9-]{1,39}$", maxLength: 39 },
             worktreePath: { type: "string" },
             headRef: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,240}$", maxLength: 241 },
             verificationReceipt: { "$ref": "#/components/schemas/ActionToolResponse" },
+            protocolVersion: { type: "integer", const: 1 }, schemaVersion: { type: "integer", const: 4 },
+            ownerId: { type: "string", minLength: 1, maxLength: 300 }, leaseKey: { type: "string", minLength: 1, maxLength: 300 }, fence: { type: "integer", minimum: 1 },
+            logicalIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" }, operationKey: { type: "string", pattern: "^[0-9a-f]{64}$" }, operationHeadSha: { type: "string", pattern: "^[0-9a-fA-F]{40}$" },
+            effectIdentity: { type: "string", pattern: "^[0-9a-f]{64}$" }, effectKey: { type: "string", pattern: "^[0-9a-f]{64}$" }, effectKind: { type: "string", enum: ["prepare_create", "prepare_quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "commit", "normal_push"] },
+            targetDigest: { type: "string", pattern: "^[0-9a-f]{64}$" }, policyDigest: { type: "string", pattern: "^[0-9a-f]{64}$" }, bindingDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
           },
         },
         GithubPrMonitorStateInput: {
@@ -1173,9 +1470,12 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
         },
         ActionToolResponse: {
           type: "object",
-          required: ["ok", "tool", "toolCall", "text", "structuredContent"],
+          required: ["ok", "protocolVersion", "schemaVersion", "requestDigest", "tool", "toolCall", "text", "imageMarkdownList", "structuredContent"],
           properties: {
             ok: { type: "boolean" },
+            protocolVersion: { type: "integer", const: 1 },
+            schemaVersion: { type: "integer", const: 4 },
+            requestDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
             tool: { type: "string" },
             toolCall: { "$ref": "#/components/schemas/ToolCallProof" },
             text: { type: "string" },
@@ -1218,12 +1518,14 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
         ToolCallProof: {
           type: "object",
           additionalProperties: true,
-          required: ["namespace", "app", "tool", "ok", "currentTurnProof", "requiredBeforeCoding"],
+          required: ["namespace", "app", "tool", "ok", "currentTurnProof", "requiredBeforeCoding", "toolName", "input"],
           properties: {
             namespace: { type: "string" },
             app: { type: "string" },
             tool: { type: "string" },
             ok: { type: "boolean" },
+            toolName: { type: "string" },
+            input: { type: "object", additionalProperties: true },
             currentTurnProof: { type: "boolean" },
             requiredBeforeCoding: { type: "boolean" },
             proceedOnlyIfOk: { type: "boolean" },
@@ -1316,12 +1618,13 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
         return;
       }
       const result = await callRegisteredTool(ctx, toolName, input);
-      const response = await actionResponse(ctx, publicOrigin, toolName, result);
+      const response = await actionResponse(ctx, publicOrigin, toolName, { toolName, input }, result);
       response.toolCall = {
         ...(response.toolCall as Record<string, unknown>),
         toolName: "call_tool",
         input: { toolName, input },
       };
+      response.requestDigest = actionRequestDigest({ toolName, input });
       res.json(response);
     });
   }
@@ -1338,7 +1641,7 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
       const result = strictInput && "error" in strictInput
         ? strictInput.error
         : await callRegisteredTool(ctx, route.tool, routeInput ?? {});
-      const response = await actionResponse(ctx, publicOrigin, route.tool, result);
+      const response = await actionResponse(ctx, publicOrigin, route.tool, routeInput ?? {}, result);
       if (routeInput) {
         response.toolCall = {
           ...(response.toolCall as Record<string, unknown>),

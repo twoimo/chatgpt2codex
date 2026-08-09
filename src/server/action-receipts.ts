@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { chmod, lstat, mkdir } from "node:fs/promises";
 import path from "node:path";
 interface SqliteStatement {
@@ -30,7 +30,6 @@ const REPOSITORY = "Yeachan-Heo/gajae-code";
 const AUTHOR = "twoimo";
 const RECEIPT_TTL_MS = 10 * 60 * 1000;
 const MAX_RECEIPTS = 256;
-const MAX_CACHED_OUTCOMES = 256;
 const MAX_STORE_BYTES = 4 * 1024 * 1024;
 const MAX_OUTCOME_BYTES = 1024 * 1024;
 const OUTCOME_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
@@ -68,6 +67,27 @@ const ReceiptSchema = z.object({
   consumedAt: z.number().int().nonnegative().nullable(),
   metadata: z.record(z.string(), z.unknown()),
 }).strict();
+const AuthorizationBindingSchema = z.object({
+  protocolVersion: z.literal(1),
+  schemaVersion: z.literal(4),
+  ownerId: z.string().min(1),
+  leaseKey: z.string().min(1),
+  fence: z.number().int().positive(),
+  logicalIdentity: z.string().regex(/^[0-9a-f]{64}$/),
+  operationKey: z.string().regex(/^[0-9a-f]{64}$/),
+  operationHeadSha: z.string().regex(/^[0-9a-f]{40}$/),
+  effectIdentity: z.string().regex(/^[0-9a-f]{64}$/),
+  effectKey: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  effectKind: z.enum(["prepare_create", "prepare_quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "commit", "normal_push"]).optional(),
+  targetDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  policyDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  bindingDigest: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict().superRefine((binding, ctx) => {
+  if ((binding.effectKey === undefined) !== (binding.effectKind === undefined)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "effectKey and effectKind must be provided together" });
+  }
+});
+
 
 const MutationBindingSchema = z.object({
   runId: z.string().min(1),
@@ -81,10 +101,11 @@ const MutationBindingSchema = z.object({
   prNumber: z.number().int().positive(),
   expectedHeadSha: z.string().regex(/^[0-9a-f]{40}$/),
   eventId: z.string().min(1),
-  phase: z.enum(["prepare", "mutate"]),
-  operation: z.enum(["create", "quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "push_prepared_worktree"]),
+  phase: z.enum(["prepare", "execute", "mutate"]),
+  operation: z.enum(["create", "quarantine", "post_reply", "resolve_thread", "rerequest_reviewer", "push_prepared_worktree", "apply_suggestions"]),
   operationFields: z.record(z.string(), z.unknown()),
   input: z.record(z.string(), z.unknown()),
+  authorization: AuthorizationBindingSchema,
 }).strict();
 
 const MutationOutcomeSchema = z.object({
@@ -99,43 +120,42 @@ const MutationOutcomeSchema = z.object({
   completedAt: z.number().int().nonnegative().nullable(),
   metadata: z.record(z.string(), z.unknown()).nullable(),
 }).strict();
-const LegacyMutationOutcomeSchema = MutationOutcomeSchema.omit({ intentEvidence: true }).extend({
-  intentEvidence: z.record(z.string(), z.unknown()).optional(),
-}).strict();
-
-const LegacyStoreV4Schema = z.object({
-  version: z.literal(4),
-  updatedAt: z.number().int().nonnegative(),
-  receipts: z.array(ReceiptSchema).max(MAX_RECEIPTS),
-  mutationOutcomes: z.array(MutationOutcomeSchema).max(MAX_CACHED_OUTCOMES),
-}).strict();
-const LegacyStoreV3Schema = LegacyStoreV4Schema.extend({ version: z.literal(3) });
-const LegacyOutcomeV2Schema = MutationOutcomeSchema.omit({ startedAt: true });
-const LegacyStoreV2Schema = z.object({
-  version: z.literal(2),
-  updatedAt: z.number().int().nonnegative(),
-  receipts: z.array(ReceiptSchema).max(MAX_RECEIPTS),
-  mutationOutcomes: z.array(LegacyOutcomeV2Schema).max(MAX_CACHED_OUTCOMES),
-}).strict();
-const LegacyStoreV1Schema = z.object({
-  version: z.literal(1),
-  updatedAt: z.number().int().nonnegative(),
-  receipts: z.array(ReceiptSchema).max(MAX_RECEIPTS),
-}).strict();
-const LegacyDocumentSchema = z.object({ integrity: z.string().regex(/^[0-9a-f]{64}$/) }).passthrough();
-const LegacyOutcomeDocumentSchema = z.object({
-  outcome: LegacyMutationOutcomeSchema,
-  integrity: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict();
-const LegacyIndexDocumentSchema = z.object({
-  outcomeKey: z.string().regex(/^[0-9a-f]{64}$/),
-  claimId: z.string().min(1).nullable(),
-  idempotencyKey: z.string().min(1).nullable(),
-  integrity: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict();
 
 export type StoredActionReceipt = z.infer<typeof ReceiptSchema>;
 export type MutationOutcomeBinding = z.infer<typeof MutationBindingSchema>;
+const MUTATION_OPERATION_FIELD_RULES: Record<string, { allowed: readonly string[]; required: readonly string[] }> = {
+  create: { allowed: ["headRef"], required: ["headRef"] },
+  quarantine: { allowed: [], required: [] },
+  post_reply: { allowed: ["body", "threadId", "triggerId"], required: ["body", "threadId"] },
+  resolve_thread: { allowed: ["threadId", "triggerId", "replyReceiptId"], required: ["threadId", "triggerId", "replyReceiptId"] },
+  rerequest_reviewer: { allowed: ["reviewer"], required: ["reviewer"] },
+  push_prepared_worktree: { allowed: ["worktreePath", "headRef", "verification"], required: ["worktreePath", "headRef", "verification"] },
+  apply_suggestions: { allowed: ["worktreePath", "headRef", "ociImageDigest", "suggestions"], required: ["worktreePath", "headRef", "ociImageDigest", "suggestions"] },
+};
+
+function validateMutationOperationFields(binding: MutationOutcomeBinding): void {
+  const rule = MUTATION_OPERATION_FIELD_RULES[binding.operation];
+  if (!rule) throw approvalRequired("Action outcome contains an unsupported mutation operation");
+  const actual = Object.keys(binding.operationFields);
+  const unexpected = actual.filter((key) => !rule.allowed.includes(key));
+  const missing = rule.required.filter((key) => binding.operationFields[key] === undefined);
+  if (unexpected.length > 0 || missing.length > 0) {
+    throw approvalRequired("Action outcome contains operation fields outside its exact operation allowlist");
+  }
+  for (const key of rule.allowed) {
+    if (Object.hasOwn(binding.input, key) && !Object.hasOwn(binding.operationFields, key)) {
+      throw approvalRequired("Action outcome omitted an operation-specific input binding");
+    }
+    if (Object.hasOwn(binding.input, key)
+      && Object.hasOwn(binding.operationFields, key)
+      && canonicalJson(binding.input[key]) !== canonicalJson(binding.operationFields[key])) {
+      throw approvalRequired("Action outcome altered an operation-specific input binding");
+    }
+  }
+  if (binding.operation === "push_prepared_worktree" && Object.hasOwn(binding.input, "remoteUrl")) {
+    throw approvalRequired("Push mutation input contains an unowned remoteUrl");
+  }
+}
 type StoredMutationOutcome = z.infer<typeof MutationOutcomeSchema>;
 
 export interface CompletedMutationOutcome {
@@ -163,10 +183,6 @@ export interface IssueActionReceipt {
   metadata: Record<string, unknown>;
 }
 
-interface LegacyState {
-  receipts: StoredActionReceipt[];
-  outcomes: StoredMutationOutcome[];
-}
 
 const locks = new Map<string, Promise<void>>();
 
@@ -210,6 +226,31 @@ function exactInputFromResponse(response: Record<string, unknown>): unknown {
   if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) return undefined;
   return (toolCall as Record<string, unknown>).input;
 }
+function validateMutationReceiptOperationFields(
+  input: Record<string, unknown>,
+  structured: Record<string, unknown>,
+): void {
+  if (input.operation !== structured.operation) {
+    throw approvalRequired("Action receipt operation binding is inconsistent");
+  }
+  if (input.operation === "resolve_thread") {
+    for (const key of ["threadId", "triggerId", "replyReceiptId"] as const) {
+      if (typeof input[key] !== "string" || structured[key] !== input[key]) {
+        throw approvalRequired("Resolve action receipt omitted an exact operation-specific provenance binding");
+      }
+    }
+  } else if (input.operation === "post_reply") {
+    if (typeof input.threadId !== "string" || structured.threadId !== input.threadId) {
+      throw approvalRequired("Reply action receipt omitted an exact threadId provenance binding");
+    }
+    if (input.triggerId !== undefined && (typeof input.triggerId !== "string" || structured.triggerId !== input.triggerId)) {
+      throw approvalRequired("Reply action receipt omitted an exact triggerId provenance binding");
+    }
+    if (input.triggerId === undefined && Object.hasOwn(structured, "triggerId")) {
+      throw approvalRequired("Reply action receipt contains an unbound triggerId provenance field");
+    }
+  }
+}
 
 function validateReceiptBinding(receipt: StoredActionReceipt): void {
   if (receipt.expiresAt !== receipt.issuedAt + RECEIPT_TTL_MS) {
@@ -224,7 +265,7 @@ function validateReceiptBinding(receipt: StoredActionReceipt): void {
     throw approvalRequired("Action receipt store contains an invalid consumption binding");
   }
   const phasesByKind: Record<ActionReceiptKind, readonly ActionReceiptPhase[]> = {
-    verification: ["issued", "consumed"],
+    verification: ["issued", "record-pending", "recorded", "reconcile-pending", "consumed"],
     "monitor-read": ["issued", "ingest-pending", "ingested", "plan-pending", "consumed"],
     "monitor-action": ["issued", "record-pending", "recorded", "reconcile-pending", "consumed"],
   };
@@ -237,7 +278,7 @@ function validateReceiptBinding(receipt: StoredActionReceipt): void {
   const inputRecord = responseInput && typeof responseInput === "object" && !Array.isArray(responseInput)
     ? responseInput as Record<string, unknown> : undefined;
   const expectedTools = receipt.kind === "verification"
-    ? ["command_run"]
+    ? ["command_run", "github_pr_monitor_execute"]
     : receipt.kind === "monitor-read"
       ? ["github_pr_monitor_read"]
       : ["github_pr_monitor_prepare", "github_pr_monitor_mutate"];
@@ -249,6 +290,7 @@ function validateReceiptBinding(receipt: StoredActionReceipt): void {
     || toolCallRecord?.toolName !== receipt.response.tool) {
     throw approvalRequired("Action receipt store contains a corrupt response binding");
   }
+  const executeVerification = receipt.kind === "verification" && receipt.response.tool === "github_pr_monitor_execute";
   if (receipt.kind !== "verification"
     && (structuredRecord.repository !== REPOSITORY
       || structuredRecord.author !== AUTHOR
@@ -256,22 +298,50 @@ function validateReceiptBinding(receipt: StoredActionReceipt): void {
       || inputRecord?.author !== AUTHOR)) {
     throw approvalRequired("Action receipt store contains a foreign repository or author binding");
   }
+  if (receipt.kind === "monitor-action" && receipt.response.tool === "github_pr_monitor_mutate") {
+    if (!inputRecord || !structuredRecord) {
+      throw approvalRequired("Monitor action receipt omitted its exact mutation input binding");
+    }
+    validateMutationReceiptOperationFields(inputRecord, structuredRecord);
+  }
   if (receipt.kind === "verification") {
     const inputArgs = Array.isArray(inputRecord?.args) ? inputRecord.args : [];
-    if (receipt.metadata.projectId !== inputRecord?.projectId
+    const exactArgs = executeVerification ? ["bun", "test"] : inputArgs;
+    if ((!executeVerification && !["issued", "consumed"].includes(receipt.phase))
+      || receipt.metadata.projectId !== (executeVerification ? inputRecord?.worktreePath && path.basename(String(inputRecord.worktreePath)) : inputRecord?.projectId)
       || receipt.metadata.projectId !== structuredRecord.projectId
-      || receipt.metadata.commandId !== inputRecord?.commandId
+      || receipt.metadata.commandId !== (executeVerification ? "github_pr_monitor_execute" : inputRecord?.commandId)
       || receipt.metadata.commandId !== structuredRecord.commandId
       || receipt.metadata.riskTier !== "verify"
       || structuredRecord.riskTier !== "verify"
       || !Array.isArray(receipt.metadata.args)
       || !Array.isArray(structuredRecord.args)
-      || canonicalJson(receipt.metadata.args) !== canonicalJson(inputArgs)
+      || canonicalJson(receipt.metadata.args) !== canonicalJson(exactArgs)
       || canonicalJson(receipt.metadata.args) !== canonicalJson(structuredRecord.args)
       || receipt.metadata.headSha !== structuredRecord.headSha
       || receipt.metadata.treeSha !== structuredRecord.treeSha
       || typeof receipt.metadata.headSha !== "string"
-      || typeof receipt.metadata.treeSha !== "string") {
+      || typeof receipt.metadata.treeSha !== "string"
+      || (executeVerification && (
+        structuredRecord.exitCode !== 0
+        || structuredRecord.operation !== "apply_suggestions"
+        || structuredRecord.repository !== REPOSITORY
+        || structuredRecord.author !== AUTHOR
+        || inputRecord?.repository !== REPOSITORY
+        || inputRecord?.author !== AUTHOR
+        || receipt.metadata.artifactDir !== structuredRecord.artifactDir
+        || receipt.metadata.bundleSha256 !== structuredRecord.bundleSha256
+        || receipt.metadata.baseTreeSha !== structuredRecord.baseTreeSha
+        || typeof structuredRecord.artifactDir !== "string"
+        || typeof structuredRecord.bundleSha256 !== "string"
+        || !/^[0-9a-f]{64}$/.test(structuredRecord.bundleSha256)
+        || typeof structuredRecord.baseTreeSha !== "string"
+        || !/^[0-9a-f]{40}$/.test(structuredRecord.baseTreeSha)
+        || typeof structuredRecord.taskDigest !== "string"
+        || !/^[0-9a-f]{64}$/.test(structuredRecord.taskDigest)
+        || !Array.isArray(structuredRecord.changedPaths)
+        || !structuredRecord.changedPaths.every((value) => typeof value === "string")
+      ))) {
       throw approvalRequired("Verification receipt metadata is not bound to its exact command response");
     }
   }
@@ -282,6 +352,10 @@ function validateMutationOutcome(outcome: StoredMutationOutcome): void {
     throw approvalRequired("Action outcome store contains a corrupt exact binding");
   }
   const binding = outcome.binding;
+  validateMutationOperationFields(binding);
+  const authorization = binding.authorization;
+  const unsignedAuthorization = { ...authorization } as Record<string, unknown>;
+  delete unsignedAuthorization.bindingDigest;
   const expectedClaimDigest = createHash("sha256").update(canonicalJson({
     runId: binding.runId,
     actionPlanId: binding.actionPlanId,
@@ -292,9 +366,15 @@ function validateMutationOutcome(outcome: StoredMutationOutcome): void {
     phase: binding.phase,
     operation: binding.operation,
     operationFields: binding.operationFields,
+    ...authorization,
   })).digest("hex");
+  const authorizationMatchesInput = Object.entries(authorization).every(([key, value]) =>
+    canonicalJson(binding.input[key]) === canonicalJson(value));
   const completed = outcome.state === "completed";
   if (expectedClaimDigest !== binding.claimPayloadDigest
+    || createHash("sha256").update(canonicalJson(unsignedAuthorization)).digest("hex") !== authorization.bindingDigest
+    || !authorizationMatchesInput
+    || authorization.operationHeadSha !== binding.expectedHeadSha
     || binding.input.runId !== binding.runId
     || binding.input.actionPlanId !== binding.actionPlanId
     || binding.input.idempotencyKey !== binding.idempotencyKey
@@ -304,15 +384,15 @@ function validateMutationOutcome(outcome: StoredMutationOutcome): void {
     || binding.input.prNumber !== binding.prNumber
     || String(binding.input.expectedHeadSha).toLowerCase() !== binding.expectedHeadSha
     || binding.input.operation !== binding.operation
-    || (binding.phase === "prepare") !== ["create", "quarantine"].includes(binding.operation)) {
+    || (binding.phase === "prepare") !== ["create", "quarantine"].includes(binding.operation)
+    || (binding.phase === "execute") !== (binding.operation === "apply_suggestions")) {
     throw approvalRequired("Action outcome store contains an inconsistent claim or effect binding");
   }
   const evidenceKeys = Object.keys(outcome.intentEvidence);
   if (binding.operation === "rerequest_reviewer") {
     const currentEvidence = evidenceKeys.length === 1
       && typeof outcome.intentEvidence.reviewerRequestedBeforeIntent === "boolean";
-    const legacyCompletedEvidence = completed && evidenceKeys.length === 0;
-    if (!currentEvidence && !legacyCompletedEvidence) {
+    if (!currentEvidence) {
       throw approvalRequired("Reviewer Action outcome omitted its exact pre-apply evidence");
     }
   } else if (evidenceKeys.length !== 0) {
@@ -332,7 +412,9 @@ function validateMutationOutcome(outcome: StoredMutationOutcome): void {
   const structured = response.structuredContent;
   const structuredRecord = structured && typeof structured === "object" && !Array.isArray(structured)
     ? structured as Record<string, unknown> : undefined;
-  const tool = binding.phase === "prepare" ? "github_pr_monitor_prepare" : "github_pr_monitor_mutate";
+  const tool = binding.operation === "apply_suggestions"
+    ? "github_pr_monitor_execute"
+    : binding.phase === "prepare" ? "github_pr_monitor_prepare" : "github_pr_monitor_mutate";
   if (response.ok !== true
     || response.tool !== tool
     || canonicalJson(exactInputFromResponse(response)) !== canonicalJson(binding.input)
@@ -348,7 +430,8 @@ function validateMutationOutcome(outcome: StoredMutationOutcome): void {
     || structuredRecord.prNumber !== binding.prNumber
     || String(structuredRecord.expectedHeadSha).toLowerCase() !== binding.expectedHeadSha
     || structuredRecord.eventId !== binding.eventId
-    || structuredRecord.operation !== binding.operation) {
+    || structuredRecord.operation !== binding.operation
+    || Object.entries(authorization).some(([key, value]) => canonicalJson(structuredRecord[key]) !== canonicalJson(value))) {
     throw approvalRequired("Action outcome store contains a corrupt response binding");
   }
 }
@@ -564,7 +647,7 @@ export class ActionReceiptAuthority {
       if (now < outcome.issuedAt) throw approvalRequired("Action outcome issue time is in the future");
       const existing = this.receipt(database, outcome.receiptId);
       if (existing) {
-        if (existing.kind !== "monitor-action"
+        if (existing.kind !== (binding.operation === "apply_suggestions" ? "verification" : "monitor-action")
           || canonicalJson(existing.response) !== canonicalJson(outcome.response)
           || existing.issuedAt !== outcome.issuedAt
           || Object.entries(outcome.metadata).some(([key, value]) =>
@@ -577,7 +660,7 @@ export class ActionReceiptAuthority {
         }
         const receipt = ReceiptSchema.parse({
           receiptId: outcome.receiptId,
-          kind: "monitor-action",
+          kind: binding.operation === "apply_suggestions" ? "verification" : "monitor-action",
           repository: REPOSITORY,
           author: AUTHOR,
           response: structuredClone(outcome.response),
@@ -592,6 +675,30 @@ export class ActionReceiptAuthority {
         this.insertReceipt(database, receipt);
       }
       return { response: structuredClone(outcome.response), receiptId: outcome.receiptId };
+    });
+  }
+
+  async exactById(
+    receiptId: string,
+    kind: ActionReceiptKind,
+    phases: readonly ActionReceiptPhase[],
+  ): Promise<StoredActionReceipt> {
+    if (!/^[0-9a-f]{64}$/.test(receiptId)) {
+      throw approvalRequired("Action receipt identifier is invalid");
+    }
+    return this.transact((database, now) => {
+      const receipt = this.receipt(database, receiptId);
+      const expired = !receipt || receipt.expiresAt < now;
+      if (
+        !receipt
+        || receipt.kind !== kind
+        || expired
+        || now < receipt.issuedAt
+        || !phases.includes(receipt.phase)
+      ) {
+        throw approvalRequired("Action receipt is corrupt, stale, replayed, or not the exact issued response");
+      }
+      return structuredClone(receipt);
     });
   }
 
@@ -692,8 +799,8 @@ export class ActionReceiptAuthority {
           CREATE INDEX IF NOT EXISTS receipts_expiry
             ON receipts(expires_at);
         `);
+        this.rejectLegacyState(database);
         this.migrateIntentEvidenceDigest(database);
-        this.migrateLegacy(database);
         await chmod(this.databasePath, FILE_MODE);
         database.exec("BEGIN IMMEDIATE");
         try {
@@ -750,163 +857,28 @@ export class ActionReceiptAuthority {
     }
   }
 
-  private migrateLegacy(database: DatabaseSync): void {
+  private rejectLegacyState(database: DatabaseSync): void {
     const migrated = database.prepare("SELECT value FROM metadata WHERE key = 'legacy_migrated'").get();
-    if (migrated?.value === "1") return;
-    const legacy = this.loadLegacyState();
-    database.exec("BEGIN IMMEDIATE");
-    try {
-      const rechecked = database.prepare("SELECT value FROM metadata WHERE key = 'legacy_migrated'").get();
-      if (rechecked?.value !== "1") {
-        for (const receipt of legacy.receipts) this.insertReceipt(database, receipt);
-        for (const outcome of legacy.outcomes) {
-          database.prepare(`
-            INSERT INTO mutation_outcomes
-              (outcome_key, claim_id, idempotency_key, state, completed_at, intent_evidence_digest, document)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).run(
-            outcome.outcomeKey,
-            outcome.binding.claimId,
-            outcome.binding.idempotencyKey,
-            outcome.state,
-            outcome.completedAt,
-            intentEvidenceDigest(outcome),
-            serializeBounded(outcome, "Legacy Action outcome exceeds the bounded shard size"),
-          );
-        }
-        database.prepare("INSERT INTO metadata(key, value) VALUES ('legacy_migrated', '1')").run();
-      }
-      database.exec("COMMIT");
-    } catch (error: unknown) {
-      try { database.exec("ROLLBACK"); } catch { /* transaction already ended */ }
-      if (/unique|constraint/i.test(error instanceof Error ? error.message : String(error))) {
-        throw approvalRequired("Legacy Action outcome identities are not unique");
-      }
-      throw error;
+    if (migrated || this.legacyArtifactsPresent()) {
+      throw approvalRequired("Legacy Action receipt state is diagnostics-only and cannot be promoted into live v4 authority");
     }
   }
 
-  private loadLegacyState(): LegacyState {
-    const receipts: StoredActionReceipt[] = [];
-    const outcomes = new Map<string, StoredMutationOutcome>();
-    const rawStore = this.readLegacyFile(this.legacyStorePath, MAX_STORE_BYTES, "Legacy Action receipt store");
-    if (rawStore !== undefined) {
-      const parsedJson = parseJsonDocument(rawStore, "Legacy Action receipt store", MAX_STORE_BYTES);
-      const document = LegacyDocumentSchema.safeParse(parsedJson);
-      if (!document.success) throw approvalRequired("Legacy Action receipt store failed validation");
-      const { integrity, ...body } = document.data;
-      if (digest(body) !== integrity) throw approvalRequired("Legacy Action receipt store failed its integrity check");
-      const v4 = LegacyStoreV4Schema.safeParse(body);
-      const v3 = LegacyStoreV3Schema.safeParse(body);
-      const v2 = LegacyStoreV2Schema.safeParse(body);
-      const v1 = LegacyStoreV1Schema.safeParse(body);
-      if (v4.success) {
-        receipts.push(...v4.data.receipts);
-        for (const outcome of v4.data.mutationOutcomes) outcomes.set(outcome.outcomeKey, outcome);
-      } else if (v3.success) {
-        receipts.push(...v3.data.receipts);
-        for (const outcome of v3.data.mutationOutcomes) outcomes.set(outcome.outcomeKey, outcome);
-      } else if (v2.success) {
-        receipts.push(...v2.data.receipts);
-        for (const legacyOutcome of v2.data.mutationOutcomes) {
-          const outcome = MutationOutcomeSchema.parse({
-            ...legacyOutcome,
-            startedAt: legacyOutcome.issuedAt ?? legacyOutcome.completedAt ?? v2.data.updatedAt,
-            intentEvidence: {},
-          });
-          outcomes.set(outcome.outcomeKey, outcome);
-        }
-      } else if (v1.success) {
-        receipts.push(...v1.data.receipts);
-      } else {
-        throw approvalRequired("Legacy Action receipt store failed validation");
-      }
-    }
-
-    const outcomeDir = path.join(this.stateDir, OUTCOME_DIR);
-    const entries = (() => {
+  private legacyArtifactsPresent(): boolean {
+    const legacyPaths = [
+      { target: this.legacyStorePath, directory: false },
+      { target: path.join(this.stateDir, OUTCOME_DIR), directory: true },
+      { target: path.join(this.stateDir, INDEX_DIR), directory: true },
+    ] as const;
+    for (const { target, directory } of legacyPaths) {
       try {
-        return readdirSync(outcomeDir, { withFileTypes: true });
+        const stat = lstatSync(target);
+        if (!directory || !stat.isDirectory() || readdirSync(target).length > 0) return true;
       } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
-      }
-    })();
-    for (const entry of entries) {
-      if (!entry.isFile() || !/^[0-9a-f]{64}\.json$/u.test(entry.name)) {
-        if (entry.name.startsWith(".")) continue;
-        throw approvalRequired("Legacy Action outcome directory contains an unexpected entry");
-      }
-      const raw = this.readLegacyFile(path.join(outcomeDir, entry.name), MAX_OUTCOME_BYTES, "Legacy Action outcome shard");
-      if (raw === undefined) throw approvalRequired("Legacy Action outcome shard disappeared during migration");
-      const parsed = LegacyOutcomeDocumentSchema.safeParse(parseJsonDocument(raw, "Legacy Action outcome shard"));
-      if (!parsed.success || digest(parsed.data.outcome) !== parsed.data.integrity) {
-        throw approvalRequired("Legacy Action outcome shard failed validation or integrity");
-      }
-      const outcome = MutationOutcomeSchema.parse({
-        ...parsed.data.outcome,
-        intentEvidence: parsed.data.outcome.intentEvidence ?? {},
-      });
-      validateMutationOutcome(outcome);
-      if (`${outcome.outcomeKey}.json` !== entry.name) {
-        throw approvalRequired("Legacy Action outcome shard is not bound to its filename");
-      }
-      const prior = outcomes.get(outcome.outcomeKey);
-      if (prior && canonicalJson(prior) !== canonicalJson(outcome)) {
-        throw approvalRequired("Legacy Action outcome shard conflicts with the primary store");
-      }
-      outcomes.set(outcome.outcomeKey, outcome);
-    }
-
-    const indexDir = path.join(this.stateDir, INDEX_DIR);
-    const indexEntries = (() => {
-      try {
-        return readdirSync(indexDir, { withFileTypes: true });
-      } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
-      }
-    })();
-    for (const entry of indexEntries) {
-      if (!entry.isFile() || !/^(?:claim|idem)-[0-9a-f]{64}\.json$/u.test(entry.name)) {
-        if (entry.name.startsWith(".")) continue;
-        throw approvalRequired("Legacy mutation identity index contains an unexpected entry");
-      }
-      const raw = this.readLegacyFile(path.join(indexDir, entry.name), MAX_OUTCOME_BYTES, "Legacy mutation identity index");
-      if (raw === undefined) throw approvalRequired("Legacy mutation identity index disappeared during migration");
-      const parsed = LegacyIndexDocumentSchema.safeParse(parseJsonDocument(raw, "Legacy mutation identity index"));
-      if (!parsed.success) throw approvalRequired("Legacy mutation identity index failed validation");
-      const { integrity, ...payload } = parsed.data;
-      if (digest(payload) !== integrity) throw approvalRequired("Legacy mutation identity index failed its integrity check");
-      const owner = outcomes.get(payload.outcomeKey);
-      if (!owner
-        || (payload.claimId !== null && owner.binding.claimId !== payload.claimId)
-        || (payload.idempotencyKey !== null && owner.binding.idempotencyKey !== payload.idempotencyKey)
-        || (payload.claimId === null) === (payload.idempotencyKey === null)) {
-        throw approvalRequired("Legacy mutation identity index does not name its exact durable outcome");
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
       }
     }
-
-    for (const receipt of receipts) validateReceiptBinding(receipt);
-    for (const outcome of outcomes.values()) validateMutationOutcome(outcome);
-    if (new Set(receipts.map((receipt) => receipt.receiptId)).size !== receipts.length) {
-      throw approvalRequired("Legacy Action receipt store contains duplicate identifiers");
-    }
-    return { receipts, outcomes: [...outcomes.values()] };
-  }
-
-  private readLegacyFile(target: string, maxBytes: number, label: string): string | undefined {
-    try {
-      const stat = lstatSync(target);
-      if (stat.isSymbolicLink() || !stat.isFile() || stat.size > maxBytes) {
-        throw approvalRequired(`${label} is not a bounded regular file`);
-      }
-      return readFileSync(target, "utf8");
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      if (error instanceof DomainError) throw error;
-      throw approvalRequired(`${label} could not be read: ${(error as Error).message}`);
-    }
+    return false;
   }
 
   private receipt(database: DatabaseSync, receiptId: string): StoredActionReceipt | undefined {

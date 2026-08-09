@@ -104,6 +104,68 @@ async function postAction(baseUrl: string, pathName: string, body: unknown, toke
     body: JSON.stringify(body),
   });
 }
+
+type MonitorEffectKind = "prepare_create" | "prepare_quarantine" | "post_reply" | "resolve_thread" | "rerequest_reviewer" | "commit" | "normal_push";
+
+function canonicalTestJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new TypeError("Test value is not JSON-serializable");
+    return serialized;
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalTestJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalTestJson(record[key])}`).join(",")}}`;
+}
+
+function testDigest(value: unknown): string {
+  return createHash("sha256").update(canonicalTestJson(value)).digest("hex");
+}
+
+function monitorAuthorization(
+  input: Record<string, unknown>,
+  effectKind?: MonitorEffectKind,
+): Record<string, unknown> {
+  const operationHeadSha = String(input.expectedHeadSha ?? input.headSha);
+  const identity = {
+    runId: input.runId,
+    actionPlanId: input.actionPlanId,
+    prNumber: input.prNumber,
+    operation: input.operation,
+    operationHeadSha,
+  };
+  const digest = (kind: string) => testDigest({ kind, ...identity });
+  const unsigned = {
+    protocolVersion: 1,
+    schemaVersion: 4,
+    ownerId: String(input.runId),
+    leaseKey: `pr:Yeachan-Heo/gajae-code:${String(input.prNumber)}`,
+    fence: 1,
+    logicalIdentity: digest("logicalIdentity"),
+    operationKey: digest("operationKey"),
+    operationHeadSha,
+    effectIdentity: digest("effectIdentity"),
+    ...(effectKind === undefined ? {} : { effectKey: digest(`effectKey:${effectKind}`), effectKind }),
+    targetDigest: digest("targetDigest"),
+    policyDigest: digest("policyDigest"),
+  };
+  return { ...unsigned, bindingDigest: testDigest(unsigned) };
+}
+
+function authorizedMonitorInput<T extends Record<string, unknown>>(input: T): T & Record<string, unknown> {
+  const effectKind = input.operation === "post_reply"
+    ? "post_reply"
+    : input.operation === "resolve_thread"
+      ? "resolve_thread"
+      : input.operation === "rerequest_reviewer"
+        ? "rerequest_reviewer"
+        : input.operation === "apply_suggestions"
+          ? "commit"
+          : input.operation === "push_prepared_worktree"
+            ? "normal_push"
+            : undefined;
+  return { ...input, ...monitorAuthorization(input, effectKind) };
+}
 async function establishAuthoritativeMonitorPlan(
   baseUrl: string,
   identity: {
@@ -187,6 +249,10 @@ if (args[0] === "api" && args[1] === "user") {
     url: "https://github.com/Yeachan-Heo/gajae-code/pull/" + args[2],
     state: "OPEN",
     author: { login: "twoimo" },
+    headRepository: { id: "repo-node-id", name: "gajae-code", nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
+    baseRefName: "main",
+    baseRefOid: "1111111111111111111111111111111111111111",
     headRefName: "feature/strict-actions",
     headRefOid: state.headRefOid ?? "0123456789abcdef0123456789abcdef01234567",
     reviewRequests: state.reviewRequests ?? [
@@ -195,11 +261,35 @@ if (args[0] === "api" && args[1] === "user") {
       { login: "malformed-json-reviewer" },
       { login: "malformed-shape-reviewer" }
     ],
-    reviews: [{ author: { login: "previous-reviewer" } }],
+    reviews: [{ id: "review-1", author: { login: "previous-reviewer", __typename: "User" }, body: "previous review" }],
     comments: [],
     latestReviews: [],
     statusCheckRollup: []
   }));
+} else if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.includes("addPullRequestReviewThreadReply"))) {
+  const threadId = args.find((arg) => arg.startsWith("threadId="))?.slice("threadId=".length);
+  const body = args.find((arg) => arg.startsWith("body="))?.slice("body=".length);
+  if (threadId === "THREAD_REPLY_GRAPHQL_ERROR") {
+    console.log(JSON.stringify({ errors: [{ message: "mutation denied" }], data: null }));
+  } else {
+    const replies = state.threadReplies ?? [];
+    replies.push({ id: "reply-" + (replies.length + 99), threadId, body, url: "https://github.com/Yeachan-Heo/gajae-code/pull/7#discussion_r" + (replies.length + 99), author: { login: "twoimo", __typename: "User" } });
+    state.threadReplies = replies;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    console.log(JSON.stringify({
+      data: {
+        addPullRequestReviewThreadReply: {
+          comment: {
+            id: "reply-99",
+            body,
+            url: "https://github.com/Yeachan-Heo/gajae-code/pull/7#discussion_r99",
+            author: { login: "twoimo", __typename: "User" },
+            pullRequestReviewThread: { id: threadId },
+          },
+        },
+      },
+    }));
+  }
 } else if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.includes("resolveReviewThread"))) {
   const threadId = args.find((arg) => arg.startsWith("id="))?.slice(3);
   if (threadId === "THREAD_GRAPHQL_ERROR") {
@@ -213,6 +303,19 @@ if (args[0] === "api" && args[1] === "user") {
     }
     console.log(JSON.stringify({ data: { resolveReviewThread: { thread: { id: threadId, isResolved: true } } } }));
   }
+} else if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.includes("node(id:$id)"))) {
+  const threadId = args.find((arg) => arg.startsWith("id="))?.slice("id=".length);
+  const replies = state.threadReplies ?? [];
+  console.log(JSON.stringify({
+    data: {
+      node: {
+        id: threadId,
+        isResolved: false,
+        isOutdated: false,
+        comments: { nodes: replies.filter((reply) => reply.threadId === threadId), pageInfo: { hasNextPage: false, endCursor: null } },
+      },
+    },
+  }));
 } else if (args[0] === "api" && args[1] === "graphql") {
   const number = Number(args.find((arg) => arg.startsWith("number="))?.slice(7));
   if (number === 901) {
@@ -231,7 +334,13 @@ if (args[0] === "api" && args[1] === "user") {
       .map((id) => ({
         id,
         isResolved: id === "THREAD_RESOLVED" || resolvedThreads.includes(id),
-        comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } }
+        isOutdated: false,
+        comments: {
+          nodes: id === "THREAD_RESOLVED"
+            ? []
+            : [{ id: id === "THREAD_CURRENT" ? "1" : "2", body: id === "THREAD_CURRENT" ? "Human trigger" : "GraphQL trigger", author: { login: "reviewer", __typename: "User" }, authorAssociation: "MEMBER", feedbackIdentity: id === "THREAD_CURRENT" ? "e".repeat(64) : "f".repeat(64) }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
       }));
     console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       nodes, pageInfo: { hasNextPage: false, endCursor: null }
@@ -268,7 +377,7 @@ if (args[0] === "api" && args[1] === "user") {
 const args = process.argv.slice(2);
 if (args.includes("get-url")) {
   console.log(args.at(-1) === "origin"
-    ? "git@github.com:twoimo/gajae-code.git"
+    ? "git@github.com:Yeachan-Heo/gajae-code.git"
     : "https://github.com/Yeachan-Heo/gajae-code.git");
 }
 `,
@@ -286,6 +395,7 @@ const canonical = (value) => {
   return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
 };
 const digest = (value) => crypto.createHash("sha256").update(canonical(value)).digest("hex");
+const authorizationKeys = ["protocolVersion", "schemaVersion", "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey", "operationHeadSha", "effectIdentity", "effectKey", "effectKind", "targetDigest", "policyDigest", "bindingDigest"];
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { input += chunk; });
@@ -297,6 +407,27 @@ process.stdin.on("end", () => {
     console.log(JSON.stringify({ ok: true, command, ...body, committed: false }));
     return;
   }
+  if (command === "lease-renew") {
+    const serverTime = "2026-07-27T00:00:00.000Z";
+    console.log(JSON.stringify({
+      ok: true,
+      command,
+      protocolVersion: 1,
+      schemaVersion: 4,
+      requestDigest: digest(body),
+      result: {
+        protocolVersion: 1,
+        schemaVersion: 4,
+        leaseKey: body.leaseKey,
+        ownerId: body.ownerId,
+        runId: body.runId,
+        fence: body.fence,
+        serverTime,
+        expiresAt: "2026-07-27T00:00:30.000Z"
+      }
+    }));
+    return;
+  }
   if (command === "claim-action") {
     assert.equal(argv.includes("--json"), false);
     assert.equal(body.prNumber, 7);
@@ -306,6 +437,7 @@ process.stdin.on("end", () => {
       process.exit(1);
     }
     console.log(JSON.stringify({
+      ...Object.fromEntries(authorizationKeys.flatMap((key) => body[key] === undefined ? [] : [[key, body[key]]])),
       command,
       ok: true,
       claimId: "claim-" + body.idempotencyKey,
@@ -321,6 +453,8 @@ process.stdin.on("end", () => {
   if (command === "ingest") {
     assert.deepEqual(Object.keys(body).sort(), ["actionPlanId", "readReceipt", "runId"]);
     console.log(JSON.stringify({
+      protocolVersion: 1,
+      schemaVersion: 4,
       ok: true,
       command,
       runId: body.runId,
@@ -337,6 +471,8 @@ process.stdin.on("end", () => {
       ? body.actionPlanId.slice("coord-".length)
       : body.actionPlanId;
     console.log(JSON.stringify({
+      protocolVersion: 1,
+      schemaVersion: 4,
       ok: true,
       command,
       runId: body.runId,
@@ -438,6 +574,7 @@ describe("Custom GPT action bridge", () => {
 
   beforeEach(async () => {
     delete process.env.CHATGPT2CODEX_ACTIONS_MODE;
+    process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = "enabled";
     stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-actions-state-"));
     projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-actions-project-"));
     await storeOwnerToken(stateDir, OWNER_TOKEN);
@@ -445,6 +582,7 @@ describe("Custom GPT action bridge", () => {
 
   afterEach(async () => {
     delete process.env.CHATGPT2CODEX_ACTIONS_MODE;
+    delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
     if (stop) {
       await stop();
       stop = undefined;
@@ -485,6 +623,7 @@ describe("Custom GPT action bridge", () => {
           ToolAvailabilityGate: Record<string, unknown>;
           GithubPrMonitorReadInput: { required: string[]; additionalProperties: boolean; properties: Record<string, Record<string, unknown>> };
           GithubPrMonitorPrepareInput: { required: string[]; additionalProperties: boolean; properties: Record<string, Record<string, unknown>> };
+          GithubPrMonitorExecuteInput: { required: string[]; additionalProperties: boolean; properties: Record<string, Record<string, unknown>> };
           GithubPrMonitorMutateInput: { required: string[]; additionalProperties: boolean; properties: Record<string, Record<string, unknown>> };
           GithubPrMonitorStateInput: { required: string[]; additionalProperties: boolean; properties: Record<string, Record<string, unknown>> };
         };
@@ -505,6 +644,7 @@ describe("Custom GPT action bridge", () => {
     expect(body.info["x-chatgpt2codex-tool-names"]).toContain("e2e_test_and_show_screenshot");
     expect(body.info["x-chatgpt2codex-tool-names"]).toContain("github_pr_monitor_read");
     expect(body.info["x-chatgpt2codex-tool-names"]).toContain("github_pr_monitor_prepare");
+    expect(body.info["x-chatgpt2codex-tool-names"]).toContain("github_pr_monitor_execute");
     expect(body.info["x-chatgpt2codex-tool-names"]).toContain("github_pr_monitor_mutate");
     expect(body.info["x-chatgpt2codex-tool-names"]).toContain("github_pr_monitor_state");
     expect(body.info["x-chatgpt2codex-tool-names"]).not.toContain("code_context_pack");
@@ -549,6 +689,7 @@ describe("Custom GPT action bridge", () => {
     for (const [routePath, operationId] of [
       ["/actions/github-pr-monitor-read", "github_pr_monitor_read"],
       ["/actions/github-pr-monitor-prepare", "github_pr_monitor_prepare"],
+      ["/actions/github-pr-monitor-execute", "github_pr_monitor_execute"],
       ["/actions/github-pr-monitor-mutate", "github_pr_monitor_mutate"],
       ["/actions/github-pr-monitor-state", "github_pr_monitor_state"],
     ] as const) {
@@ -557,6 +698,7 @@ describe("Custom GPT action bridge", () => {
     const monitorSchemas = [
       body.components.schemas.GithubPrMonitorReadInput,
       body.components.schemas.GithubPrMonitorPrepareInput,
+      body.components.schemas.GithubPrMonitorExecuteInput,
       body.components.schemas.GithubPrMonitorMutateInput,
       body.components.schemas.GithubPrMonitorStateInput,
     ];
@@ -575,12 +717,27 @@ describe("Custom GPT action bridge", () => {
     });
     for (const schema of [
       body.components.schemas.GithubPrMonitorPrepareInput,
+      body.components.schemas.GithubPrMonitorExecuteInput,
       body.components.schemas.GithubPrMonitorMutateInput,
     ]) {
       expect(schema.properties.repository).toMatchObject({ type: "string", const: "Yeachan-Heo/gajae-code" });
       expect(schema.properties.author).toMatchObject({ type: "string", const: "twoimo" });
     }
     expect(body.components.schemas.GithubPrMonitorPrepareInput.properties.operation.enum).toEqual(["create", "quarantine"]);
+    expect(body.components.schemas.GithubPrMonitorExecuteInput.properties.operation).toMatchObject({ const: "apply_suggestions" });
+    expect(body.components.schemas.GithubPrMonitorExecuteInput.properties.ociImageDigest).toMatchObject({ pattern: "^sha256:[0-9a-f]{64}$" });
+    const executeSchema = body.components.schemas.GithubPrMonitorExecuteInput as {
+      required?: string[];
+      properties?: Record<string, unknown>;
+    };
+    expect(executeSchema.required).toContain("suggestions");
+    expect((executeSchema.properties?.suggestions as { items?: { required?: string[]; properties?: Record<string, unknown> } }).items?.required).toEqual([
+      "threadId", "commentId", "reviewer", "path", "startLine", "line", "expectedOriginal", "replacement", "sourceDigest",
+    ]);
+    expect((executeSchema.properties?.suggestions as { items?: { properties?: Record<string, unknown> } }).items?.properties).toMatchObject({
+      expectedOriginal: { type: "string", minLength: 1, maxLength: 65536 },
+      reviewer: { type: "string", maxLength: 80 },
+    });
     expect(body.components.schemas.GithubPrMonitorMutateInput.properties.operation.enum).toEqual([
       "post_reply",
       "resolve_thread",
@@ -615,7 +772,7 @@ describe("Custom GPT action bridge", () => {
     );
   });
 
-  it("emits only health and the four dedicated operations in github-pr-monitor mode", async () => {
+  it("emits only health and the five dedicated operations in github-pr-monitor mode", async () => {
     process.env.CHATGPT2CODEX_ACTIONS_MODE = "github-pr-monitor";
     const server = await startApp(makeCtx(stateDir, projectRoot));
     stop = server.stop;
@@ -633,6 +790,7 @@ describe("Custom GPT action bridge", () => {
         schemas: {
           GithubPrMonitorReadInput: { properties: Record<string, Record<string, unknown>> };
           GithubPrMonitorPrepareInput: { properties: Record<string, Record<string, unknown>> };
+          GithubPrMonitorExecuteInput: { properties: Record<string, Record<string, unknown>> };
           GithubPrMonitorMutateInput: { properties: Record<string, Record<string, unknown>> };
         };
       };
@@ -640,12 +798,14 @@ describe("Custom GPT action bridge", () => {
     const monitorOperations = [
       ["/actions/github-pr-monitor-read", "github_pr_monitor_read"],
       ["/actions/github-pr-monitor-prepare", "github_pr_monitor_prepare"],
+      ["/actions/github-pr-monitor-execute", "github_pr_monitor_execute"],
       ["/actions/github-pr-monitor-mutate", "github_pr_monitor_mutate"],
       ["/actions/github-pr-monitor-state", "github_pr_monitor_state"],
     ] as const;
 
     expect(res.status).toBe(200);
     expect(Object.keys(body.paths).sort()).toEqual([
+      "/actions/github-pr-monitor-execute",
       "/actions/github-pr-monitor-mutate",
       "/actions/github-pr-monitor-prepare",
       "/actions/github-pr-monitor-read",
@@ -659,7 +819,7 @@ describe("Custom GPT action bridge", () => {
     expect(body.info.title).toContain("GitHub PR Monitor");
     expect(body.info.description).toContain("Yeachan-Heo/gajae-code");
     expect(body.info.description).toContain("twoimo");
-    expect(body.info["x-chatgpt2codex-openapi-operation-count"]).toBe(5);
+    expect(body.info["x-chatgpt2codex-openapi-operation-count"]).toBe(6);
     expect(body.info["x-chatgpt2codex-tool-names"]).toEqual(monitorOperations.map(([, operationId]) => operationId));
     expect(body.components.schemas.GithubPrMonitorReadInput.properties.repository).toMatchObject({
       const: "Yeachan-Heo/gajae-code",
@@ -668,6 +828,7 @@ describe("Custom GPT action bridge", () => {
     expect(body.components.schemas.GithubPrMonitorPrepareInput.properties.repository).toMatchObject({
       const: "Yeachan-Heo/gajae-code",
     });
+    expect(body.components.schemas.GithubPrMonitorExecuteInput.properties.operation).toMatchObject({ const: "apply_suggestions" });
     expect(body.components.schemas.GithubPrMonitorMutateInput.properties.author).toMatchObject({ const: "twoimo" });
   });
 
@@ -680,11 +841,12 @@ describe("Custom GPT action bridge", () => {
     expect(health.status).toBe(200);
     await expect(health.json()).resolves.toMatchObject({
       ok: true,
-      actions: 4,
-      openApiOperations: 5,
+      actions: 5,
+      openApiOperations: 6,
       openApiToolNames: [
         "github_pr_monitor_read",
         "github_pr_monitor_prepare",
+        "github_pr_monitor_execute",
         "github_pr_monitor_mutate",
         "github_pr_monitor_state",
       ],
@@ -693,6 +855,7 @@ describe("Custom GPT action bridge", () => {
     for (const [routePath, tool] of [
       ["/actions/github-pr-monitor-read", "github_pr_monitor_read"],
       ["/actions/github-pr-monitor-prepare", "github_pr_monitor_prepare"],
+      ["/actions/github-pr-monitor-execute", "github_pr_monitor_execute"],
       ["/actions/github-pr-monitor-mutate", "github_pr_monitor_mutate"],
       ["/actions/github-pr-monitor-state", "github_pr_monitor_state"],
     ] as const) {
@@ -882,7 +1045,7 @@ describe("Custom GPT action bridge", () => {
       type: "tool.call.failed",
       tool: "github_pr_monitor_state",
       input: expect.objectContaining({
-        input: { marker: "decoded-before-dispatch" },
+        inputDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
       }),
     }));
 
@@ -896,6 +1059,29 @@ describe("Custom GPT action bridge", () => {
     });
     const malformedBody = (await malformed.json()) as { structuredContent: { code?: string } };
     expect(malformedBody.structuredContent.code).toBe("INVALID_INPUT");
+    const versionless = await postAction(server.baseUrl, "/actions/github-pr-monitor-state", {
+      runId: "run-state",
+      actionPlanId: "plan-state",
+      idempotencyKey: "idem-state",
+      eventId: "event-state",
+      command: "ingest",
+      input: JSON.stringify({
+        receipt: {
+          ok: true,
+          tool: "github_pr_monitor_read",
+          structuredContent: {
+            ok: true,
+            receiptId: "a".repeat(64),
+            repository: "Yeachan-Heo/gajae-code",
+            author: "twoimo",
+            prs: [],
+          },
+        },
+      }),
+    });
+    const versionlessBody = (await versionless.json()) as { structuredContent: { code?: string; error?: string } };
+    expect(versionlessBody.structuredContent.code).toBe("INVALID_INPUT");
+    expect(versionlessBody.structuredContent.error).toMatch(/protocolVersion|v4 ActionToolResponse/);
   });
 
   it("dispatches valid dedicated PR actions and preserves action receipts", async () => {
@@ -932,13 +1118,13 @@ describe("Custom GPT action bridge", () => {
       expect(readBody.structuredContent.prs).toHaveLength(1);
       await establishAuthoritativeMonitorPlan(server.baseUrl, identity);
 
-      const prepareRes = await postAction(server.baseUrl, "/actions/github-pr-monitor-prepare", {
+      const prepareRes = await postAction(server.baseUrl, "/actions/github-pr-monitor-prepare", authorizedMonitorInput({
         ...identity,
         idempotencyKey: "idem-prepare",
         eventId: "event-prepare",
         expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
         operation: "quarantine",
-      });
+      }));
       const prepareBody = (await prepareRes.json()) as {
         ok: boolean;
         structuredContent: { code?: string };
@@ -950,14 +1136,15 @@ describe("Custom GPT action bridge", () => {
         tool: "github_pr_monitor_prepare",
       }));
 
-      const mutateRes = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+      const mutateRes = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
         ...identity,
         idempotencyKey: "idem-mutate",
         eventId: "event-mutate",
         expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
         operation: "post_reply",
         body: "Bounded reply",
-      });
+        threadId: "THREAD_CURRENT",
+      }));
       const mutateBody = (await mutateRes.json()) as {
         ok: boolean;
         tool: string;
@@ -995,23 +1182,34 @@ describe("Custom GPT action bridge", () => {
         headSha: "0123456789abcdef0123456789abcdef01234567",
         operation: "post_reply",
         phase: "mutate",
-        operationFields: { body: "Bounded reply" },
+        operationFields: { body: "Bounded reply", threadId: "THREAD_CURRENT" },
+        ...monitorAuthorization({
+          ...identity,
+          expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
+          operation: "post_reply",
+          threadId: "THREAD_CURRENT",
+        }, "post_reply"),
       });
-      const retryRes = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+      const retryRes = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
         ...identity,
         idempotencyKey: "idem-mutate",
         eventId: "event-mutate",
         expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
         operation: "post_reply",
         body: "Bounded reply",
-      });
+        threadId: "THREAD_CURRENT",
+      }));
       const retryBody = await retryRes.json();
       expect(JSON.stringify(retryBody)).toBe(JSON.stringify(mutateBody));
       const ghInvocations = (await fs.readFile(path.join(projectRoot, "fake-bin", "gh-invocations.log"), "utf8"))
         .trim().split("\n").map((line) => JSON.parse(line) as string[]);
       expect(ghInvocations.filter((args) =>
-        args[1]?.endsWith("/comments") && !args.includes("--paginate")
-        && args.some((arg) => arg.includes("idem-mutate")))).toHaveLength(1);
+        args[1] === "graphql"
+        && args.some((arg) => arg.includes("addPullRequestReviewThreadReply"))
+        && args.some((arg) => arg.includes("threadId=THREAD_CURRENT"))
+        && args.some((arg) => arg.includes("<!-- gjc:auto-response:v1:")))).toHaveLength(1);
+      expect(ghInvocations.some((args) =>
+        args[1]?.endsWith("/comments") && !args.includes("--paginate"))).toBe(false);
     } finally {
       restorePath();
     }
@@ -1033,10 +1231,10 @@ describe("Custom GPT action bridge", () => {
         operation: "post_reply",
         body: "Must not be posted",
       };
-      const malformed = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+      const malformed = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
         ...baseInput,
         threadId: "EXTRANEOUS_THREAD",
-      });
+      }));
       expect(((await malformed.json()) as { ok: boolean }).ok).toBe(false);
       const claimLogPath = path.join(projectRoot, "fake-bin", "claim-invocations.log");
       const ghLogPath = path.join(projectRoot, "fake-bin", "gh-invocations.log");
@@ -1048,10 +1246,10 @@ describe("Custom GPT action bridge", () => {
       });
       await fs.writeFile(ghLogPath, "");
 
-      const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+      const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
         ...baseInput,
         actionPlanId: "reject-plan",
-      });
+      }));
       const body = (await response.json()) as { ok: boolean; structuredContent: { code?: string } };
       expect(body.ok).toBe(false);
       expect(body.structuredContent.code).toBe("APPROVAL_REQUIRED");
@@ -1106,11 +1304,11 @@ describe("Custom GPT action bridge", () => {
       await establishAuthoritativeMonitorPlan(server.baseUrl, baseInput);
 
       for (const threadId of ["THREAD_FOREIGN", "THREAD_RESOLVED"]) {
-        const res = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+        const res = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
           ...baseInput,
           ...mutationIdentity(threadId.toLowerCase()),
           threadId,
-        });
+        }));
         const body = (await res.json()) as {
           ok: boolean;
           structuredContent: { code?: string; error?: string };
@@ -1119,34 +1317,33 @@ describe("Custom GPT action bridge", () => {
         expect(body.ok, threadId).toBe(false);
         expect(body.structuredContent.code, threadId).toBe("APPROVAL_REQUIRED");
         expect(body.structuredContent.error, threadId).toMatch(
-          /unresolved thread from the current fixed PR snapshot|no unique exact thread evidence|already applied without an exact pending intent/,
+          /unresolved thread from the current fixed PR snapshot|no unique exact thread evidence|already applied without an exact pending intent|exact threadId, triggerId, and replyReceiptId fields/,
         );
       }
-      const graphqlError = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+      const graphqlError = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
         ...baseInput,
         ...mutationIdentity("graphql-error"),
         threadId: "THREAD_GRAPHQL_ERROR",
-      });
+      }));
       const graphqlErrorBody = (await graphqlError.json()) as {
         ok: boolean;
         structuredContent: { code?: string; error?: string };
       };
       expect(graphqlErrorBody.ok).toBe(false);
       expect(graphqlErrorBody.structuredContent.code).toBe("APPROVAL_REQUIRED");
-      expect(graphqlErrorBody.structuredContent.error).toContain("GraphQL errors");
-      const current = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+      expect(graphqlErrorBody.structuredContent.error).toContain("exact threadId, triggerId, and replyReceiptId fields");
+      const current = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
         ...baseInput,
         ...mutationIdentity("current"),
         threadId: "THREAD_CURRENT",
-      });
+      }));
       const currentBody = (await current.json()) as {
         ok: boolean;
         structuredContent: { operation?: string; remoteObject?: { id?: string } };
       };
-      expect(currentBody.ok).toBe(true);
+      expect(currentBody.ok).toBe(false);
       expect(currentBody.structuredContent).toMatchObject({
-        operation: "resolve_thread",
-        remoteObject: { id: "THREAD_CURRENT" },
+        code: "APPROVAL_REQUIRED",
       });
     } finally {
       restorePath();
@@ -1179,12 +1376,12 @@ describe("Custom GPT action bridge", () => {
           remoteObject?: { id?: string; reviewer?: string };
         };
       }> {
-        const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+        const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
           ...baseInput,
           idempotencyKey: `idem-${reviewer}`,
           eventId: `event-${reviewer}`,
           reviewer,
-        });
+        }));
         return response.json() as Promise<{
           ok: boolean;
           text?: string;
@@ -1270,6 +1467,7 @@ describe("Custom GPT action bridge", () => {
         expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
         operation: "resolve_thread",
       };
+      const replyReceiptIds = new Map<string, string>();
       const mutate = async (suffix: string, threadId: string): Promise<{
         ok: boolean;
         text?: string;
@@ -1280,12 +1478,14 @@ describe("Custom GPT action bridge", () => {
           remoteObject?: { id?: string; html_url?: string };
         };
       }> => {
-        const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+        const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
           ...baseInput,
           idempotencyKey: `idem-resolve-${suffix}`,
           eventId: `event-resolve-${suffix}`,
           threadId,
-        });
+          triggerId: threadId === "THREAD_CURRENT" ? "1" : "2",
+          replyReceiptId: replyReceiptIds.get(threadId) ?? replyReceiptId,
+        }));
         return response.json() as Promise<{
           ok: boolean;
           text?: string;
@@ -1300,6 +1500,24 @@ describe("Custom GPT action bridge", () => {
 
       await patchGhState({});
       await establishAuthoritativeMonitorPlan(server.baseUrl, baseInput);
+      const replyResponse = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
+        ...baseInput,
+        idempotencyKey: "idem-resolve-reply",
+        eventId: "event-resolve-reply",
+        operation: "post_reply",
+        body: "Reply before resolve",
+        triggerId: "1",
+        threadId: "THREAD_CURRENT",
+      })).then((response) => response.json() as Promise<Record<string, unknown>>);
+      expect(replyResponse.ok).toBe(true);
+      const replyReceiptId = String((replyResponse.structuredContent as Record<string, unknown>).receiptId);
+      replyReceiptIds.set("THREAD_CURRENT", replyReceiptId);
+      const authority = new ActionReceiptAuthority(stateDir);
+      const exactReplyResponse = (await authority.exactById(replyReceiptId, "monitor-action", ["issued"])).response;
+      await authority.transitionExact(replyReceiptId, "monitor-action", exactReplyResponse, ["issued"], "record-pending");
+      await authority.transitionExact(replyReceiptId, "monitor-action", exactReplyResponse, ["record-pending"], "recorded");
+      await authority.transitionExact(replyReceiptId, "monitor-action", exactReplyResponse, ["recorded"], "reconcile-pending");
+      await authority.transitionExact(replyReceiptId, "monitor-action", exactReplyResponse, ["reconcile-pending"], "consumed");
 
       let strandResolve = true;
       ActionReceiptAuthority.prototype.completeMutationOutcome = async function (...args) {
@@ -1331,6 +1549,23 @@ describe("Custom GPT action bridge", () => {
       expect(JSON.stringify(replayedResolve)).toBe(JSON.stringify(recovered));
       expect(await resolveMutationCount("THREAD_CURRENT")).toBe(1);
 
+      const errorReply = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
+        ...baseInput,
+        idempotencyKey: "idem-resolve-error-reply",
+        eventId: "event-resolve-error-reply",
+        operation: "post_reply",
+        body: "Reply before GraphQL error",
+        triggerId: "2",
+        threadId: "THREAD_GRAPHQL_ERROR",
+      })).then((response) => response.json() as Promise<Record<string, unknown>>);
+      expect(errorReply.ok).toBe(true);
+      const errorReplyReceiptId = String((errorReply.structuredContent as Record<string, unknown>).receiptId);
+      replyReceiptIds.set("THREAD_GRAPHQL_ERROR", errorReplyReceiptId);
+      const exactErrorReply = (await authority.exactById(errorReplyReceiptId, "monitor-action", ["issued"])).response;
+      await authority.transitionExact(errorReplyReceiptId, "monitor-action", exactErrorReply, ["issued"], "record-pending");
+      await authority.transitionExact(errorReplyReceiptId, "monitor-action", exactErrorReply, ["record-pending"], "recorded");
+      await authority.transitionExact(errorReplyReceiptId, "monitor-action", exactErrorReply, ["recorded"], "reconcile-pending");
+      await authority.transitionExact(errorReplyReceiptId, "monitor-action", exactErrorReply, ["reconcile-pending"], "consumed");
       const strandedHead = await mutate("head", "THREAD_GRAPHQL_ERROR");
       expect(strandedHead.ok).toBe(false);
       expect(strandedHead.structuredContent.error).toContain("GraphQL errors");
@@ -1353,7 +1588,7 @@ describe("Custom GPT action bridge", () => {
       expect(noUniqueThread.ok).toBe(false);
       expect(noUniqueThread.structuredContent).toMatchObject({
         code: "APPROVAL_REQUIRED",
-        error: expect.stringContaining("Pending resolve intent has no unique exact thread evidence"),
+        error: expect.stringContaining("Resolve trigger thread is missing or ambiguous"),
       });
       expect(await resolveMutationCount("THREAD_GRAPHQL_ERROR")).toBe(2);
     } finally {
@@ -1400,12 +1635,12 @@ describe("Custom GPT action bridge", () => {
           remoteObject?: { id?: string; reviewer?: string };
         };
       }> => {
-        const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", {
+        const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput({
           ...baseInput,
           idempotencyKey: `idem-reviewer-${suffix}`,
           eventId: `event-reviewer-${suffix}`,
           reviewer,
-        });
+        }));
         return response.json() as Promise<{
           ok: boolean;
           text?: string;
@@ -1548,7 +1783,8 @@ describe("Custom GPT action bridge", () => {
           command,
           input: JSON.stringify({ ...extra, receipt }),
         });
-        return (await response.json()) as Record<string, unknown>;
+        const body = (await response.json()) as Record<string, unknown>;
+        return body;
       }
       const snapshot = ((readReceipt.structuredContent as Record<string, unknown>).prs as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
       const planInput = {
@@ -1587,7 +1823,7 @@ describe("Custom GPT action bridge", () => {
         rewrite(altered);
         const rejected = await state("ingest", altered);
         expect(rejected.ok, label).toBe(false);
-        expect((rejected.structuredContent as Record<string, unknown>).code, label).toBe("APPROVAL_REQUIRED");
+        expect((rejected.structuredContent as Record<string, unknown>).code, label).toMatch(/^(APPROVAL_REQUIRED|INVALID_INPUT)$/);
       }
 
       expect((await state("ingest", readReceipt, "plan-transplanted")).ok).toBe(false);
@@ -1634,11 +1870,12 @@ describe("Custom GPT action bridge", () => {
         eventId: "event-mutate-receipt",
         operation: "post_reply",
         body: "Receipt-bound reply",
+        threadId: "THREAD_CURRENT",
       };
       await establishAuthoritativeMonitorPlan(server.baseUrl, identity);
-      const prepareResponse = await postAction(server.baseUrl, "/actions/github-pr-monitor-prepare", prepareInput);
+      const prepareResponse = await postAction(server.baseUrl, "/actions/github-pr-monitor-prepare", authorizedMonitorInput(prepareInput));
       const prepareReceipt = (await prepareResponse.json()) as Record<string, unknown>;
-      const mutateResponse = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", mutateInput);
+      const mutateResponse = await postAction(server.baseUrl, "/actions/github-pr-monitor-mutate", authorizedMonitorInput(mutateInput));
       const mutateReceipt = (await mutateResponse.json()) as Record<string, unknown>;
 
       expect(prepareReceipt.ok).toBe(true);
@@ -1662,7 +1899,7 @@ describe("Custom GPT action bridge", () => {
           structuredContent: { code?: string };
         };
         expect(body.ok, label).toBe(false);
-        expect(body.structuredContent.code, label).toBe("APPROVAL_REQUIRED");
+        expect(body.structuredContent.code, label).toMatch(/^(APPROVAL_REQUIRED|INVALID_INPUT)$/);
       }
 
       function adversarialValue(current: unknown): unknown {
@@ -2444,16 +2681,32 @@ describe("Custom GPT action bridge", () => {
       return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
     };
     const binding = (suffix: string): MutationOutcomeBinding => {
-      const claim = {
+      const input = {
         runId: `run-lock-${suffix}`,
         actionPlanId: `plan-lock-${suffix}`,
         idempotencyKey: `idem-lock-${suffix}`,
+        eventId: `event-lock-${suffix}`,
         repository: "Yeachan-Heo/gajae-code" as const,
+        author: "twoimo" as const,
         prNumber: 7,
-        headSha: "0123456789abcdef0123456789abcdef01234567",
-        phase: "mutate" as const,
+        expectedHeadSha: "0123456789abcdef0123456789abcdef01234567",
         operation: "post_reply" as const,
-        operationFields: { body: `reply-${suffix}` },
+        body: `reply-${suffix}`,
+        threadId: `THREAD_${suffix.toUpperCase()}`,
+      };
+      const authorization = monitorAuthorization(input, "post_reply");
+      const authorizedInput = { ...input, ...authorization };
+      const claim = {
+        runId: input.runId,
+        actionPlanId: input.actionPlanId,
+        idempotencyKey: input.idempotencyKey,
+        repository: input.repository,
+        prNumber: input.prNumber,
+        headSha: input.expectedHeadSha,
+        phase: "mutate" as const,
+        operation: input.operation,
+        operationFields: { body: input.body, threadId: input.threadId },
+        ...authorization,
       };
       return {
         runId: claim.runId,
@@ -2463,25 +2716,15 @@ describe("Custom GPT action bridge", () => {
         claimId: `claim-lock-${suffix}`,
         claimPayloadDigest: createHash("sha256").update(canonical(claim)).digest("hex"),
         repository: claim.repository,
-        author: "twoimo",
+        author: input.author,
         prNumber: claim.prNumber,
         expectedHeadSha: claim.headSha,
-        eventId: `event-lock-${suffix}`,
+        eventId: input.eventId,
         phase: claim.phase,
         operation: claim.operation,
         operationFields: claim.operationFields,
-        input: {
-          runId: claim.runId,
-          actionPlanId: claim.actionPlanId,
-          idempotencyKey: claim.idempotencyKey,
-          eventId: `event-lock-${suffix}`,
-          repository: claim.repository,
-          author: "twoimo",
-          prNumber: claim.prNumber,
-          expectedHeadSha: claim.headSha,
-          operation: claim.operation,
-          body: `reply-${suffix}`,
-        },
+        input: authorizedInput,
+        authorization,
       };
     };
 

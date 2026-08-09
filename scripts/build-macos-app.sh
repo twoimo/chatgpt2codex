@@ -163,6 +163,24 @@ cp "$ROOT/assets/chatgpt2codex-icon.png" "$RESOURCES_DIR/chatgpt2codex-icon.png"
 
 cp -R "$ROOT/dist" "$RUNTIME_DIR/dist"
 find "$RUNTIME_DIR/dist" -name '*.map' -type f -delete
+verify_runtime_dist_parity() {
+  local source_file relative_path bundled_file
+  while IFS= read -r -d '' source_file; do
+    case "$source_file" in
+      *.map) continue ;;
+    esac
+    relative_path="${source_file#"$ROOT/dist/"}"
+    bundled_file="$RUNTIME_DIR/dist/$relative_path"
+    [[ -f "$bundled_file" ]] || { echo "error: packaged dist is missing $relative_path" >&2; return 1; }
+    cmp -s "$source_file" "$bundled_file" || { echo "error: packaged dist differs at $relative_path" >&2; return 1; }
+  done < <(find "$ROOT/dist" -type f -print0)
+  while IFS= read -r -d '' bundled_file; do
+    relative_path="${bundled_file#"$RUNTIME_DIR/dist/"}"
+    [[ "$relative_path" == *.map ]] && continue
+    [[ -f "$ROOT/dist/$relative_path" ]] || { echo "error: packaged dist contains unexpected $relative_path" >&2; return 1; }
+  done < <(find "$RUNTIME_DIR/dist" -type f -print0)
+}
+verify_runtime_dist_parity
 cp "$ROOT/package.json" "$RUNTIME_DIR/package.json"
 cp "$ROOT/package-lock.json" "$RUNTIME_DIR/package-lock.json"
 cp "$ROOT/start-chatgpt.sh" "$RUNTIME_DIR/start-chatgpt.sh"

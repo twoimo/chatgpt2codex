@@ -15,24 +15,9 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
-import { findProject, scanWorkspace } from "./workspace/registry.js";
-import { makeLease } from "./workspace/project-select.js";
-import { Store } from "./state/store.js";
-import { Ledger } from "./state/ledger.js";
-import { createServer } from "./server/mcp-server.js";
-import { createHttpServer, defaultHttpServerConfig } from "./server/http.js";
-import { generateOwnerToken, hasOwnerToken, storeOwnerToken } from "./auth/owner-token.js";
-import { JsonOAuthStore } from "./auth/oauth-store.js";
-import { checkIntakeAvailability } from "./assets/image-intake.js";
-import { controlAllowlist, isAppAllowed, isControlEnabled, isSensitiveApp } from "./control/policy.js";
-import { startExecutor } from "./control/executor.js";
-import { approveAction, isKilled, listActions, rejectAction, setKill, toSummary } from "./control/queue.js";
-import { preflightPermissions } from "./control/mac-input.js";
-import { clampMinutes, clearAuto, readAuto, setAuto, type AutoActionKind } from "./control/auto.js";
-import { createDirectActionClient, isDirectMonitorTool } from "./server/direct-action-client.js";
-import { runDirectMonitorCycle } from "./server/direct-monitor-cycle.js";
+import type { MonitorRollout } from "./server/direct-monitor-orchestrator.js";
+import type { AutoActionKind } from "./control/auto.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -82,6 +67,11 @@ function defaultConfig(workspaceRoot: string, stateDir: string): Config {
 }
 
 async function buildToolContext(workspace: string): Promise<ToolContext> {
+  const [{ scanWorkspace }, { Store }, { Ledger }] = await Promise.all([
+    import("./workspace/registry.js"),
+    import("./state/store.js"),
+    import("./state/ledger.js"),
+  ]);
   const workspaceRoot = path.resolve(workspace);
   const stateDir = defaultStateDir();
 
@@ -122,6 +112,10 @@ function parseLeasePreset(value: string | boolean | undefined): LeasePreset {
 }
 
 async function applyStartupProjectSelection(ctx: ToolContext, flags: Record<string, string | boolean>): Promise<void> {
+  const [{ findProject }, { makeLease }] = await Promise.all([
+    import("./workspace/registry.js"),
+    import("./workspace/project-select.js"),
+  ]);
   const activeProject = typeof flags["active-project"] === "string" ? flags["active-project"] : undefined;
   const activeProjectRoot =
     typeof flags["active-project-root"] === "string" ? path.resolve(flags["active-project-root"]) : undefined;
@@ -155,6 +149,12 @@ async function applyStartupProjectSelection(ctx: ToolContext, flags: Record<stri
 }
 
 async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<void> {
+  const [{ StdioServerTransport }, { isControlEnabled }, { startExecutor }, { createServer }] = await Promise.all([
+    import("@modelcontextprotocol/sdk/server/stdio.js"),
+    import("./control/policy.js"),
+    import("./control/executor.js"),
+    import("./server/mcp-server.js"),
+  ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const ctx = await buildToolContext(workspace);
   await applyStartupProjectSelection(ctx, flags);
@@ -173,6 +173,13 @@ async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<v
  * OAuth 2.1 (see src/server/http.ts, src/auth/oauth-provider.ts).
  */
 async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<void> {
+  const [{ hasOwnerToken }, { isControlEnabled }, { startExecutor }, { createHttpServer, defaultHttpServerConfig }] =
+    await Promise.all([
+      import("./auth/owner-token.js"),
+      import("./control/policy.js"),
+      import("./control/executor.js"),
+      import("./server/http.js"),
+    ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const ctx = await buildToolContext(workspace);
 
@@ -196,7 +203,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   await applyStartupProjectSelection(ctx, flags);
   if (isControlEnabled()) startExecutor(ctx);
 
-  let httpServer: ReturnType<ReturnType<typeof createHttpServer>["app"]["listen"]> | undefined;
+  let httpServer: { close(callback?: () => void): unknown } | undefined;
   let closeHttpServer: () => void = () => undefined;
   let shuttingDown = false;
   const shutdown = (exitCode = 0) => {
@@ -253,6 +260,13 @@ async function cmdServe(flags: Record<string, string | boolean>): Promise<void> 
 }
 
 async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
+  const [{ scanWorkspace }, { Store }, { Ledger }, { generateOwnerToken, hasOwnerToken, storeOwnerToken }] =
+    await Promise.all([
+      import("./workspace/registry.js"),
+      import("./state/store.js"),
+      import("./state/ledger.js"),
+      import("./auth/owner-token.js"),
+    ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const workspaceRoot = path.resolve(workspace);
   const stateDir = defaultStateDir();
@@ -304,6 +318,10 @@ async function readStdin(): Promise<string> {
 }
 
 async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<void> {
+  const [{ generateOwnerToken, hasOwnerToken, storeOwnerToken }, { JsonOAuthStore }] = await Promise.all([
+    import("./auth/owner-token.js"),
+    import("./auth/oauth-store.js"),
+  ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const stateDir = defaultStateDir();
 
@@ -333,10 +351,11 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
   process.exitCode = 1;
 }
 async function cmdDirectAction(positional: string[], flags: Record<string, string | boolean>): Promise<void> {
+  const { createDirectActionClient, isDirectMonitorTool } = await import("./server/direct-action-client.js");
   const tool = positional[0];
   if (!tool || positional.length !== 1 || !isDirectMonitorTool(tool)) {
     throw new Error(
-      "usage: chatgpt2codex direct-action <github_pr_monitor_read|github_pr_monitor_state|github_pr_monitor_prepare|github_pr_monitor_mutate> [--workspace <path>]",
+      "usage: chatgpt2codex direct-action <github_pr_monitor_read|github_pr_monitor_state|github_pr_monitor_prepare|github_pr_monitor_execute|github_pr_monitor_mutate> [--workspace <path>]",
     );
   }
 
@@ -363,16 +382,51 @@ async function cmdDirectAction(positional: string[], flags: Record<string, strin
     await client.close();
   }
 }
+function monitorRollout(flags: Record<string, string | boolean>): MonitorRollout {
+  const value = typeof flags.rollout === "string" ? flags.rollout : process.env.CHATGPT2CODEX_MONITOR_ROLLOUT ?? "off";
+  if (value !== "off" && value !== "shadow" && value !== "prepare" && value !== "enabled") {
+    throw new Error("direct-monitor-cycle --rollout must be off, shadow, prepare, or enabled");
+  }
+  return value;
+}
+function monitorOciImage(flags: Record<string, string | boolean>): string | undefined {
+  const flag = flags["oci-image"];
+  if (flag === true) throw new Error("direct-monitor-cycle --oci-image requires a sha256 digest");
+  const value = typeof flag === "string" ? flag : process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
+  if (value !== undefined && !/^sha256:[0-9a-f]{64}$/u.test(value)) {
+    throw new Error("direct-monitor-cycle --oci-image must be a pinned sha256 digest");
+  }
+  return value;
+}
+
 
 async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const ctx = await buildToolContext(workspace);
-  const client = await createDirectActionClient(ctx);
+  const rollout = monitorRollout(flags);
+  const sandboxImageDigest = monitorOciImage(flags);
+  const previousRollout = process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+  const previousImage = process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
+  process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = rollout;
+  if (sandboxImageDigest === undefined) delete process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
+  else process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE = sandboxImageDigest;
   try {
-    const result = await runDirectMonitorCycle(client);
-    console.log(JSON.stringify(result));
+    const [{ createDirectActionClient }, { runDirectMonitorCycle }] = await Promise.all([
+      import("./server/direct-action-client.js"),
+      import("./server/direct-monitor-cycle.js"),
+    ]);
+    const ctx = await buildToolContext(workspace);
+    const client = await createDirectActionClient(ctx);
+    try {
+      const result = await runDirectMonitorCycle(client, {}, { rollout });
+      console.log(JSON.stringify(result));
+    } finally {
+      await client.close();
+    }
   } finally {
-    await client.close();
+    if (previousRollout === undefined) delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+    else process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = previousRollout;
+    if (previousImage === undefined) delete process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
+    else process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE = previousImage;
   }
 }
 
@@ -390,6 +444,17 @@ async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): P
  * HTTP route that calls approveAction, setKill, or setAuto.
  */
 async function cmdControl(positional: string[], flags: Record<string, string | boolean> = {}): Promise<void> {
+  const [
+    { approveAction, isKilled, listActions, rejectAction, setKill, toSummary },
+    { controlAllowlist, isAppAllowed, isControlEnabled, isSensitiveApp },
+    { preflightPermissions },
+    { clampMinutes, clearAuto, readAuto, setAuto },
+  ] = await Promise.all([
+    import("./control/queue.js"),
+    import("./control/policy.js"),
+    import("./control/mac-input.js"),
+    import("./control/auto.js"),
+  ]);
   const stateDir = defaultStateDir();
   const [sub, actionId] = positional;
   switch (sub) {
@@ -570,6 +635,10 @@ async function checkCommand(cmd: string, args: string[]): Promise<string | undef
 }
 
 async function cmdDoctor(): Promise<void> {
+  const [{ hasOwnerToken }, { checkIntakeAvailability }] = await Promise.all([
+    import("./auth/owner-token.js"),
+    import("./assets/image-intake.js"),
+  ]);
   const nodeVersion = process.version;
   const rgVersion = await checkCommand("rg", ["--version"]);
   const gitVersion = await checkCommand("git", ["--version"]);
@@ -640,7 +709,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|direct-monitor-cycle> [--workspace <path>] [--rollout <off|shadow|prepare|enabled>] [--oci-image <sha256:digest>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }
