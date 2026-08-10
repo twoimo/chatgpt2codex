@@ -172,7 +172,7 @@ function pageInfo(value: unknown, invalidCode: MonitorErrorCode = "GITHUB_MONITO
     if (!isSafeCursor(value.endCursor)) failure(invalidCode);
     return { hasNextPage: true, endCursor: value.endCursor };
   }
-  if (value.endCursor !== null && value.endCursor !== undefined) failure(invalidCode);
+  if (value.endCursor !== null && value.endCursor !== undefined && !isSafeCursor(value.endCursor)) failure(invalidCode);
   return { hasNextPage: false, endCursor: null };
 }
 function rootCheck(value: unknown, candidate: Candidate): Record<string, unknown> {

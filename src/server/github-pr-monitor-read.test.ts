@@ -384,8 +384,8 @@ describe("github PR monitor read", () => {
     const result = await runGithubPrMonitorRead(INPUT, { gh, deadlineMs: 2_000 });
     expect(result).toMatchObject({ ok: false, code: "GITHUB_MONITOR_DISCOVERY_INVALID" });
   });
-  it("accepts null and absent terminal cursors when no page follows", async () => {
-    for (const endCursor of [null, undefined]) {
+  it("accepts null, absent, and safe terminal cursors when no page follows", async () => {
+    for (const endCursor of [null, undefined, "terminal-cursor"]) {
       const fake = makeFakeGh({ singleCandidate: true });
       const gh: GhCommand = async (args, options) => {
         const result = await fake.gh(args, options);
@@ -399,18 +399,6 @@ describe("github PR monitor read", () => {
       const result = await runGithubPrMonitorRead(INPUT, { gh, now: () => NOW, nonce: () => "fixed-nonce", deadlineMs: 2_000 });
       expect(result.ok).toBe(true);
     }
-  });
-  it("rejects any terminal cursor when no page follows", async () => {
-    const fake = makeFakeGh({ singleCandidate: true });
-    const gh: GhCommand = async (args, options) => {
-      const result = await fake.gh(args, options);
-      if (arg(args, "query") !== SEARCH_QUERY) return result;
-      const parsed = JSON.parse(typeof result === "string" ? result : result.stdout) as { data: { search: Record<string, unknown> } };
-      parsed.data.search.pageInfo = { hasNextPage: false, endCursor: "terminal-cursor" };
-      return stdout(parsed);
-    };
-    const result = await runGithubPrMonitorRead(INPUT, { gh, deadlineMs: 2_000 });
-    expect(result).toMatchObject({ ok: false, code: "GITHUB_MONITOR_DISCOVERY_INVALID" });
   });
 
   it("rejects unsafe terminal cursors even when no page follows", async () => {

@@ -487,24 +487,24 @@ export const REVIEWS_QUERY = `query PullRequestReviews($owner:String!,$repo:Stri
 export const COMMENTS_QUERY = `query PullRequestComments($owner:String!,$repo:String!,$number:Int!,$after:String) {
   repository(owner:$owner,name:$repo) { id nameWithOwner pullRequest(number:$number) {
     author { login __typename }
-    comments(first:100,after:$after) { nodes { id body author { login __typename } authorAssociation } pageInfo { hasNextPage endCursor }
+    comments(first:100,after:$after) { nodes { id body author { login __typename } authorAssociation } pageInfo { hasNextPage endCursor } }
   }}
 }`;
 /* Keep the owner/name argument spelling in the emitted query stable. */
 export const LATEST_REVIEWS_QUERY = `query PullRequestLatestReviews($owner:String!,$repo:String!,$number:Int!,$after:String) {
   repository(owner:$owner,name:$repo) { id nameWithOwner pullRequest(number:$number) {
     author { login __typename }
-    latestReviews(first:100,after:$after) { nodes { id body author { login __typename } authorAssociation state } pageInfo { hasNextPage endCursor }
+    latestReviews(first:100,after:$after) { nodes { id body author { login __typename } authorAssociation state } pageInfo { hasNextPage endCursor } }
   }}
 }`;
 export const REVIEW_THREADS_QUERY = `query PullRequestReviewThreads($owner:String!,$repo:String!,$number:Int!,$after:String) {
   repository(owner:$owner,name:$repo) { id nameWithOwner pullRequest(number:$number) {
-    reviewThreads(first:100,after:$after) { nodes { id isResolved isOutdated } pageInfo { hasNextPage endCursor }
+    reviewThreads(first:100,after:$after) { nodes { id isResolved isOutdated } pageInfo { hasNextPage endCursor } }
   }}
 }`;
 export const THREAD_COMMENTS_QUERY = `query PullRequestReviewThreadComments($threadId:ID!,$after:String) {
   node(id:$threadId) { __typename ... on PullRequestReviewThread { id isResolved isOutdated
-    comments(first:100,after:$after) { nodes { id body author { login __typename } authorAssociation path line startLine outdated commit { oid } } pageInfo { hasNextPage endCursor }
+    comments(first:100,after:$after) { nodes { id body author { login __typename } authorAssociation path line startLine outdated commit { oid } } pageInfo { hasNextPage endCursor } }
   }}
 }`;
 export const SEARCH_OPEN_PULL_REQUESTS_QUERY = SEARCH_QUERY;
