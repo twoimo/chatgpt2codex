@@ -131,10 +131,20 @@ GPT editor, configure Bearer authentication with the Owner Token, and save the
 GPT. Use the exact public origin reported by the running app or server; temporary
 tunnel hostnames must be re-imported after they change.
 
-On macOS, **Read-only ChatGPT MCP tools** is an optional remote-only
-least-privilege mode. When enabled, remote clients see only tools annotated as
-read-only, and hidden write/control tools are also denied when called directly.
-It does not change the default full tool catalog or local sessions.
+On macOS, **Read-only ChatGPT MCP tools** is available only in the exact
+monitor mode `CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor`. In that mode the
+remote MCP server exposes the authenticated-account GitHub PR read operation
+only; hidden write/control tools are not registered and cannot be called.
+Authenticate GitHub locally first with `gh auth login`. The monitor reads open
+PRs authored by, or directly requesting review from, the authenticated account
+across visible repositories, with bounded discovery/snapshot output and
+redacted review/check metadata. It does not comment, edit, commit, push, or run
+monitor state, migration, or reconciliation operations.
+The monitor caps each discovery list at 1,000 issues, limits child feedback pages and
+thread comments, and reports `complete: false` whenever a PR closes or a reviewer
+request changes during the read. Repository keys are canonical lowercase
+`owner/name` values. Unknown or deleted GitHub actors are represented explicitly
+and are never treated as authenticated users.
 
 Interactive Custom GPT conversations can invoke Actions. In current ChatGPT
 scheduled tasks, the scheduled conversation may not inherit the Custom GPT's

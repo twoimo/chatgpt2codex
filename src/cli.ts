@@ -16,10 +16,21 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
-import type { MonitorRollout } from "./server/direct-monitor-orchestrator.js";
 import type { AutoActionKind } from "./control/auto.js";
 
 const execFileAsync = promisify(execFile);
+const MAX_DIRECT_ACTION_INPUT_BYTES = 256 * 1024;
+const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
+type ActionsMode = "general" | "github-pr-monitor";
+
+function configuredActionsMode(): ActionsMode {
+  const raw = process.env[ACTIONS_MODE_ENV];
+  if (raw === undefined) return "general";
+  const mode = raw.trim().toLowerCase();
+  if (mode === "" || mode === "general") return "general";
+  if (mode === "github-pr-monitor") return "github-pr-monitor";
+  throw new Error(`${ACTIONS_MODE_ENV} must be either "general" or "github-pr-monitor".`);
+}
 
 interface ParsedArgs {
   command: string | undefined;
@@ -63,6 +74,25 @@ function defaultConfig(workspaceRoot: string, stateDir: string): Config {
     maxPatchBytes: 10 * 1024 * 1024,
     defaultCommandTimeoutSec: 30,
     defaultLeaseTtlMs: 30 * 60 * 1000,
+  };
+}
+
+function buildReadOnlyMonitorContext(workspace: string): ToolContext {
+  const workspaceRoot = path.resolve(workspace);
+  const stateDir = defaultStateDir();
+
+  return {
+    workspaceRoot,
+    stateDir,
+    registry: [],
+    ledger: { append: async () => undefined },
+    store: {
+      loadProjects: async () => [],
+      saveProjects: async () => undefined,
+      getSession: async () => null,
+      setSession: async () => undefined,
+    },
+    config: defaultConfig(workspaceRoot, stateDir),
   };
 }
 
@@ -147,19 +177,22 @@ async function applyStartupProjectSelection(ctx: ToolContext, flags: Record<stri
     preset,
   });
 }
-
-async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<void> {
-  const [{ StdioServerTransport }, { isControlEnabled }, { startExecutor }, { createServer }] = await Promise.all([
-    import("@modelcontextprotocol/sdk/server/stdio.js"),
-    import("./control/policy.js"),
-    import("./control/executor.js"),
-    import("./server/mcp-server.js"),
-  ]);
+async function cmdServeStdio(flags: Record<string, string | boolean>, actionsMode: ActionsMode): Promise<void> {
+  const [{ StdioServerTransport }, { isControlEnabled }, { startExecutor }, { createServer, createMonitorServer }] =
+    await Promise.all([
+      import("@modelcontextprotocol/sdk/server/stdio.js"),
+      import("./control/policy.js"),
+      import("./control/executor.js"),
+      import("./server/mcp-server.js"),
+    ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const ctx = await buildToolContext(workspace);
-  await applyStartupProjectSelection(ctx, flags);
-  if (isControlEnabled()) startExecutor(ctx);
-  const server = await createServer(ctx);
+  const monitorMode = actionsMode === "github-pr-monitor";
+  const ctx = monitorMode ? buildReadOnlyMonitorContext(workspace) : await buildToolContext(workspace);
+  if (!monitorMode) {
+    await applyStartupProjectSelection(ctx, flags);
+    if (isControlEnabled()) startExecutor(ctx);
+  }
+  const server = monitorMode ? await createMonitorServer(ctx) : await createServer(ctx);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot });
@@ -172,16 +205,17 @@ async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<v
  * catalog as stdio mode over a Streamable HTTP `/mcp` endpoint, gated by
  * OAuth 2.1 (see src/server/http.ts, src/auth/oauth-provider.ts).
  */
-async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<void> {
-  const [{ hasOwnerToken }, { isControlEnabled }, { startExecutor }, { createHttpServer, defaultHttpServerConfig }] =
-    await Promise.all([
-      import("./auth/owner-token.js"),
-      import("./control/policy.js"),
-      import("./control/executor.js"),
-      import("./server/http.js"),
-    ]);
+async function cmdServeHttp(
+  flags: Record<string, string | boolean>,
+  actionsMode: ActionsMode,
+): Promise<void> {
+  const [{ hasOwnerToken }, { createHttpServer, defaultHttpServerConfig }] = await Promise.all([
+    import("./auth/owner-token.js"),
+    import("./server/http.js"),
+  ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const ctx = await buildToolContext(workspace);
+  const monitorMode = actionsMode === "github-pr-monitor";
+  const ctx = monitorMode ? buildReadOnlyMonitorContext(workspace) : await buildToolContext(workspace);
 
   if (!(await hasOwnerToken(ctx.stateDir))) {
     console.error(
@@ -200,8 +234,14 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
     typeof flags["idle-shutdown-minutes"] === "string" ? Number.parseFloat(flags["idle-shutdown-minutes"]) : 0;
   const idleShutdownMs =
     Number.isFinite(idleShutdownMinutes) && idleShutdownMinutes > 0 ? idleShutdownMinutes * 60 * 1000 : undefined;
-  await applyStartupProjectSelection(ctx, flags);
-  if (isControlEnabled()) startExecutor(ctx);
+  if (!monitorMode) {
+    const [{ isControlEnabled }, { startExecutor }] = await Promise.all([
+      import("./control/policy.js"),
+      import("./control/executor.js"),
+    ]);
+    await applyStartupProjectSelection(ctx, flags);
+    if (isControlEnabled()) startExecutor(ctx);
+  }
 
   let httpServer: { close(callback?: () => void): unknown } | undefined;
   let closeHttpServer: () => void = () => undefined;
@@ -240,7 +280,9 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
     }
   });
 
-  await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot, transport: "http" });
+  if (!monitorMode) {
+    await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot, transport: "http" });
+  }
 
   process.once("SIGINT", () => shutdown(130));
   process.once("SIGTERM", () => shutdown(143));
@@ -252,11 +294,12 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
 }
 
 async function cmdServe(flags: Record<string, string | boolean>): Promise<void> {
+  const actionsMode = configuredActionsMode();
   if (flags.http) {
-    await cmdServeHttp(flags);
+    await cmdServeHttp(flags, actionsMode);
     return;
   }
-  await cmdServeStdio(flags);
+  await cmdServeStdio(flags, actionsMode);
 }
 
 async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
@@ -305,14 +348,25 @@ async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
   }
 }
 
-async function readStdin(): Promise<string> {
+async function readStdin(maxBytes = Number.POSITIVE_INFINITY): Promise<string> {
   return await new Promise((resolve, reject) => {
     let value = "";
+    let bytes = 0;
+    let oversized = false;
     process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
+    process.stdin.on("data", (chunk: string) => {
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      if (bytes + chunkBytes > maxBytes) {
+        oversized = true;
+        return;
+      }
+      bytes += chunkBytes;
       value += chunk;
     });
-    process.stdin.on("end", () => resolve(value));
+    process.stdin.on("end", () => {
+      if (oversized) reject(new Error("direct-action stdin exceeds the bounded input limit"));
+      else resolve(value);
+    });
     process.stdin.on("error", reject);
   });
 }
@@ -355,11 +409,11 @@ async function cmdDirectAction(positional: string[], flags: Record<string, strin
   const tool = positional[0];
   if (!tool || positional.length !== 1 || !isDirectMonitorTool(tool)) {
     throw new Error(
-      "usage: chatgpt2codex direct-action <github_pr_monitor_read|github_pr_monitor_state|github_pr_monitor_prepare|github_pr_monitor_execute|github_pr_monitor_mutate> [--workspace <path>]",
+      "usage: chatgpt2codex direct-action <github_pr_monitor_read> [--workspace <path>]",
     );
   }
 
-  const raw = (await readStdin()).trim();
+  const raw = (await readStdin(MAX_DIRECT_ACTION_INPUT_BYTES)).trim();
   if (!raw) throw new Error("direct-action requires one JSON object on stdin");
   let parsed: unknown;
   try {
@@ -372,7 +426,8 @@ async function cmdDirectAction(positional: string[], flags: Record<string, strin
   }
 
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const ctx = await buildToolContext(workspace);
+  const ctx = buildReadOnlyMonitorContext(workspace);
+
   const client = await createDirectActionClient(ctx);
   try {
     const response = await client.call(tool, parsed as Record<string, unknown>);
@@ -382,51 +437,19 @@ async function cmdDirectAction(positional: string[], flags: Record<string, strin
     await client.close();
   }
 }
-function monitorRollout(flags: Record<string, string | boolean>): MonitorRollout {
-  const value = typeof flags.rollout === "string" ? flags.rollout : process.env.CHATGPT2CODEX_MONITOR_ROLLOUT ?? "off";
-  if (value !== "off" && value !== "shadow" && value !== "prepare" && value !== "enabled") {
-    throw new Error("direct-monitor-cycle --rollout must be off, shadow, prepare, or enabled");
-  }
-  return value;
-}
-function monitorOciImage(flags: Record<string, string | boolean>): string | undefined {
-  const flag = flags["oci-image"];
-  if (flag === true) throw new Error("direct-monitor-cycle --oci-image requires a sha256 digest");
-  const value = typeof flag === "string" ? flag : process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
-  if (value !== undefined && !/^sha256:[0-9a-f]{64}$/u.test(value)) {
-    throw new Error("direct-monitor-cycle --oci-image must be a pinned sha256 digest");
-  }
-  return value;
-}
-
-
 async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
-  const rollout = monitorRollout(flags);
-  const sandboxImageDigest = monitorOciImage(flags);
-  const previousRollout = process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
-  const previousImage = process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
-  process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = rollout;
-  if (sandboxImageDigest === undefined) delete process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
-  else process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE = sandboxImageDigest;
+  const [{ createDirectActionClient }, { runDirectMonitorCycle }] = await Promise.all([
+    import("./server/direct-action-client.js"),
+    import("./server/direct-monitor-cycle.js"),
+  ]);
+  const ctx = buildReadOnlyMonitorContext(workspace);
+  const client = await createDirectActionClient(ctx);
   try {
-    const [{ createDirectActionClient }, { runDirectMonitorCycle }] = await Promise.all([
-      import("./server/direct-action-client.js"),
-      import("./server/direct-monitor-cycle.js"),
-    ]);
-    const ctx = await buildToolContext(workspace);
-    const client = await createDirectActionClient(ctx);
-    try {
-      const result = await runDirectMonitorCycle(client, {}, { rollout });
-      console.log(JSON.stringify(result));
-    } finally {
-      await client.close();
-    }
+    const result = await runDirectMonitorCycle(client);
+    console.log(JSON.stringify(result));
   } finally {
-    if (previousRollout === undefined) delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
-    else process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = previousRollout;
-    if (previousImage === undefined) delete process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE;
-    else process.env.CHATGPT2CODEX_MONITOR_OCI_IMAGE = previousImage;
+    await client.close();
   }
 }
 
@@ -709,7 +732,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|direct-monitor-cycle> [--workspace <path>] [--rollout <off|shadow|prepare|enabled>] [--oci-image <sha256:digest>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

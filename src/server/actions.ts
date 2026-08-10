@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Express, Request, Response } from "express";
+import type { Express, NextFunction, Request, Response } from "express";
 import { promises as fs } from "node:fs";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
@@ -8,6 +8,18 @@ import { CONTROL_TOOL_NAMES, isControlChatGptExposed } from "../control/policy.j
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
 import { normalizeObjectSchema, safeParseAsync, getParseErrorMessage } from "@modelcontextprotocol/sdk/server/zod-compat.js";
+import {
+  GITHUB_PR_MONITOR_OPENAPI,
+  GithubPrMonitorReadInputSchema,
+  GITHUB_PR_MONITOR_READ_INPUT_JSON_SCHEMA,
+  MAX_TEXT_BYTES,
+  MAX_WIRE_BYTES,
+  safeErrorMessage,
+  validateMonitorError,
+  validateMonitorSuccess,
+  isSafeId,
+} from "./github-pr-monitor-contract.js";
+import { runGithubPrMonitorRead, type GithubPrMonitorReadOptions } from "./github-pr-monitor-read.js";
 
 interface CallToolResultLike {
   content?: Array<{ type?: string; text?: string }>;
@@ -28,21 +40,19 @@ interface ActionRoute {
   description: string;
   schema: string;
 }
+interface MonitorActionContext extends ToolContext {
+  githubPrMonitorReadOptions?: GithubPrMonitorReadOptions;
+}
 type ActionsMode = "general" | "github-pr-monitor";
 
 const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
-const GITHUB_PR_MONITOR_TOOL_NAMES = new Set([
-  "github_pr_monitor_read",
-  "github_pr_monitor_prepare",
-  "github_pr_monitor_execute",
-  "github_pr_monitor_mutate",
-  "github_pr_monitor_state",
-]);
+const GITHUB_PR_MONITOR_TOOL_NAMES = new Set(["github_pr_monitor_read"]);
 
 function configuredActionsMode(): ActionsMode {
   const raw = process.env[ACTIONS_MODE_ENV];
   if (raw === undefined) return "general";
   const mode = raw.trim().toLowerCase();
+  if (mode === "") return "general";
   if (mode === "general" || mode === "github-pr-monitor") return mode;
   throw new Error(`${ACTIONS_MODE_ENV} must be either "general" or "github-pr-monitor".`);
 }
@@ -326,41 +336,10 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/github-pr-monitor-read",
     tool: "github_pr_monitor_read",
     operationId: "github_pr_monitor_read",
-    summary: "Read fixed-repository authored PR state",
-    description: "Read open Yeachan-Heo/gajae-code PR state for the fixed author twoimo.",
+    summary: "Read authenticated-account open PR state",
+    description:
+      "Read-only open pull request snapshots for the authenticated GitHub account, including authored and requested-reviewer roles. This route performs no local state or screenshot-share writes.",
     schema: "GithubPrMonitorReadInput",
-  },
-  {
-    path: "/actions/github-pr-monitor-prepare",
-    tool: "github_pr_monitor_prepare",
-    operationId: "github_pr_monitor_prepare",
-    summary: "Prepare a fixed-repository PR worktree",
-    description: "Create or quarantine the bounded monitor worktree for an authored Yeachan-Heo/gajae-code PR.",
-    schema: "GithubPrMonitorPrepareInput",
-  },
-  {
-    path: "/actions/github-pr-monitor-execute",
-    tool: "github_pr_monitor_execute",
-    operationId: "github_pr_monitor_execute",
-    summary: "Apply and verify exact PR suggestions",
-    description: "Apply exact externally planned suggestions in the prepared worktree, commit with trusted git plumbing, and verify the commit with bun test in pinned OCI.",
-    schema: "GithubPrMonitorExecuteInput",
-  },
-  {
-    path: "/actions/github-pr-monitor-mutate",
-    tool: "github_pr_monitor_mutate",
-    operationId: "github_pr_monitor_mutate",
-    summary: "Apply a bounded authored PR response",
-    description: "Post a reply, resolve a thread, re-request a reviewer, or push a verified prepared worktree for the fixed repository and author.",
-    schema: "GithubPrMonitorMutateInput",
-  },
-  {
-    path: "/actions/github-pr-monitor-state",
-    tool: "github_pr_monitor_state",
-    operationId: "github_pr_monitor_state",
-    summary: "Run a bounded PR-monitor state command",
-    description: "Run one fixed monitor state command. The input property is a JSON object encoded as a string and is decoded before MCP dispatch.",
-    schema: "GithubPrMonitorStateInput",
   },
 ];
 
@@ -385,11 +364,6 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "e2e_open_url_screenshot",
   "repo_status",
   "repo_diff_summary",
-  "github_pr_monitor_read",
-  "github_pr_monitor_prepare",
-  "github_pr_monitor_execute",
-  "github_pr_monitor_mutate",
-  "github_pr_monitor_state",
   "save_chatgpt_image",
   "save_chatgpt_image_from_url",
 ]);
@@ -413,8 +387,8 @@ const GITHUB_PR_MUTATE_OPERATION_FIELDS: Record<string, { allowed: readonly stri
 
 const GITHUB_PR_ACTION_FIELDS: Record<string, { allowed: ReadonlySet<string>; required: ReadonlySet<string> }> = {
   github_pr_monitor_read: {
-    allowed: new Set(["runId", "actionPlanId", "repository", "author", "prNumber"]),
-    required: new Set(["runId", "actionPlanId", "repository", "author"]),
+    allowed: new Set(["runId", "actionPlanId"]),
+    required: new Set(["runId", "actionPlanId"]),
   },
   github_pr_monitor_prepare: {
     allowed: new Set([...GITHUB_PR_MUTATION_COMMON_FIELDS, "headRef"]),
@@ -435,12 +409,23 @@ const GITHUB_PR_ACTION_FIELDS: Record<string, { allowed: ReadonlySet<string>; re
 };
 
 function openApiActionRoutes(mode: ActionsMode): ActionRoute[] {
-  return ACTION_ROUTES.filter(
-    (route) =>
-      OPENAPI_ACTION_TOOL_NAMES.has(route.tool) &&
-      (mode === "general" || GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool)),
+  if (mode === "github-pr-monitor") {
+    return ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool));
+  }
+  return ACTION_ROUTES.filter((route) =>
+    OPENAPI_ACTION_TOOL_NAMES.has(route.tool) && !GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool),
   );
 }
+const MONITOR_OPENAPI_SCHEMA_NAMES = new Set([
+  "ActionToolResponse",
+  "ErrorResponse",
+  "GithubPrMonitorErrorResult",
+  "GithubPrMonitorReadInput",
+  "GithubPrMonitorReadResult",
+  "HealthResponse",
+  "ToolAvailabilityGate",
+  "ToolCallProof",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -490,6 +475,14 @@ function actionToolCallExact(value: unknown, tool: string, ok: boolean, input: R
 function actionInput(body: unknown): Record<string, unknown> {
   if (!isRecord(body)) return {};
   return isRecord(body.input) ? body.input : body;
+}
+function safeMonitorActionInput(body: unknown): Record<string, unknown> {
+  const raw = isRecord(body) ? body : {};
+  const parsed = GithubPrMonitorReadInputSchema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+  const runId = raw.runId;
+  const actionPlanId = raw.actionPlanId;
+  return isSafeId(runId) && isSafeId(actionPlanId) ? { runId, actionPlanId } : {};
 }
 
 function actionInputForRoute(route: ActionRoute, body: unknown): Record<string, unknown> {
@@ -568,6 +561,10 @@ function strictGithubPrActionInput(
     }
   }
 
+  if (route.tool === "github_pr_monitor_read") {
+    const parsed = GithubPrMonitorReadInputSchema.safeParse(body);
+    if (!parsed.success) return { error: invalidActionInput(route.tool, getParseErrorMessage(parsed.error)) };
+  }
   const input = { ...body };
   if (route.tool === "github_pr_monitor_state" && input.input !== undefined) {
     if (typeof input.input !== "string") {
@@ -633,7 +630,7 @@ function validateMonitorEvidenceEnvelope(command: string, input: Record<string, 
     || structured.schemaVersion !== 4
     || structured.requestDigest !== requestDigest
     || structured.ok !== true
-    || !actionProofExact(structured.chatgpt2codexToolCall, evidence.tool, true)
+    || (evidence.tool !== "github_pr_monitor_read" && !actionProofExact(structured.chatgpt2codexToolCall, evidence.tool, true))
     || typeof structured.receiptId !== "string"
     || !/^[0-9a-f]{64}$/u.test(structured.receiptId)) {
     return `${command} receipt must carry protocolVersion=1, schemaVersion=4, and a bounded receiptId`;
@@ -648,45 +645,8 @@ function validateMonitorEvidenceEnvelope(command: string, input: Record<string, 
     return `${command} receipt exceeds its bounded 256KiB envelope`;
   }
   if (evidence.tool === "github_pr_monitor_read") {
-    const requiredReadKeys = [
-      "chatgpt2codexToolCall", "protocolVersion", "schemaVersion", "requestDigest", "namespace", "tool", "operation", "ok",
-      "runId", "actionPlanId", "repository", "author", "prs", "observedAt", "receiptId",
-    ];
-    if (Object.keys(structured).some((key) => !requiredReadKeys.includes(key))
-      || structured.namespace !== "ChatGPT_To_Codex"
-      || structured.tool !== "github_pr_monitor_read"
-      || structured.operation !== "read"
-      || structured.repository !== "Yeachan-Heo/gajae-code"
-      || structured.author !== "twoimo"
-      || !Array.isArray(structured.prs)
-      || structured.prs.length > 500) {
-      return `${command} read receipt is not the exact fixed-repository envelope`;
-    }
-    for (const snapshotValue of structured.prs) {
-      if (!isRecord(snapshotValue)) return `${command} read receipt contains an invalid PR snapshot`;
-      const snapshotKeys = [
-        "number", "url", "state", "author", "baseRepository", "headRepository", "baseRefName", "baseRefOid",
-        "headRefName", "headRefOid", "reviewRequests", "reviews", "comments", "latestReviews", "statusCheckRollup", "reviewThreads",
-      ];
-      if (Object.keys(snapshotValue).some((key) => !snapshotKeys.includes(key))
-        || Object.hasOwn(snapshotValue, "protocolVersion")
-        || Object.hasOwn(snapshotValue, "schemaVersion")) {
-        return `${command} read receipt contains an unapproved PR snapshot shape`;
-      }
-      const threads = snapshotValue.reviewThreads;
-      if (!isRecord(threads) || Object.keys(threads).some((key) => key !== "nodes") || !Array.isArray(threads.nodes)) {
-        return `${command} read receipt contains an invalid compact thread boundary`;
-      }
-      for (const threadValue of threads.nodes) {
-        if (!isRecord(threadValue)) return `${command} read receipt contains an invalid compact thread`;
-        if (Object.keys(threadValue).some((key) => !["id", "isResolved", "isOutdated", "comments"].includes(key))) {
-          return `${command} read receipt contains an invalid compact thread shape`;
-        }
-        const comments = threadValue.comments;
-        if (!isRecord(comments) || Object.keys(comments).some((key) => key !== "nodes") || !Array.isArray(comments.nodes)) {
-          return `${command} read receipt contains an invalid compact comment boundary`;
-        }
-      }
+    if (!validateMonitorSuccess(structured) && !validateMonitorError(structured)) {
+      return `${command} read receipt is not a valid shared monitor result envelope`;
     }
     return undefined;
   }
@@ -729,6 +689,14 @@ async function callRegisteredTool(
   // tools/list hide in src/server/tools.ts installChatGptToolListHandler.
   if (CONTROL_TOOL_NAMES.has(toolName) && !isControlChatGptExposed()) {
     const message = `Tool ${toolName} is not available through the chatgpt2codex action bridge.`;
+    return {
+      isError: true,
+      structuredContent: { code: "PERMISSION_DENIED", error: message },
+      content: [{ type: "text", text: message }],
+    };
+  }
+  if (toolName.startsWith("github_pr_monitor_")) {
+    const message = `Tool ${toolName} is unavailable through the generic Actions bridge.`;
     return {
       isError: true,
       structuredContent: { code: "PERMISSION_DENIED", error: message },
@@ -788,6 +756,98 @@ async function callRegisteredTool(
   }
   return handler(input);
 }
+async function callGithubPrMonitorRead(
+  input: Record<string, unknown>,
+  options: GithubPrMonitorReadOptions,
+): Promise<CallToolResultLike> {
+  const result = await runGithubPrMonitorRead(input, options);
+  return {
+    isError: result.ok !== true,
+    structuredContent: result as unknown as Record<string, unknown>,
+    content: [{ type: "text", text: result.ok ? "Read authenticated-account open PR state." : "error" in result ? result.error : safeErrorMessage("GITHUB_MONITOR_UNAVAILABLE") }],
+  };
+}
+
+function boundedUtf8Text(value: string, maxBytes = MAX_TEXT_BYTES): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let bounded = Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8");
+  while (bounded.length > 0 && Buffer.byteLength(bounded, "utf8") > maxBytes) {
+    bounded = bounded.slice(0, -1);
+  }
+  return bounded;
+}
+
+function encodedActionResponseBytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function monitorOutputLimitResult(input: Record<string, unknown>): CallToolResultLike {
+  const parsed = GithubPrMonitorReadInputSchema.safeParse(input);
+  const safeInput = parsed.success ? parsed.data : undefined;
+  const requestDigest = actionRequestDigest(safeInput ?? {});
+  return {
+    isError: true,
+    structuredContent: {
+      monitorPayloadVersion: 1,
+      protocolVersion: 1,
+      schemaVersion: 4,
+      requestDigest,
+      namespace: "ChatGPT_To_Codex",
+      tool: "github_pr_monitor_read",
+      operation: "read",
+      ok: false,
+      ...(safeInput ?? {}),
+      code: "GITHUB_MONITOR_OUTPUT_LIMIT",
+      error: safeErrorMessage("GITHUB_MONITOR_OUTPUT_LIMIT"),
+      chatgpt2codexToolCall: {
+        namespace: "ChatGPT_To_Codex",
+        toolName: "github_pr_monitor_read",
+        ...(safeInput ? { input: safeInput } : {}),
+        ok: false,
+      },
+    },
+    content: [{ type: "text", text: safeErrorMessage("GITHUB_MONITOR_OUTPUT_LIMIT") }],
+  };
+}
+
+async function boundedActionResponse(
+  ctx: ToolContext,
+  publicOrigin: string,
+  tool: string,
+  toolCallInput: Record<string, unknown>,
+  response: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (encodedActionResponseBytes(response) <= MAX_WIRE_BYTES) return response;
+  if (tool === "github_pr_monitor_read") {
+    const bounded = await actionResponse(
+      ctx,
+      publicOrigin,
+      tool,
+      toolCallInput,
+      monitorOutputLimitResult(toolCallInput),
+    );
+    if (encodedActionResponseBytes(bounded) <= MAX_WIRE_BYTES) return bounded;
+  }
+  return {
+    ok: false,
+    protocolVersion: 1,
+    schemaVersion: 4,
+    requestDigest: actionRequestDigest(toolCallInput),
+    tool,
+    toolCall: {
+      ...toolCallProof(tool, false),
+      toolName: tool,
+      input: {},
+    },
+    text: boundedUtf8Text("Action response exceeded its bounded wire limit."),
+    structuredContent: { code: "OUTPUT_LIMIT", error: "Action response exceeded its bounded wire limit." },
+    isError: true,
+  };
+}
 
 function resultText(result: CallToolResultLike): string {
   return (result.content ?? [])
@@ -841,21 +901,28 @@ async function actionResponse(
   toolCallInput: Record<string, unknown>,
   result: CallToolResultLike,
 ): Promise<Record<string, unknown>> {
-  const enriched = await attachInlineScreenshotShares(ctx, publicOrigin, result.structuredContent ?? {});
+  const monitor = GITHUB_PR_MONITOR_TOOL_NAMES.has(tool);
+  const monitorRead = tool === "github_pr_monitor_read";
+  const enriched = monitorRead
+    ? { value: result.structuredContent ?? {}, markdown: [] as string[] }
+    : await attachInlineScreenshotShares(ctx, publicOrigin, result.structuredContent ?? {});
   const text = resultText(result);
-  const inlineText = enriched.markdown.length > 0 ? `${text}\n\n${enriched.markdown.join("\n")}` : text;
+  const inlineText = boundedUtf8Text(enriched.markdown.length > 0 ? `${text}\n\n${enriched.markdown.join("\n")}` : text);
   const ok = result.isError !== true;
   const requestDigest = actionRequestDigest(toolCallInput);
-  const monitor = GITHUB_PR_MONITOR_TOOL_NAMES.has(tool);
-  const structuredContent = monitor
-    ? {
-        ...(isRecord(enriched.value) ? enriched.value : {}),
-        protocolVersion: 1,
-        schemaVersion: 4,
-        requestDigest,
-        chatgpt2codexToolCall: toolCallProof(tool, ok),
-      }
-    : enriched.value;
+  const structuredValue = isRecord(enriched.value) ? enriched.value : {};
+  const validMonitorRead = monitorRead && (validateMonitorSuccess(structuredValue) || validateMonitorError(structuredValue));
+  const structuredContent = validMonitorRead
+    ? structuredValue
+    : monitor
+      ? {
+          ...structuredValue,
+          protocolVersion: 1,
+          schemaVersion: 4,
+          requestDigest,
+          chatgpt2codexToolCall: toolCallProof(tool, ok),
+        }
+      : enriched.value;
   return {
     ok,
     protocolVersion: 1,
@@ -883,6 +950,28 @@ function chatGptActionDescription(description: string): string {
   if (description.length <= CHATGPT_ACTION_DESCRIPTION_LIMIT) return description;
   return `${description.slice(0, CHATGPT_ACTION_DESCRIPTION_LIMIT - 1).trimEnd()}…`;
 }
+const GITHUB_PR_MONITOR_ACTION_RESPONSE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["ok", "protocolVersion", "schemaVersion", "requestDigest", "tool", "toolCall", "text", "imageMarkdownList", "structuredContent"],
+  properties: {
+    ok: { type: "boolean" },
+    protocolVersion: { type: "integer", const: 1 },
+    schemaVersion: { type: "integer", const: 4 },
+    requestDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    tool: { type: "string", const: "github_pr_monitor_read" },
+    toolCall: { "$ref": "#/components/schemas/ToolCallProof" },
+    text: { type: "string", maxLength: MAX_TEXT_BYTES },
+    imageMarkdownList: { type: "array", maxItems: 0, items: { type: "string" } },
+    structuredContent: {
+      oneOf: [
+        { "$ref": "#/components/schemas/GithubPrMonitorReadResult" },
+        { "$ref": "#/components/schemas/GithubPrMonitorErrorResult" },
+      ],
+    },
+    isError: { type: "boolean", const: true },
+  },
+};
 
 function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, unknown> {
   const paths: Record<string, unknown> = {
@@ -942,7 +1031,13 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
         responses: {
           "200": {
             description: "Tool call result",
-            content: { "application/json": { schema: { "$ref": "#/components/schemas/ActionToolResponse" } } },
+            content: {
+              "application/json": {
+                schema: route.tool === "github_pr_monitor_read"
+                  ? GITHUB_PR_MONITOR_ACTION_RESPONSE_SCHEMA
+                  : { "$ref": "#/components/schemas/ActionToolResponse" },
+              },
+            },
           },
           "401": {
             description: "Missing or invalid owner token",
@@ -956,15 +1051,12 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
   return {
     openapi: "3.1.0",
     info: {
-      title:
-        mode === "github-pr-monitor"
-          ? "chatgpt2codex GitHub PR Monitor Actions"
-          : "chatgpt2codex Custom GPT Actions",
+      title: "chatgpt2codex Custom GPT Actions",
       version: "0.1.6",
       description:
         mode === "github-pr-monitor"
-          ? "Monitor-only OpenAPI bridge for the deployed Custom GPT. It exposes only health plus the five dedicated github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_execute, github_pr_monitor_mutate, and github_pr_monitor_state operations. The monitor identity is fixed to repository Yeachan-Heo/gajae-code and author twoimo."
-          : "OpenAPI bridge for Custom GPTs. This compact schema stays within 30 operations and exposes workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing. Dedicated strict PR monitor actions github_pr_monitor_read, github_pr_monitor_prepare, github_pr_monitor_execute, github_pr_monitor_mutate, and github_pr_monitor_state dispatch through their registered MCP tools; they are fixed to Yeachan-Heo/gajae-code and authenticated author twoimo, and return toolCall.namespace=ChatGPT_To_Codex proof. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
+          ? "OpenAPI bridge for Custom GPTs in github-pr-monitor mode. Use /actions/github-pr-monitor-read for the read-only GitHub PR monitor; mutation and state authorities are unavailable. ChatGPT's sandbox cannot write /Users/... directly."
+          : "OpenAPI bridge for Custom GPTs. Monitor authorities are not exposed on Actions; use the read-only monitor MCP surface instead. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes(mode).map((route) => route.tool),
@@ -980,7 +1072,7 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
           description: "Use the chatgpt2codex owner token shown at init/setup time. Never commit it.",
         },
       },
-      schemas: {
+      schemas: Object.fromEntries(Object.entries({
         EmptyInput: { type: "object", additionalProperties: false, properties: {} },
         CallToolInput: {
           type: "object",
@@ -1343,18 +1435,7 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
             bindingDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
           },
         },
-        GithubPrMonitorReadInput: {
-          type: "object",
-          additionalProperties: false,
-          required: ["runId", "actionPlanId", "repository", "author"],
-          properties: {
-            runId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
-            actionPlanId: { type: "string", pattern: "^[A-Za-z0-9_=-]{1,300}$", maxLength: 300 },
-            repository: { type: "string", const: "Yeachan-Heo/gajae-code" },
-            author: { type: "string", const: "twoimo" },
-            prNumber: { type: "integer", minimum: 1 },
-          },
-        },
+        GithubPrMonitorReadInput: GITHUB_PR_MONITOR_READ_INPUT_JSON_SCHEMA,
         GithubPrMonitorPrepareInput: {
           type: "object",
           additionalProperties: false,
@@ -1468,6 +1549,8 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
             },
           },
         },
+        GithubPrMonitorReadResult: GITHUB_PR_MONITOR_OPENAPI.success,
+        GithubPrMonitorErrorResult: GITHUB_PR_MONITOR_OPENAPI.error,
         ActionToolResponse: {
           type: "object",
           required: ["ok", "protocolVersion", "schemaVersion", "requestDigest", "tool", "toolCall", "text", "imageMarkdownList", "structuredContent"],
@@ -1541,7 +1624,11 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
             error: { type: "string" },
           },
         },
-      },
+      }).filter(([name]) => {
+        if (mode === "github-pr-monitor") return MONITOR_OPENAPI_SCHEMA_NAMES.has(name);
+        if (name === "MonitorAuthorizationBindingV1") return false;
+        return !name.startsWith("GithubPrMonitor");
+      })),
     },
   };
 }
@@ -1551,7 +1638,7 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
   const mode = configuredActionsMode();
   const actionRoutes = mode === "github-pr-monitor"
     ? ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool))
-    : ACTION_ROUTES;
+    : ACTION_ROUTES.filter((route) => !GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool));
   const openApiRoutes = openApiActionRoutes(mode);
 
   if (mode === "github-pr-monitor") {
@@ -1610,10 +1697,13 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
         res.status(400).json({ ok: false, error: "Missing toolName" });
         return;
       }
-      if (Object.hasOwn(GITHUB_PR_ACTION_FIELDS, toolName)) {
-        res.status(400).json({
+      if (toolName.startsWith("github_pr_monitor_")) {
+        res.status(403).json({
           ok: false,
-          error: `Dedicated monitor tool ${toolName} must use its strict Action route`,
+          code: "PERMISSION_DENIED",
+          error: toolName.length > 300
+            ? "Monitor tools are unavailable through the generic Actions bridge."
+            : `Tool ${toolName} is unavailable through the generic Actions bridge.`,
         });
         return;
       }
@@ -1625,22 +1715,32 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
         input: { toolName, input },
       };
       response.requestDigest = actionRequestDigest({ toolName, input });
-      res.json(response);
+      res.json(await boundedActionResponse(ctx, publicOrigin, toolName, { toolName, input }, response));
     });
   }
 
   for (const route of actionRoutes) {
     app.post(route.path, async (req, res) => {
       if (!(await requireOwnerBearer(ctx, req, res))) return;
-      const strictInput = strictGithubPrActionInput(route, req.body);
-      const routeInput = strictInput
-        ? "error" in strictInput
-          ? undefined
-          : strictInput.input
-        : actionInputForRoute(route, req.body);
-      const result = strictInput && "error" in strictInput
-        ? strictInput.error
-        : await callRegisteredTool(ctx, route.tool, routeInput ?? {});
+      const monitorRead = route.tool === "github_pr_monitor_read";
+      const strictInput = monitorRead ? undefined : strictGithubPrActionInput(route, req.body);
+      const parsedMonitorInput = monitorRead ? GithubPrMonitorReadInputSchema.safeParse(req.body) : undefined;
+      const monitorInput = monitorRead ? safeMonitorActionInput(req.body) : undefined;
+      const routeInput = monitorRead
+        ? (parsedMonitorInput?.success ? parsedMonitorInput.data : monitorInput ?? {})
+        : strictInput
+          ? "error" in strictInput
+            ? undefined
+            : strictInput.input
+          : actionInputForRoute(route, req.body);
+      const result = monitorRead
+        ? await callGithubPrMonitorRead(
+          req.body,
+          (ctx as MonitorActionContext).githubPrMonitorReadOptions ?? {},
+        )
+        : strictInput && "error" in strictInput
+          ? strictInput.error
+          : await callRegisteredTool(ctx, route.tool, routeInput ?? {});
       const response = await actionResponse(ctx, publicOrigin, route.tool, routeInput ?? {}, result);
       if (routeInput) {
         response.toolCall = {
@@ -1649,7 +1749,33 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
           input: routeInput,
         };
       }
-      res.json(response);
+      if (monitorRead && isRecord(response.structuredContent) && typeof response.structuredContent.requestDigest === "string") {
+        response.requestDigest = response.structuredContent.requestDigest;
+      }
+      res.json(await boundedActionResponse(ctx, publicOrigin, route.tool, routeInput ?? {}, response));
     });
   }
+  app.use(async (error: unknown, req: Request, res: Response, next: NextFunction) => {
+    const errorType = isRecord(error) && typeof error.type === "string" ? error.type : undefined;
+    const pathName = req.originalUrl.split("?", 1)[0] ?? "";
+    if (
+      mode !== "github-pr-monitor"
+      || pathName !== "/actions/github-pr-monitor-read"
+      || (errorType !== "entity.parse.failed" && errorType !== "entity.too.large")
+    ) {
+      next(error);
+      return;
+    }
+    try {
+      if (!(await requireOwnerBearer(ctx, req, res))) return;
+      const result = await callGithubPrMonitorRead({}, (ctx as MonitorActionContext).githubPrMonitorReadOptions ?? {});
+      const response = await actionResponse(ctx, publicOrigin, "github_pr_monitor_read", {}, result);
+      if (isRecord(response.structuredContent) && typeof response.structuredContent.requestDigest === "string") {
+        response.requestDigest = response.structuredContent.requestDigest;
+      }
+      res.status(200).json(await boundedActionResponse(ctx, publicOrigin, "github_pr_monitor_read", {}, response));
+    } catch (handlerError) {
+      next(handlerError);
+    }
+  });
 }

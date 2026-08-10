@@ -12,14 +12,15 @@ export async function createServer(ctx: ToolContext): Promise<McpServer> {
   });
   const { registerTools } = await import("./tools.js");
 
-  registerTools(server, ctx);
+  registerTools(server, ctx, { includeDeferredMonitorTools: false });
 
   return server;
 }
 
 /**
- * Construct the fixed PR-monitor MCP surface without registering any of the
- * normal workspace, E2E, asset, or desktop-control tools.
+ * Construct the monitor-only MCP surface with only the dynamic
+ * github_pr_monitor_read tool. State, mutation, receipt, and OCI authorities
+ * remain deferred and are not registered on this surface.
  */
 export async function createMonitorServer(ctx: ToolContext): Promise<McpServer> {
   const server = new McpServer({
@@ -28,7 +29,7 @@ export async function createMonitorServer(ctx: ToolContext): Promise<McpServer> 
   });
   const { registerTools } = await import("./tools.js");
 
-  registerTools(server, ctx, { monitorOnly: true });
+  registerTools(server, ctx, { monitorOnly: true, includeDeferredMonitorTools: false });
 
   return server;
 }

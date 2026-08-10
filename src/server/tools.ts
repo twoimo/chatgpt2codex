@@ -103,6 +103,13 @@ import { tmpdir } from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { createVerifiedMonitorArtifact, pushVerifiedMonitorArtifact, type MonitorOciArtifactTask, type VerifiedMonitorArtifact } from "./monitor-oci-artifact.js";
+import {
+  GithubPrMonitorReadInputSchema,
+  MONITOR_SUCCESS_TEXT,
+  validateMonitorError,
+  validateMonitorSuccess,
+} from "./github-pr-monitor-contract.js";
+import { runGithubPrMonitorRead } from "./github-pr-monitor-read.js";
 
 // ---------------------------------------------------------------------------
 // Session helpers
@@ -444,15 +451,17 @@ function toCallToolResult(
   result: ToolResult<Record<string, unknown>>,
   input: unknown,
 ): CallToolResultLike {
-  const structured = toolName.startsWith("github_pr_monitor_")
-    ? {
-        ...result.structuredContent,
-        protocolVersion: 1,
-        schemaVersion: 4,
-        requestDigest: monitorFingerprint(input),
-        chatgpt2codexToolCall: toolCallProof(toolName, result.isError !== true),
-      }
-    : addToolCallProof(result.structuredContent, toolName, result.isError !== true);
+  const structured = toolName === "github_pr_monitor_read"
+    ? { ...result.structuredContent }
+    : toolName.startsWith("github_pr_monitor_")
+      ? {
+          ...result.structuredContent,
+          protocolVersion: 1,
+          schemaVersion: 4,
+          requestDigest: monitorFingerprint(input),
+          chatgpt2codexToolCall: toolCallProof(toolName, result.isError !== true),
+        }
+      : addToolCallProof(result.structuredContent, toolName, result.isError !== true);
   return {
     content: result.content,
     structuredContent: structured,
@@ -3309,15 +3318,20 @@ async function guardSecretPath(ctx: ToolContext, absPath: string, toolName: stri
 export function registerTools(
   server: unknown,
   ctx: ToolContext,
-  options: { monitorOnly?: boolean } = {},
+  options: { monitorOnly?: boolean; includeDeferredMonitorTools?: boolean } = {},
 ): void {
   const monitorOnly = options.monitorOnly === true;
+  const includeDeferredMonitorTools = options.includeDeferredMonitorTools === true;
   const monitorToolNames = new Set([
     "github_pr_monitor_read",
-    "github_pr_monitor_state",
-    "github_pr_monitor_prepare",
-    "github_pr_monitor_execute",
-    "github_pr_monitor_mutate",
+    ...(includeDeferredMonitorTools
+      ? [
+          "github_pr_monitor_state",
+          "github_pr_monitor_execute",
+          "github_pr_monitor_prepare",
+          "github_pr_monitor_mutate",
+        ]
+      : []),
   ]);
   const s = server as McpServer;
   const rawRegisterTool = s.registerTool.bind(s);
@@ -4996,6 +5010,8 @@ export function registerTools(
     },
   );
 
+  // Deferred state authority is opt-in only from createDeferredMonitorServerForTests.
+  if (includeDeferredMonitorTools) {
   registerTool(
     "github_pr_monitor_state",
     {
@@ -5088,58 +5104,27 @@ export function registerTools(
       return makeResult(receipt, `Ran monitor state command ${input.command}.`);
     }),
   );
+  }
   registerTool(
     "github_pr_monitor_read",
     {
-      title: "Read fixed-repository authored PR state",
-      description: "Read open PR response state only for Yeachan-Heo/gajae-code PRs authored by twoimo.",
+      title: "Read authenticated-account open PR state",
+      description: "Read open PR state for the authenticated GitHub account, including authored and requested-reviewer roles.",
       annotations: READ_ONLY_ANNOTATIONS,
-      _meta: chatGptToolMeta("Reading authored PR state...", "Authored PR state read"),
-      inputSchema: { runId: z.string().regex(SAFE_ID), actionPlanId: z.string().regex(SAFE_ID), repository: z.literal(GITHUB_PR_REPOSITORY), author: z.literal(GITHUB_PR_AUTHOR), prNumber: z.number().int().positive().optional() },
+      _meta: chatGptToolMeta("Reading authenticated-account PR state...", "Authenticated-account PR state read"),
+      inputSchema: GithubPrMonitorReadInputSchema,
     },
     async (input) => withErrorMapping(ctx, "github_pr_monitor_read", input, async () => {
-      await requireGithubAuthenticatedAuthor();
-      const prNumbers = input.prNumber ? [input.prNumber] : await githubOpenAuthoredPrNumbers();
-      const snapshots = await Promise.all(prNumbers.map((number) => githubPrSnapshot(number)));
-      const issuedAt = Date.now();
-      const observedAt = new Date(issuedAt).toISOString();
-      const receiptId = monitorReceiptId({
-        tool: "github_pr_monitor_read",
-        input,
-        snapshots,
-        issuedAt,
-        nonce: randomUUID(),
-      });
-      const receipt = Object.freeze({
-        protocolVersion: 1,
-        schemaVersion: 4,
-        receiptId,
-        namespace: "ChatGPT_To_Codex",
-        tool: "github_pr_monitor_read",
-        operation: "read",
-        ok: true,
-        runId: input.runId,
-        actionPlanId: input.actionPlanId,
-        repository: GITHUB_PR_REPOSITORY,
-        author: GITHUB_PR_AUTHOR,
-        prs: snapshots,
-        observedAt,
-      });
-      const text = "Read authored open PR state.";
-      const issued = {
-        structured: receipt,
-        input: structuredClone(input),
-        text,
-        issuedAt,
-      };
-      await issueActionReceipt(ctx, "monitor-read", "github_pr_monitor_read", receiptId, issued, {
-        runId: input.runId,
-        actionPlanId: input.actionPlanId,
-      });
-      return makeResult(receipt, text);
+      const result = await runGithubPrMonitorRead(input);
+      if (!validateMonitorSuccess(result) && !validateMonitorError(result)) {
+        throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "GitHub PR monitor returned an invalid result envelope");
+      }
+      return makeResult(result as unknown as Record<string, unknown>, result.ok ? MONITOR_SUCCESS_TEXT : result.error, result.ok !== true);
     }),
   );
 
+  // Deferred mutation authorities are opt-in only from createDeferredMonitorServerForTests.
+  if (includeDeferredMonitorTools) {
   registerTool(
     "github_pr_monitor_execute",
     {
@@ -5944,6 +5929,7 @@ export function registerTools(
       return makeResult(receipt, text);
     }),
   );
+  }
   registerTool(
     "git_push",
     {

@@ -12,13 +12,9 @@ import type { ToolContext } from "../types.js";
 import { createHttpServer, defaultHttpServerConfig } from "./http.js";
 
 /**
- * End-to-end proof (real MCP-over-HTTP client, real OAuth token) that
- * src/server/http.ts marks a `/mcp` session `remote: true`
- * (createMcpServer({ ...ctx, remote: true })) and that
- * src/server/tools.ts's project_select handler refuses preset=control for a
- * remote session — i.e. lease arming (and kill-switch resumption, which only
- * a fresh control grant can do) stays local-only (stdio) even once the
- * desktop-control tools are exposed to ChatGPT.
+ * End-to-end proof that the remote `/mcp` surface in github-pr-monitor mode is
+ * least privilege: it exposes only the dynamic read operation and does not
+ * register deferred state, mutation, or desktop-control tools.
  */
 
 const OWNER_TOKEN = "unit-test-owner-token-mcp-remote";
@@ -158,20 +154,21 @@ async function connectMcpClient(baseUrl: string, accessToken: string): Promise<C
   return client;
 }
 
-describe("remote MCP session (/mcp, how ChatGPT connects) marks ctx.remote", () => {
+describe("remote MCP session (/mcp) exposes the read-only dynamic monitor surface", () => {
   let stateDir: string;
   let projectRoot: string;
   let stop: (() => Promise<void>) | undefined;
   let client: Client | undefined;
 
   beforeEach(async () => {
+    process.env.CHATGPT2CODEX_ACTIONS_MODE = "github-pr-monitor";
     stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-mcp-remote-"));
     projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-mcp-remote-project-"));
     await storeOwnerToken(stateDir, OWNER_TOKEN);
   });
 
   afterEach(async () => {
-    delete process.env.CHATGPT2CODEX_CONTROL_CHATGPT;
+    delete process.env.CHATGPT2CODEX_ACTIONS_MODE;
     await client?.close().catch(() => undefined);
     client = undefined;
     await stop?.();
@@ -180,8 +177,7 @@ describe("remote MCP session (/mcp, how ChatGPT connects) marks ctx.remote", () 
     await fs.rm(projectRoot, { recursive: true, force: true });
   }, 15_000);
 
-  it("rejects project_select preset=control over /mcp, even with the ChatGPT-confirm exposure flag on", async () => {
-    process.env.CHATGPT2CODEX_CONTROL_CHATGPT = "1";
+  it("lists exactly the dynamic read operation with read-only annotations", async () => {
     const ctx = makeCtx(stateDir, projectRoot);
     const app = await startApp(ctx);
     stop = app.stop;
@@ -189,19 +185,25 @@ describe("remote MCP session (/mcp, how ChatGPT connects) marks ctx.remote", () 
     const token = await getMcpAccessToken(app.baseUrl);
     client = await connectMcpClient(app.baseUrl, token);
 
-    const result = (await client.callTool({
-      name: "project_select",
-      arguments: { projectId: "proj", reason: "remote self-grant attempt", preset: "control" },
-    })) as { isError?: boolean; structuredContent?: { code?: string } };
-
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent?.code).toBe("PERMISSION_DENIED");
-
-    const session = (await ctx.store.getSession()) as { lease?: { preset?: string } | null } | null;
-    expect(session?.lease?.preset ?? null).not.toBe("control");
+    const listed = await client.listTools();
+    expect(listed.tools.map((tool) => tool.name)).toEqual(["github_pr_monitor_read"]);
+    expect(listed.tools[0]).toMatchObject({
+      name: "github_pr_monitor_read",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["runId", "actionPlanId"],
+      },
+    });
+    expect((listed.tools[0]?.inputSchema as { properties?: Record<string, unknown> }).properties).toEqual({
+      runId: expect.any(Object),
+      actionPlanId: expect.any(Object),
+    });
+    expect(listed.tools[0]).not.toHaveProperty("outputSchema");
   }, 20_000);
 
-  it("still allows a normal preset (full-write) over the same /mcp session", async () => {
+  it("rejects deferred state, mutation, and control tools over the same remote session", async () => {
     const ctx = makeCtx(stateDir, projectRoot);
     const app = await startApp(ctx);
     stop = app.stop;
@@ -209,12 +211,20 @@ describe("remote MCP session (/mcp, how ChatGPT connects) marks ctx.remote", () 
     const token = await getMcpAccessToken(app.baseUrl);
     client = await connectMcpClient(app.baseUrl, token);
 
-    const result = (await client.callTool({
-      name: "project_select",
-      arguments: { projectId: "proj", reason: "remote normal select", preset: "full-write" },
-    })) as { isError?: boolean; structuredContent?: { lease?: { preset?: string } } };
-
-    expect(result.isError).toBeFalsy();
-    expect(result.structuredContent?.lease?.preset).toBe("full-write");
+    for (const name of [
+      "github_pr_monitor_state",
+      "github_pr_monitor_prepare",
+      "github_pr_monitor_execute",
+      "github_pr_monitor_mutate",
+      "project_select",
+      "computer_request_action",
+    ]) {
+      const result = (await client.callTool({ name, arguments: {} })) as {
+        isError?: boolean;
+        content?: Array<{ text?: string }>;
+      };
+      expect(result.isError).toBe(true);
+      expect(result.content?.[0]?.text).toContain("not found");
+    }
   }, 20_000);
 });

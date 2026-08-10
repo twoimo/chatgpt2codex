@@ -1,282 +1,192 @@
 import { describe, expect, it } from "vitest";
 import { actionRequestDigest, actionResponseFromMcpResult, type DirectActionClient, type DirectMonitorTool } from "./direct-action-client.js";
 import { runDirectMonitorCycle } from "./direct-monitor-cycle.js";
-import { toolCallProof } from "./tool-proof.js";
+import { makeToolCallProof } from "./github-pr-monitor-contract.js";
 
 const RECEIPT_ID = "a".repeat(64);
+const INPUT = { runId: "run-test", actionPlanId: "plan-test" };
 
-function action(tool: DirectMonitorTool, input: Record<string, unknown>, structuredContent: Record<string, unknown>) {
-  const inputBindings = tool === "github_pr_monitor_read"
-    ? { runId: input.runId, actionPlanId: input.actionPlanId, repository: input.repository, author: input.author, operation: "read" }
-    : { runId: input.runId, actionPlanId: input.actionPlanId, command: input.command, operation: input.command };
-  const requestDigest = actionRequestDigest(input);
+function readStructured(input = INPUT) {
+  const actor = { login: "twoimo", actorType: "User" };
+  const repository = { id: "repo-id", nameWithOwner: "yeachan-heo/gajae-code" };
+  const headRepository = { id: "head-repo-id", name: "gajae-code", nameWithOwner: "yeachan-heo/gajae-code" };
+  const snapshot = {
+    number: 17,
+    url: "https://github.com/yeachan-heo/gajae-code/pull/17",
+    state: "OPEN",
+    author: actor,
+    roles: ["authored", "requested_reviewer"],
+    baseRepository: repository,
+    headRepository,
+    baseRefName: "main",
+    headRefName: "fix/example",
+    baseRefOid: "1".repeat(40),
+    headRefOid: "0".repeat(40),
+    reviewRequests: [],
+    reviews: [{
+      id: "review-1",
+      author: { login: "reviewer", actorType: "User" },
+      feedbackIdentity: "1".repeat(64),
+    }],
+    comments: [{
+      id: "comment-1",
+      author: { login: "reviewer", actorType: "User" },
+      feedbackIdentity: "2".repeat(64),
+    }],
+    latestReviews: [],
+    reviewThreads: [{
+      id: "thread-1",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [] },
+    }],
+    statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }],
+    ciSummary: { total: 1, success: 1, failure: 0, pending: 0, cancelled: 0, neutral: 0, unknown: 0 },
+  };
   return {
-    ok: true,
+    monitorPayloadVersion: 1,
     protocolVersion: 1,
     schemaVersion: 4,
-    requestDigest,
-    tool,
-    toolCall: { ...toolCallProof(tool, true), toolName: tool, input },
-    text: "ok",
-    imageMarkdownList: [],
-    structuredContent: {
-      protocolVersion: 1,
-      schemaVersion: 4,
-      requestDigest,
-      ...inputBindings,
-      ...structuredContent,
-      chatgpt2codexToolCall: toolCallProof(tool, true),
-      namespace: "ChatGPT_To_Codex",
-      tool,
-      ok: true,
-      receiptId: RECEIPT_ID,
+    requestDigest: actionRequestDigest(input),
+    receiptId: RECEIPT_ID,
+    namespace: "ChatGPT_To_Codex",
+    tool: "github_pr_monitor_read",
+    operation: "read",
+    ok: true,
+    runId: input.runId,
+    actionPlanId: input.actionPlanId,
+    account: { login: "twoimo" },
+    discovery: {
+      authored: { issueCount: 1, fetchedCount: 1, pageCount: 1, complete: true },
+      requestedReviewer: { issueCount: 1, fetchedCount: 1, pageCount: 1, complete: true },
+      uniqueCandidateCount: 1,
+      snapshotAttemptCount: 1,
+      snapshotCount: 1,
+      races: { prClosed: 0, authoredRoleLost: 0, reviewerRequestLost: 0 },
+      complete: true,
     },
+    prs: [snapshot],
+    observedAt: "2026-08-10T00:00:00.000Z",
+    chatgpt2codexToolCall: makeToolCallProof(input, true),
   };
 }
 
+function action(input = INPUT) {
+  const structuredContent = readStructured(input);
+  return actionResponseFromMcpResult("github_pr_monitor_read", input, {
+    content: [{ type: "text", text: "Read authenticated-account open PR state." }],
+    structuredContent,
+  });
+}
+
 describe("direct monitor cycle", () => {
-  it("runs read, ingest, and plan-cycle without a browser", async () => {
+  it("runs one dynamic read and returns the exact cycle summary without a browser or state transitions", async () => {
     const calls: Array<{ tool: DirectMonitorTool; input: Record<string, unknown> }> = [];
-    let readResponse: Record<string, unknown> | undefined;
     const client: DirectActionClient = {
       async call(tool, input) {
         calls.push({ tool, input });
-        if (tool === "github_pr_monitor_read") {
-          readResponse = action(tool, input, {
-            prs: [{
-              number: 17,
-              headRefName: "fix/example",
-              headRefOid: "0123456789abcdef0123456789abcdef01234567",
-              headRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
-              baseRepository: { nameWithOwner: "Yeachan-Heo/gajae-code" },
-              baseRefName: "main",
-              baseRefOid: "1111111111111111111111111111111111111111",
-              reviews: [],
-              comments: [],
-              reviewThreads: { nodes: [] },
-              statusCheckRollup: [],
-            }],
-          });
-          return readResponse;
-        }
-        const command = input.command;
-        const result = command === "status"
-          ? {
-              rolloutModes: ["off", "shadow", "prepare", "enabled"],
-              database: { userVersion: 4, healthy: true },
-            }
-          : command === "plan-cycle"
-            ? {
-                version: 1,
-                target: { repository: "Yeachan-Heo/gajae-code", author: "twoimo" },
-                prSet: "authoritative",
-                status: "blocked_no_authorizable_effects",
-                actionPlanId: "plan-result",
-                steps: [],
-                next: [],
-              }
-            : { ingested: 1 };
-        return action(tool, input, {
-          stdout: JSON.stringify({ ok: true, command, result }),
-        });
+        return action(input as typeof INPUT);
       },
       async close() {},
     };
 
-    const result = await runDirectMonitorCycle(
-      client,
-      { runId: "run-test", actionPlanId: "bootstrap-test" },
-      { rollout: "shadow" },
-    );
+    const result = await runDirectMonitorCycle(client, INPUT);
 
-    expect(result).toMatchObject({
-      chromeRequired: false,
-      runId: "run-test",
-      bootstrapActionPlanId: "bootstrap-test",
-      plan: { ok: true, namespace: "ChatGPT_To_Codex", status: "blocked_no_authorizable_effects", actionPlanId: "plan-result" },
-      prs: [{ number: 17, unresolvedReviewThreads: 0, checks: {} }],
-    });
-    expect(calls.map(({ tool }) => tool)).toEqual([
-      "github_pr_monitor_read",
-      "github_pr_monitor_state",
-      "github_pr_monitor_state",
-      "github_pr_monitor_state",
-    ]);
-    expect(calls[1]?.input).toMatchObject({ command: "status" });
-    expect(calls[2]?.input).toMatchObject({ command: "ingest", input: { receipt: readResponse } });
-    expect(calls[3]?.input).toMatchObject({
-      command: "plan-cycle",
-      input: {
-        receipt: readResponse,
-        prs: [{
-          number: 17,
-          author: "twoimo",
-          headRef: "fix/example",
-          headOid: "0123456789abcdef0123456789abcdef01234567",
-        }],
+    expect(calls).toEqual([{ tool: "github_pr_monitor_read", input: INPUT }]);
+    expect(result).toEqual({
+      cyclePayloadVersion: 1,
+      runId: INPUT.runId,
+      actionPlanId: INPUT.actionPlanId,
+      account: { login: "twoimo" },
+      discovery: {
+        authored: { issueCount: 1, fetchedCount: 1, pageCount: 1, complete: true },
+        requestedReviewer: { issueCount: 1, fetchedCount: 1, pageCount: 1, complete: true },
+        uniqueCandidateCount: 1,
+        snapshotAttemptCount: 1,
+        snapshotCount: 1,
+        races: { prClosed: 0, authoredRoleLost: 0, reviewerRequestLost: 0 },
+        complete: true,
       },
-    });
-    expect(calls[3]?.input).not.toHaveProperty("input.capability");
-    expect(calls[3]?.input).not.toHaveProperty("input.prs.0.attempts");
-    expect(calls[3]?.input).not.toHaveProperty("input.prs.0.tier");
-    expect(result.plan).toMatchObject({
-      rollout: "shadow",
-      execution: { status: "not_executed", reason: "blocked_no_authorizable_effects", effects: [] },
+      prs: [{
+        number: 17,
+        url: "https://github.com/yeachan-heo/gajae-code/pull/17",
+        roles: ["authored", "requested_reviewer"],
+        baseRepository: { id: "repo-id", nameWithOwner: "yeachan-heo/gajae-code" },
+        headRepository: { id: "head-repo-id", name: "gajae-code", nameWithOwner: "yeachan-heo/gajae-code" },
+        headRefName: "fix/example",
+        headRefOid: "0".repeat(40),
+        reviewCount: 1,
+        commentCount: 1,
+        threadCount: 1,
+        unresolvedThreadCount: 1,
+        ciSummary: { total: 1, success: 1, failure: 0, pending: 0, cancelled: 0, neutral: 0, unknown: 0 },
+      }],
+      observedAt: "2026-08-10T00:00:00.000Z",
     });
   });
 
-  it("keeps rollout off read-only and skips all state transitions", async () => {
-    const calls: DirectMonitorTool[] = [];
+  it("generates safe identifiers when identities are omitted", async () => {
+    const calls: Array<{ tool: DirectMonitorTool; input: Record<string, unknown> }> = [];
     const client: DirectActionClient = {
       async call(tool, input) {
-        calls.push(tool);
-        if (tool !== "github_pr_monitor_read") throw new Error(`unexpected state call: ${tool}`);
-        return action(tool, input, { prs: [] });
+        calls.push({ tool, input });
+        return action(input as typeof INPUT);
       },
       async close() {},
     };
 
-    const result = await runDirectMonitorCycle(client, { runId: "run-off", actionPlanId: "plan-off" });
+    const result = await runDirectMonitorCycle(client);
 
-    expect(calls).toEqual(["github_pr_monitor_read"]);
-    expect(result).toMatchObject({
-      ingest: { status: "not_executed", reason: "rollout_off" },
-      plan: {
-        status: "not_executed",
-        rollout: "off",
-        execution: { status: "not_executed", reason: "rollout_off", effects: [] },
-      },
-    });
+    expect(result.cyclePayloadVersion).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.tool).toBe("github_pr_monitor_read");
+    expect(calls[0]?.input.runId).toMatch(/^direct_run_/u);
+    expect(calls[0]?.input.actionPlanId).toMatch(/^direct_plan_/u);
   });
-  it("rejects malformed Action responses before advancing the cycle", async () => {
+
+  it("rejects a malformed Action response before advancing the cycle", async () => {
     const calls: DirectMonitorTool[] = [];
     const client: DirectActionClient = {
       async call(tool, input) {
         calls.push(tool);
-        const response = action(tool, input, { prs: [] });
-        (response.toolCall as Record<string, unknown>).input = { ...input, repository: "other/repository" };
+        const response = action(input as typeof INPUT) as Record<string, unknown>;
+        response.toolCall = { ...(response.toolCall as Record<string, unknown>), input: { ...input, extra: true } };
         return response;
       },
       async close() {},
     };
 
-    await expect(runDirectMonitorCycle(client, { runId: "run-test", actionPlanId: "plan-test" }))
-      .rejects.toThrow("does not bind the exact call");
+    await expect(runDirectMonitorCycle(client, INPUT)).rejects.toThrow("does not bind the exact call");
     expect(calls).toEqual(["github_pr_monitor_read"]);
   });
-});
 
-function mcpSuccess(input: Record<string, unknown>) {
-  return {
-    content: [{ type: "text", text: "Read authored open PR state." }],
-    structuredContent: {
-      requestDigest: actionRequestDigest(input),
-      protocolVersion: 1,
-      schemaVersion: 4,
-      chatgpt2codexToolCall: toolCallProof("github_pr_monitor_read", true),
-      receiptId: RECEIPT_ID,
-      namespace: "ChatGPT_To_Codex",
-      tool: "github_pr_monitor_read",
-      operation: "read",
-      ok: true,
-      runId: input.runId,
-      actionPlanId: input.actionPlanId,
-      repository: input.repository,
-      author: input.author,
-      prs: [{ number: 17 }],
-    },
-  };
-}
-
-describe("direct Action MCP materialization", () => {
-  it("clones an exact success without retaining input or receipt aliases", () => {
-    const input = {
-      runId: "run-1",
-      actionPlanId: "plan-1",
-      repository: "Yeachan-Heo/gajae-code",
-      author: "twoimo",
-      nested: { marker: "input" },
-    };
-    const wire = mcpSuccess(input);
-    const response = actionResponseFromMcpResult("github_pr_monitor_read", input, wire);
-
-    input.nested.marker = "changed";
-    (wire.structuredContent.prs[0] as { number: number }).number = 99;
-    expect(response).toMatchObject({
-      ok: true,
-      tool: "github_pr_monitor_read",
-      toolCall: { input: { nested: { marker: "input" } } },
-      structuredContent: { receiptId: RECEIPT_ID, prs: [{ number: 17 }] },
-    });
-    expect(response).not.toHaveProperty("isError");
-  });
-
-  it("materializes only an exact error marker and error receipt shape", () => {
-    const wire = {
-      isError: true,
-      content: [{ type: "text", text: "blocked" }],
-      structuredContent: {
-        protocolVersion: 1,
-        schemaVersion: 4,
-        requestDigest: actionRequestDigest({}),
-        chatgpt2codexToolCall: toolCallProof("github_pr_monitor_state", false),
-        code: "APPROVAL_REQUIRED",
-        error: "blocked",
-        details: { reason: "external authority denied" },
+  it("stops on a failed shared dynamic read envelope", async () => {
+    const client: DirectActionClient = {
+      async call(_tool, input) {
+        const error = {
+          monitorPayloadVersion: 1,
+          protocolVersion: 1,
+          schemaVersion: 4,
+          requestDigest: actionRequestDigest(input),
+          namespace: "ChatGPT_To_Codex",
+          tool: "github_pr_monitor_read",
+          operation: "read",
+          ok: false,
+          runId: input.runId,
+          actionPlanId: input.actionPlanId,
+          code: "GITHUB_MONITOR_UNAVAILABLE",
+          error: "GitHub monitor is unavailable.",
+          chatgpt2codexToolCall: makeToolCallProof(input as typeof INPUT, false),
+        };
+        return actionResponseFromMcpResult("github_pr_monitor_read", input, {
+          isError: true,
+          content: [{ type: "text", text: error.error }],
+          structuredContent: error,
+        });
       },
+      async close() {},
     };
-    const response = actionResponseFromMcpResult("github_pr_monitor_state", {}, wire);
 
-    (wire.structuredContent.details as { reason: string }).reason = "changed";
-    expect(response).toMatchObject({
-      ok: false,
-      isError: true,
-      tool: "github_pr_monitor_state",
-      toolCall: { namespace: "ChatGPT_To_Codex", tool: "github_pr_monitor_state", ok: false },
-      structuredContent: { code: "APPROVAL_REQUIRED", error: "blocked", details: { reason: "external authority denied" } },
-    });
-  });
-
-  it("rejects malformed MCP successes, errors, top-level aliases, and missing fields", () => {
-    const input = {
-      runId: "run-1",
-      actionPlanId: "plan-1",
-      repository: "Yeachan-Heo/gajae-code",
-      author: "twoimo",
-    };
-    const success = mcpSuccess(input);
-    const malformed: unknown[] = [
-      null,
-      { ...success, result: success.structuredContent },
-      { structuredContent: success.structuredContent },
-      { ...success, content: [] },
-      { ...success, content: [{ type: "image", text: "not text" }] },
-      { ...success, structuredContent: undefined },
-      { ...success, structuredContent: { ...success.structuredContent, receiptId: undefined } },
-      { ...success, structuredContent: { ...success.structuredContent, namespace: "other" } },
-      {
-        isError: true,
-        content: [{ type: "text", text: "blocked" }],
-        structuredContent: {
-          chatgpt2codexToolCall: toolCallProof("github_pr_monitor_read", true),
-          code: "APPROVAL_REQUIRED",
-          error: "blocked",
-        },
-      },
-      {
-        isError: true,
-        content: [{ type: "text", text: "blocked" }],
-        structuredContent: {
-          chatgpt2codexToolCall: toolCallProof("github_pr_monitor_read", false),
-          code: "APPROVAL_REQUIRED",
-        },
-      },
-    ];
-    expect(actionResponseFromMcpResult("github_pr_monitor_read", input, { ...success, isError: false }))
-      .toEqual(actionResponseFromMcpResult("github_pr_monitor_read", input, success));
-
-    for (const value of malformed) {
-      expect(() => actionResponseFromMcpResult("github_pr_monitor_read", input, value)).toThrow();
-    }
+    await expect(runDirectMonitorCycle(client, INPUT)).rejects.toThrow("GITHUB_MONITOR_UNAVAILABLE");
   });
 });

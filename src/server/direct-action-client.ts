@@ -1,17 +1,23 @@
 import { createHash } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { ToolContext } from "../types.js";
 import { createMonitorServer } from "./mcp-server.js";
-import { toolCallProof } from "./tool-proof.js";
+import {
+  GithubPrMonitorErrorResultSchema,
+  GithubPrMonitorReadResultSchema,
+  MAX_TEXT_BYTES,
+  MAX_WIRE_BYTES,
+  makeToolCallProof,
+  parseGithubPrMonitorReadInput,
+  isSafeId,
+  safeErrorMessage,
+  validateMonitorError,
+  validateMonitorSuccess,
+} from "./github-pr-monitor-contract.js";
 
 export const DIRECT_MONITOR_TOOLS = [
   "github_pr_monitor_read",
-  "github_pr_monitor_state",
-  "github_pr_monitor_prepare",
-  "github_pr_monitor_execute",
-  "github_pr_monitor_mutate",
 ] as const;
 
 export type DirectMonitorTool = (typeof DIRECT_MONITOR_TOOLS)[number];
@@ -46,6 +52,7 @@ function canonicalJson(value: unknown): string {
 export function actionRequestDigest(input: unknown): string {
   return createHash("sha256").update(canonicalJson(input), "utf8").digest("hex");
 }
+const INVALID_INPUT_REQUEST_DIGEST = createHash("sha256").update("invalid-input", "utf8").digest("hex");
 
 function record(value: unknown, message: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
@@ -54,151 +61,50 @@ function record(value: unknown, message: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-const SUCCESSFUL_STRUCTURED_COMMON_KEYS = [
-  "chatgpt2codexToolCall", "protocolVersion", "schemaVersion", "requestDigest", "receiptId",
-  "namespace", "tool", "operation", "ok", "runId", "actionPlanId",
-] as const;
-const SUCCESSFUL_STRUCTURED_AUTHORIZATION_KEYS = [
-  "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey", "operationHeadSha",
-  "effectIdentity", "effectKey", "effectKind", "targetDigest", "policyDigest", "bindingDigest",
-] as const;
-const SUCCESSFUL_STRUCTURED_KEYS: Record<DirectMonitorTool, readonly string[]> = {
-  github_pr_monitor_read: [
-    ...SUCCESSFUL_STRUCTURED_COMMON_KEYS,
-    "repository", "author", "prs", "observedAt",
-  ],
-  github_pr_monitor_state: [
-    ...SUCCESSFUL_STRUCTURED_COMMON_KEYS,
-    "command", "stdout",
-  ],
-  github_pr_monitor_prepare: [
-    ...SUCCESSFUL_STRUCTURED_COMMON_KEYS,
-    ...SUCCESSFUL_STRUCTURED_AUTHORIZATION_KEYS,
-    "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha",
-    "oldHeadSha", "newHeadSha", "claimId", "claimedAt", "payloadDigest",
-    "headRef", "worktreePath", "quarantinedPath", "safePath", "alreadyAbsent", "remoteObject", "timestamp",
-  ],
-  github_pr_monitor_execute: [
-    ...SUCCESSFUL_STRUCTURED_COMMON_KEYS,
-    ...SUCCESSFUL_STRUCTURED_AUTHORIZATION_KEYS,
-    "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha",
-    "oldHeadSha", "newHeadSha", "claimId", "claimedAt", "payloadDigest",
-    "worktreePath", "headRef", "ociImageDigest", "taskDigest", "changedPaths",
-    "artifactDir", "bundleSha256", "baseTreeSha", "projectId", "commandId", "riskTier",
-    "args", "headSha", "treeSha", "remoteObject", "timestamp",
-  ],
-  github_pr_monitor_mutate: [
-    ...SUCCESSFUL_STRUCTURED_COMMON_KEYS,
-    ...SUCCESSFUL_STRUCTURED_AUTHORIZATION_KEYS,
-    "idempotencyKey", "eventId", "repository", "author", "prNumber", "expectedHeadSha",
-    "oldHeadSha", "newHeadSha", "claimId", "claimedAt", "payloadDigest",
-    "replyMarker", "remoteObject", "timestamp",
-  ],
-};
-const SUCCESSFUL_MUTATE_OPERATION_FIELDS: Record<string, { allowed: readonly string[]; required: readonly string[] }> = {
-  post_reply: { allowed: ["threadId", "triggerId"], required: ["threadId"] },
-  resolve_thread: { allowed: ["threadId", "triggerId", "replyReceiptId"], required: ["threadId", "triggerId", "replyReceiptId"] },
-  rerequest_reviewer: { allowed: [], required: [] },
-  push_prepared_worktree: { allowed: [], required: [] },
-};
-
-function successfulStructuredKeys(tool: DirectMonitorTool, input: Record<string, unknown>): readonly string[] {
-  const base = SUCCESSFUL_STRUCTURED_KEYS[tool];
-  if (tool !== "github_pr_monitor_mutate") return base;
-  const operation = typeof input.operation === "string" ? input.operation : "";
-  const fields = SUCCESSFUL_MUTATE_OPERATION_FIELDS[operation];
-  if (!fields) throw new Error("MCP success has an unsupported mutation operation");
-  const missing = fields.required.filter((key) => !Object.hasOwn(input, key));
-  if (missing.length > 0) throw new Error(`MCP success omitted mutation fields: ${missing.join(",")}`);
-  const present = fields.allowed.filter((key) => Object.hasOwn(input, key));
-  return [...base, ...present];
-}
 
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[], context: string): void {
   const extras = Object.keys(value).filter((key) => !allowed.includes(key));
   if (extras.length > 0) throw new Error(`${context} contains unsupported fields: ${extras.join(",")}`);
 }
-
-function exactProof(value: unknown, tool: DirectMonitorTool, ok: boolean): Record<string, unknown> {
-  const proof = record(value, "MCP structuredContent omitted tool-call proof");
-  const expected = toolCallProof(tool, ok);
-  exactKeys(proof, Object.keys(expected), "MCP tool-call proof");
-  for (const [key, expectedValue] of Object.entries(expected)) {
-    if (proof[key] !== expectedValue) throw new Error("MCP tool-call proof does not bind the exact tool result");
+function enforceWireCap(value: unknown, context: string): void {
+  let serialized: string;
+  try { serialized = JSON.stringify(value); } catch { throw new Error(`${context} is not serializable`); }
+  if (typeof serialized !== "string" || Buffer.byteLength(serialized, "utf8") > MAX_WIRE_BYTES) {
+    throw new Error(`${context} exceeds the bounded wire limit`);
   }
-  return proof;
 }
 
 function materializedText(value: unknown): string {
   if (!Array.isArray(value) || value.length !== 1) throw new Error("MCP result content must contain exactly one text item");
   const item = record(value[0], "MCP result content item is invalid");
   exactKeys(item, ["type", "text"], "MCP result content item");
-  if (item.type !== "text" || typeof item.text !== "string" || item.text.length === 0) {
+  if (item.type !== "text" || typeof item.text !== "string" || item.text.length === 0
+    || Buffer.byteLength(item.text, "utf8") > MAX_TEXT_BYTES) {
     throw new Error("MCP result content item is invalid");
   }
   return item.text;
 }
-
 function successfulStructuredContent(
   value: Record<string, unknown>,
   tool: DirectMonitorTool,
   input: Record<string, unknown>,
 ): Record<string, unknown> {
-  exactKeys(value, successfulStructuredKeys(tool, input), "MCP success structuredContent");
-  exactProof(value.chatgpt2codexToolCall, tool, true);
-  if (value.namespace !== "ChatGPT_To_Codex" || value.tool !== tool || value.ok !== true) {
-    throw new Error("MCP success does not bind the exact tool namespace and status");
+  if (tool !== "github_pr_monitor_read"
+    || !validateMonitorSuccess(value)
+    || !GithubPrMonitorReadResultSchema.safeParse(value).success) {
+    throw new Error("MCP success is not a valid shared github_pr_monitor_read result");
   }
-  if (value.protocolVersion !== 1 || value.schemaVersion !== 4) {
-    throw new Error("MCP success does not negotiate protocolVersion 1 and schemaVersion 4");
+  if (value.requestDigest !== actionRequestDigest(input)
+    || value.runId !== input.runId
+    || value.actionPlanId !== input.actionPlanId) {
+    throw new Error("MCP success does not bind the exact read input");
   }
-  if (typeof value.receiptId !== "string" || !/^[0-9a-f]{64}$/u.test(value.receiptId)) {
-    throw new Error("MCP success omitted an exact receipt binding");
-  }
-  if (typeof value.requestDigest !== "string" || value.requestDigest !== actionRequestDigest(input)) {
-    throw new Error("MCP success does not bind the exact Action input digest");
-  }
-  const authorizationBindings = [
-    "protocolVersion", "schemaVersion", "ownerId", "leaseKey", "fence", "logicalIdentity", "operationKey",
-    "operationHeadSha", "effectIdentity", "effectKey", "effectKind", "targetDigest", "policyDigest", "bindingDigest",
-  ].filter((key) => Object.hasOwn(input, key));
-  const bindings = tool === "github_pr_monitor_read"
-    ? ["runId", "actionPlanId", "repository", "author"]
-    : tool === "github_pr_monitor_state"
-      ? ["runId", "actionPlanId", "command"]
-      : [
-          "runId", "actionPlanId", "idempotencyKey", "eventId", "repository", "author", "prNumber",
-          "expectedHeadSha", "operation", ...authorizationBindings,
-          ...(tool === "github_pr_monitor_mutate" && input.operation === "resolve_thread"
-            ? ["threadId", "triggerId", "replyReceiptId"]
-            : tool === "github_pr_monitor_mutate" && input.operation === "post_reply"
-              ? ["threadId", ...(Object.hasOwn(input, "triggerId") ? ["triggerId"] : [])]
-              : []),
-        ];
-  for (const key of bindings) {
-    if (!Object.hasOwn(input, key) || !Object.hasOwn(value, key) || !isDeepStrictEqual(value[key], input[key])) {
-      throw new Error(`MCP success receipt does not bind the exact ${key}`);
-    }
-  }
-  if (tool === "github_pr_monitor_state" && value.operation !== input.command) {
-    throw new Error("MCP success receipt does not bind the exact state operation");
-  }
-  if (tool === "github_pr_monitor_read" && value.operation !== "read") {
-    throw new Error("MCP success receipt does not bind the exact read operation");
-  }
-  if (tool === "github_pr_monitor_mutate") {
-    const marker = value.replyMarker;
-    if (input.operation === "post_reply") {
-      const expectedMarker = `<!-- gjc:auto-response:v1:${String(value.effectIdentity)} -->`;
-      if (Object.hasOwn(input, "effectIdentity") && (typeof marker !== "string" || marker !== expectedMarker)) {
-        throw new Error("MCP success post_reply does not bind its exact marker/channel relation");
-      }
-      if (marker !== undefined && (typeof marker !== "string" || marker !== expectedMarker)) {
-        throw new Error("MCP success post_reply marker/channel relation is invalid");
-      }
-    } else if (marker !== undefined) {
-      throw new Error("MCP success carried a reply marker for a non-post_reply operation");
-    }
+  const proof = record(value.chatgpt2codexToolCall, "MCP structuredContent omitted tool-call proof");
+  if (proof.namespace !== "ChatGPT_To_Codex"
+    || proof.toolName !== "github_pr_monitor_read"
+    || proof.ok !== true
+    || canonicalJson(proof.input) !== canonicalJson(input)) {
+    throw new Error("MCP success does not bind the exact read tool-call proof");
   }
   return value;
 }
@@ -208,23 +114,22 @@ function failedStructuredContent(
   tool: DirectMonitorTool,
   input: Record<string, unknown>,
 ): Record<string, unknown> {
-  exactKeys(
-    value,
-    ["chatgpt2codexToolCall", "protocolVersion", "schemaVersion", "requestDigest", "code", "error", "details"],
-    "MCP error structuredContent",
-  );
-  exactProof(value.chatgpt2codexToolCall, tool, false);
-  if (
-    value.protocolVersion !== 1
-    || value.schemaVersion !== 4
-    || typeof value.requestDigest !== "string"
-    || value.requestDigest !== actionRequestDigest(input)
-    || typeof value.code !== "string"
-    || value.code.length === 0
-    || typeof value.error !== "string"
-    || value.error.length === 0
-  ) {
-    throw new Error("MCP error omitted its exact v4 code, message, or input binding");
+  if (tool !== "github_pr_monitor_read"
+    || !validateMonitorError(value)
+    || !GithubPrMonitorErrorResultSchema.safeParse(value).success) {
+    throw new Error("MCP error is not a valid shared github_pr_monitor_read result");
+  }
+  if (value.requestDigest !== actionRequestDigest(input)
+    || value.runId !== input.runId
+    || value.actionPlanId !== input.actionPlanId) {
+    throw new Error("MCP error does not bind the exact read input");
+  }
+  const proof = record(value.chatgpt2codexToolCall, "MCP structuredContent omitted tool-call proof");
+  if (proof.namespace !== "ChatGPT_To_Codex"
+    || proof.toolName !== "github_pr_monitor_read"
+    || proof.ok !== false
+    || canonicalJson(proof.input) !== canonicalJson(input)) {
+    throw new Error("MCP error does not bind the exact read tool-call proof");
   }
   return value;
 }
@@ -250,10 +155,14 @@ export function successfulDirectActionResponse(
     tool,
     input,
   );
-  const expectedProof = { ...toolCallProof(tool, true), toolName: tool, input };
+  const expectedProof = {
+    ...record(structured.chatgpt2codexToolCall, `${tool} Action response omitted tool-call proof`),
+    toolName: tool,
+    input,
+  };
   exactKeys(proof, Object.keys(expectedProof), `${tool} Action response toolCall proof`);
   for (const [key, expectedValue] of Object.entries(expectedProof)) {
-    if (!isDeepStrictEqual(proof[key], expectedValue)) {
+    if (canonicalJson(proof[key]) !== canonicalJson(expectedValue)) {
       throw new Error(`${tool} Action response toolCall proof does not bind the exact call`);
     }
   }
@@ -266,6 +175,7 @@ export function successfulDirectActionResponse(
     || response.tool !== tool
     || typeof response.text !== "string"
     || response.text.length === 0
+    || Buffer.byteLength(String(response.text), "utf8") > MAX_TEXT_BYTES
     || !Array.isArray(response.imageMarkdownList)
     || response.imageMarkdownList.length !== 0
     || structured.namespace !== "ChatGPT_To_Codex"
@@ -277,6 +187,7 @@ export function successfulDirectActionResponse(
   if (response.isError !== undefined && response.isError !== false) {
     throw new Error(`${tool} Action response must not mark a successful response as an error`);
   }
+  enforceWireCap(response, `${tool} Action response`);
   return response as DirectActionResponse;
 }
 function failedDirectActionResponse(
@@ -291,10 +202,15 @@ function failedDirectActionResponse(
     `${tool} Action response`,
   );
   const proof = record(response.toolCall, `${tool} Action response omitted toolCall proof`);
-  const expectedProof = { ...toolCallProof(tool, false), toolName: tool, input };
+  const structured = record(response.structuredContent, `${tool} Action response omitted structuredContent`);
+  const expectedProof = {
+    ...record(structured.chatgpt2codexToolCall, `${tool} Action response omitted tool-call proof`),
+    toolName: tool,
+    input,
+  };
   exactKeys(proof, Object.keys(expectedProof), `${tool} Action response toolCall proof`);
   for (const [key, expectedValue] of Object.entries(expectedProof)) {
-    if (!isDeepStrictEqual(proof[key], expectedValue)) {
+    if (canonicalJson(proof[key]) !== canonicalJson(expectedValue)) {
       throw new Error(`${tool} Action response toolCall proof does not bind the exact call`);
     }
   }
@@ -307,12 +223,14 @@ function failedDirectActionResponse(
     || response.tool !== tool
     || typeof response.text !== "string"
     || response.text.length === 0
+    || Buffer.byteLength(String(response.text), "utf8") > MAX_TEXT_BYTES
     || !Array.isArray(response.imageMarkdownList)
     || response.imageMarkdownList.length !== 0
   ) {
     throw new Error(`${tool} did not return an exact failed v4 ChatGPT_To_Codex Action response`);
   }
   failedStructuredContent(record(response.structuredContent, `${tool} Action response omitted structuredContent`), tool, input);
+  enforceWireCap(response, `${tool} Action response`);
   return response as DirectActionResponse;
 }
 
@@ -321,6 +239,9 @@ export function actionResponseFromMcpResult(
   input: Record<string, unknown>,
   result: unknown,
 ): Record<string, unknown> {
+  if (tool === "github_pr_monitor_read") {
+    try { parseGithubPrMonitorReadInput(input); } catch { throw new Error("Direct monitor input failed strict prevalidation"); }
+  }
   const wire = record(result, "MCP result must be an object");
   exactKeys(wire, ["content", "structuredContent", "isError"], "MCP result");
   if (wire.isError !== undefined && typeof wire.isError !== "boolean") throw new Error("MCP result has a malformed error marker");
@@ -355,6 +276,52 @@ export function actionResponseFromMcpResult(
   return ok ? successfulDirectActionResponse(response, tool, input) : failedDirectActionResponse(response, tool, input);
 }
 
+function safeInput(value: unknown): { runId: string; actionPlanId: string } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  try {
+    const candidate = value as Record<string, unknown>;
+    const runId = candidate.runId;
+    const actionPlanId = candidate.actionPlanId;
+    return isSafeId(runId) && isSafeId(actionPlanId) ? { runId, actionPlanId } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function invalidDirectActionResponse(tool: DirectMonitorTool, input: Record<string, unknown>): DirectActionResponse {
+  const safe = safeInput(input);
+  const code = "GITHUB_MONITOR_INVALID_INPUT" as const;
+  const error = safeErrorMessage(code);
+  const requestDigest = safe ? actionRequestDigest(safe) : INVALID_INPUT_REQUEST_DIGEST;
+  const structured: Record<string, unknown> = {
+    monitorPayloadVersion: 1,
+    protocolVersion: 1,
+    schemaVersion: 4,
+    requestDigest,
+    namespace: "ChatGPT_To_Codex",
+    tool,
+    operation: "read",
+    ok: false,
+    ...(safe ? { runId: safe.runId, actionPlanId: safe.actionPlanId } : {}),
+    code,
+    error,
+    chatgpt2codexToolCall: makeToolCallProof(safe, false),
+  };
+  const proof = record(structured.chatgpt2codexToolCall, "Direct invalid-input proof is invalid");
+  const response: DirectActionResponse = {
+    ok: false,
+    protocolVersion: 1,
+    schemaVersion: 4,
+    requestDigest,
+    tool,
+    toolCall: { ...structuredClone(proof), toolName: tool },
+    text: error,
+    imageMarkdownList: [],
+    structuredContent: structured,
+    isError: true,
+  };
+  enforceWireCap(response, `${tool} Action response`);
+  return response;
+}
 export interface DirectActionClient {
   call(tool: DirectMonitorTool, input: Record<string, unknown>): Promise<Record<string, unknown>>;
   close(): Promise<void>;
@@ -369,6 +336,10 @@ export async function createDirectActionClient(ctx: ToolContext): Promise<Direct
 
   return {
     async call(tool, input) {
+      if (!isDirectMonitorTool(tool)) throw new Error("Direct monitor tool is not allowlisted");
+      if (tool === "github_pr_monitor_read") {
+        try { parseGithubPrMonitorReadInput(input); } catch { return invalidDirectActionResponse(tool, input); }
+      }
       const result: unknown = await client.callTool({ name: tool, arguments: input });
       return actionResponseFromMcpResult(tool, input, result);
     },
