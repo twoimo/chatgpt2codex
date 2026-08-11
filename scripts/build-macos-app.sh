@@ -4,7 +4,7 @@ export COPYFILE_DISABLE=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="${APP_NAME:-ChatGPT To Codex}"
-BUNDLE_ID="${BUNDLE_ID:-dev.chatgpttocodex.menubar}"
+BUNDLE_ID="${BUNDLE_ID:-app.ezbuilder.chatgpt2codex}"
 VERSION="$(node -p 'require("./package.json").version')"
 BUILD_DIR="$ROOT/build/macos"
 APP_DIR="$BUILD_DIR/${APP_NAME}.app"
@@ -16,6 +16,7 @@ DEPS_DIR="$BUILD_DIR/deps"
 PKG_SCRIPTS_DIR="$BUILD_DIR/pkg-scripts"
 UNSIGNED_PKG="$BUILD_DIR/chatgpt2codex-${VERSION}.pkg"
 SIGNED_PKG="$BUILD_DIR/chatgpt2codex-${VERSION}-signed.pkg"
+OPERATOR_ENTITLEMENTS="$BUILD_DIR/operator-helper.entitlements.plist"
 
 find_codesign_identity() {
   local needle="$1"
@@ -125,6 +126,42 @@ EOF
 
 APP_SIGN_IDENTITY="${CODESIGN_IDENTITY:-$(find_codesign_identity "Developer ID Application")}"
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-$(find_basic_identity "Developer ID Installer")}"
+HELPER_BUNDLE_ID="${OPERATOR_HELPER_BUNDLE_ID:-${BUNDLE_ID}.operator-helper}"
+TEAM_ID="${CODESIGN_TEAM_ID:-}"
+if [[ -z "$TEAM_ID" && "$APP_SIGN_IDENTITY" =~ \(([A-Z0-9]{10})\)$ ]]; then
+  TEAM_ID="${BASH_REMATCH[1]}"
+fi
+if [[ -z "$APP_SIGN_IDENTITY" || "$APP_SIGN_IDENTITY" == "-" ]]; then
+  echo "error: a real Apple code-signing identity is required for the Secure Enclave operator helper." >&2
+  exit 1
+fi
+if [[ ! "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+  echo "error: CODESIGN_TEAM_ID or a ten-character team ID in CODESIGN_IDENTITY is required." >&2
+  exit 1
+fi
+if [[ ! "$BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ || ! "$HELPER_BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "error: bundle identifiers contain unsupported characters." >&2
+  exit 1
+fi
+
+write_operator_helper_entitlements() {
+  python3 - "$ROOT/macos/ChatGPTToCodexStatusBar/operator-helper.entitlements.plist" "$OPERATOR_ENTITLEMENTS" "$TEAM_ID" "$BUNDLE_ID" "$HELPER_BUNDLE_ID" <<'PY'
+import sys
+from pathlib import Path
+
+template_path, output_path, team_id, bundle_id, helper_bundle_id = sys.argv[1:]
+rendered = Path(template_path).read_text(encoding="utf-8")
+for marker, value in {
+    "__TEAM_ID__": team_id,
+    "__BUNDLE_ID__": bundle_id,
+    "__HELPER_BUNDLE_ID__": helper_bundle_id,
+}.items():
+    rendered = rendered.replace(marker, value)
+if "__" in rendered:
+    raise SystemExit("unresolved operator-helper entitlement placeholder")
+Path(output_path).write_text(rendered, encoding="utf-8")
+PY
+}
 
 cd "$ROOT"
 npm run build
@@ -132,6 +169,7 @@ python3 "$ROOT/scripts/generate-macos-icon.py" --out "build/macos/generated-icon
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$RUNTIME_DIR"
+write_operator_helper_entitlements
 
 cp "$ROOT/macos/ChatGPTToCodexStatusBar/Info.plist" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS_DIR/Info.plist" >/dev/null
@@ -213,11 +251,18 @@ chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$MACOS_DIR/chatgpt2codex-ax" "$MA
 write_pkg_scripts
 xattr -cr "$APP_DIR" || true
 
-if [[ -n "$APP_SIGN_IDENTITY" ]]; then
-  codesign --force --deep --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$APP_DIR"
-else
-  codesign --force --deep --sign - "$APP_DIR"
-fi
+codesign --force --deep --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$APP_DIR"
+codesign --force --options runtime --timestamp \
+  --entitlements "$OPERATOR_ENTITLEMENTS" \
+  --identifier "$HELPER_BUNDLE_ID" \
+  --sign "$APP_SIGN_IDENTITY" \
+  "$MACOS_DIR/chatgpt2codex-operator-helper"
+codesign --force --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$APP_DIR"
+codesign --verify --strict --verbose=2 "$MACOS_DIR/chatgpt2codex-operator-helper"
+codesign --display --entitlements :- "$MACOS_DIR/chatgpt2codex-operator-helper" | grep -Fq "${TEAM_ID}.${BUNDLE_ID}.operator" || {
+  echo "error: signed operator helper is missing its team-scoped keychain entitlement." >&2
+  exit 1
+}
 
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 

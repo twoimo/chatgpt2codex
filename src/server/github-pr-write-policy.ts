@@ -1,4 +1,4 @@
-import { GithubPrWriteError, WriteOperation, WriteStage, digest, sha256 } from "./github-pr-write-contract.js";
+import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, WriteOperation, WriteStage, digest, sha256 } from "./github-pr-write-contract.js";
 
 export const MAX_COMMENT_BYTES = 6_000;
 export const AUTO_MARKER_PREFIX = "<!-- gjc:auto-response:v2:";
@@ -12,14 +12,31 @@ export interface GithubEvidence {
   permission: Permission; canPush: boolean; expectedHead: string;
 }
 
+export interface RepositoryTopology {
+  baseRepository: string;
+  headRepository: string;
+}
+
 const rank: Record<Permission, number> = { NONE: 0, READ: 1, TRIAGE: 2, WRITE: 3, MAINTAIN: 4, ADMIN: 5 };
 export function isSameRepository(e: GithubEvidence): boolean { return e.baseRepositoryId === e.headRepositoryId && e.baseRepositoryId === e.repositoryId; }
-export function canWriteCode(e: GithubEvidence): boolean {
-  return e.account.actorType === "User" && e.author.actorType === "User" && isSameRepository(e) && rank[e.permission] >= rank.WRITE && e.canPush;
+export function isOwnedFork(e: GithubEvidence, topology?: RepositoryTopology): boolean {
+  return topology?.baseRepository === GITHUB_PR_WRITE_REPOSITORY
+    && topology.headRepository === GITHUB_PR_WRITE_FORK_REPOSITORY
+    && e.repositoryId === e.baseRepositoryId
+    && e.headRepositoryId !== e.baseRepositoryId;
 }
-export function assertOperationAllowed(operation: WriteOperation, e: GithubEvidence, stage: WriteStage): void {
+export function canWriteCode(e: GithubEvidence, topology?: RepositoryTopology): boolean {
+  return e.account.login === GITHUB_PR_WRITE_ACCOUNT
+    && e.author.login === GITHUB_PR_WRITE_ACCOUNT
+    && e.account.actorType === "User"
+    && e.author.actorType === "User"
+    && (isSameRepository(e) || isOwnedFork(e, topology))
+    && rank[e.permission] >= rank.WRITE
+    && e.canPush;
+}
+export function assertOperationAllowed(operation: WriteOperation, e: GithubEvidence, stage: WriteStage, topology?: RepositoryTopology): void {
   if (stage === "off" || (stage === "prepare" && operation !== "apply_suggestions")) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "operation is disabled at rollout stage");
-  if (stage !== "shadow" && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation) && !canWriteCode(e)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require authored same-repository User PR with push permission");
+  if (stage !== "shadow" && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation) && !canWriteCode(e, topology)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
   if (e.account.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "the authenticated account must be a User");
   if (!["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation) && e.author.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require a User-authored PR");
   if (!Number.isSafeInteger(e.repositoryId) || !Number.isSafeInteger(e.baseRepositoryId) || !Number.isSafeInteger(e.headRepositoryId)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "immutable repository IDs are required");

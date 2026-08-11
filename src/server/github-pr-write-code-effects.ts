@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError } from "./github-pr-write-contract.js";
+import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError } from "./github-pr-write-contract.js";
 import { defaultGhCommand, type GhCommand } from "./github-pr-write-effects.js";
 import { canWriteCode, type GithubEvidence } from "./github-pr-write-policy.js";
 
@@ -15,6 +15,8 @@ export interface CodeEffectContext {
   repository: string;
   prNumber: number;
   expectedHead: string;
+  baseRepository?: string;
+  headRepository?: string;
   headRef?: string;
   evidence: GithubEvidence;
 }
@@ -56,6 +58,8 @@ export class GithubPrWriteCodeEffects {
   constructor(private readonly git: GitCommand = defaultGitCommand, private readonly gh?: GhCommand, private readonly timeoutMs = TIMEOUT_MS) {}
   private async freshRemoteEvidence(context: CodeEffectContext): Promise<void> {
     if (!this.gh) return;
+    const baseRepositoryName = context.baseRepository ?? GITHUB_PR_WRITE_REPOSITORY;
+    const headRepositoryName = context.headRepository ?? GITHUB_PR_WRITE_REPOSITORY;
     try {
       const user = await this.gh(["api", "user", "--hostname", "github.com", "--jq", ".login"], this.timeoutMs);
       if (typeof user.stdout !== "string" || user.timedOut || user.exitCode !== 0 || user.stdout.trim() !== GITHUB_PR_WRITE_ACCOUNT) fail("GITHUB_WRITE_RECOVERY_REQUIRED", "authenticated account evidence is ambiguous");
@@ -67,7 +71,15 @@ export class GithubPrWriteCodeEffects {
       const repository = parsed.repository as Record<string, unknown> | undefined;
       const baseRepository = parsed.baseRepository as Record<string, unknown> | undefined;
       const headRepository = parsed.headRepository as Record<string, unknown> | undefined;
-      if (parsed.state !== "OPEN" || String(parsed.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase() || author?.login !== GITHUB_PR_WRITE_ACCOUNT || repository?.nameWithOwner !== GITHUB_PR_WRITE_REPOSITORY || baseRepository?.nameWithOwner !== GITHUB_PR_WRITE_REPOSITORY || headRepository?.nameWithOwner !== GITHUB_PR_WRITE_REPOSITORY) fail("GITHUB_WRITE_MUTATION_DENIED", "pull request topology or head evidence is stale");
+      if (baseRepositoryName !== GITHUB_PR_WRITE_REPOSITORY || (headRepositoryName !== GITHUB_PR_WRITE_REPOSITORY && headRepositoryName !== GITHUB_PR_WRITE_FORK_REPOSITORY)
+        || parsed.state !== "OPEN"
+        || String(parsed.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase()
+        || author?.login !== GITHUB_PR_WRITE_ACCOUNT
+        || repository?.nameWithOwner !== GITHUB_PR_WRITE_REPOSITORY
+        || baseRepository?.nameWithOwner !== baseRepositoryName
+        || headRepository?.nameWithOwner !== headRepositoryName) {
+        fail("GITHUB_WRITE_MUTATION_DENIED", "pull request topology or head evidence is stale");
+      }
     } catch (error) {
       if (error instanceof GithubPrWriteError) throw error;
       fail("GITHUB_WRITE_RECOVERY_REQUIRED", "pull request evidence is ambiguous");
@@ -75,7 +87,10 @@ export class GithubPrWriteCodeEffects {
   }
 
   private validateContext(context: CodeEffectContext): void {
-    if (!canWriteCode(context.evidence) || context.repository !== GITHUB_PR_WRITE_REPOSITORY || context.evidence.account.login !== GITHUB_PR_WRITE_ACCOUNT || context.evidence.author.login !== GITHUB_PR_WRITE_ACCOUNT || !SHA.test(context.expectedHead) || !Number.isSafeInteger(context.prNumber) || context.prNumber < 1 || !REF.test(context.repository)) fail("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored same-repository User PR with push permission");
+    const baseRepository = context.baseRepository ?? GITHUB_PR_WRITE_REPOSITORY;
+    const headRepository = context.headRepository ?? GITHUB_PR_WRITE_REPOSITORY;
+    const topology = { baseRepository, headRepository };
+    if (!canWriteCode(context.evidence, topology) || baseRepository !== GITHUB_PR_WRITE_REPOSITORY || (headRepository !== GITHUB_PR_WRITE_REPOSITORY && headRepository !== GITHUB_PR_WRITE_FORK_REPOSITORY) || context.repository !== GITHUB_PR_WRITE_REPOSITORY || !SHA.test(context.expectedHead) || !Number.isSafeInteger(context.prNumber) || context.prNumber < 1 || !REF.test(context.repository)) fail("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
     if (context.headRef !== undefined && (!REF.test(context.headRef) || context.headRef.split("/").some((part) => part === "." || part === ".."))) fail("GITHUB_WRITE_INVALID_INPUT", "head ref is invalid");
     const root = path.resolve(context.workspaceRoot);
     if (!root || root === path.parse(root).root) fail("GITHUB_WRITE_INVALID_INPUT", "workspace root is invalid");
@@ -110,6 +125,14 @@ export class GithubPrWriteCodeEffects {
     const value = result.stdout.trim();
     if (!SHA.test(value)) fail("GITHUB_WRITE_RECOVERY_REQUIRED", "git head evidence is invalid");
     return value;
+  }
+  private async assertRemoteOrigin(context: CodeEffectContext, cwd: string): Promise<void> {
+    const result = await this.run(["remote", "get-url", "origin"], cwd, "git remote origin");
+    const actual = result.stdout.trim().replace(/\/+$/u, "").replace(/\.git$/iu, "");
+    const expected = `https://github.com/${context.headRepository ?? GITHUB_PR_WRITE_REPOSITORY}`;
+    if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/iu.test(actual) || actual.toLowerCase() !== expected.toLowerCase()) {
+      fail("GITHUB_WRITE_MUTATION_DENIED", "git origin must be the approved HTTPS head repository");
+    }
   }
 
   private async applySuggestions(worktreePath: string, suggestions: Suggestion[]): Promise<string[]> {
@@ -148,6 +171,7 @@ export class GithubPrWriteCodeEffects {
       const worktreeStat = await lstat(worktreePath).catch(() => undefined);
       if (!worktreeStat?.isDirectory() || worktreeStat.isSymbolicLink()) fail("GITHUB_WRITE_MUTATION_DENIED", "worktree must be a real directory");
     }
+    await this.assertRemoteOrigin(context, worktreePath);
     const initialHead = await this.head(worktreePath);
     if (initialHead.toLowerCase() !== context.expectedHead.toLowerCase()) fail("GITHUB_WRITE_MUTATION_DENIED", "worktree head does not match fresh evidence");
     const clean = await this.run(["status", "--porcelain=v1", "--untracked-files=all"], worktreePath, "git worktree status");

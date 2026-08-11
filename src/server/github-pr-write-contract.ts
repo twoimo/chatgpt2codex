@@ -27,6 +27,7 @@ export const WRITE_OPERATIONS = [
   "apply_suggestions", "push_prepared_worktree",
 ] as const;
 export const GITHUB_PR_WRITE_REPOSITORY = "Yeachan-Heo/gajae-code" as const;
+export const GITHUB_PR_WRITE_FORK_REPOSITORY = "twoimo/gajae-code" as const;
 export const GITHUB_PR_WRITE_ACCOUNT = "twoimo" as const;
 export type WriteOperation = (typeof WRITE_OPERATIONS)[number];
 

@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "../types.js";
 import { toolCallProof } from "./tool-proof.js";
 import { GithubPrWriteAuthority } from "./github-pr-write-authority.js";
-import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, WRITE_OPERATIONS, digest, effectIdentityFor, type WriteStage } from "./github-pr-write-contract.js";
+import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, WRITE_OPERATIONS, digest, effectIdentityFor, type WriteStage } from "./github-pr-write-contract.js";
 import { assertOperationAllowed, assertSafeBody, renderComment, type GithubEvidence } from "./github-pr-write-policy.js";
 import { GithubPrWriteEffects, defaultGhCommand, type GhCommand } from "./github-pr-write-effects.js";
 import { GithubPrWriteCodeEffects, defaultGitCommand, type GitCommand, type Suggestion } from "./github-pr-write-code-effects.js";
@@ -113,8 +113,8 @@ function assertOperationFields(operation: typeof WRITE_OPERATIONS[number], reque
         : operation === "rerequest_reviewer"
           ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "reviewer"]
           : operation === "apply_suggestions"
-            ? ["repository", "prNumber", "expectedHead", "worktreePath", "suggestions", "message"]
-            : ["repository", "prNumber", "expectedHead", "worktreePath", "headRef", "verificationReceiptId", "verificationProofDigest", "noForce"];
+            ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "worktreePath", "suggestions", "message"]
+            : ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "worktreePath", "headRef", "verificationReceiptId", "verificationProofDigest", "noForce"];
   const allowedKeys = new Set(allowed);
   if (Object.keys(request).some((key) => !allowedKeys.has(key))) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
 }
@@ -123,8 +123,9 @@ function assertHostTarget(request: Record<string, unknown>, evidence?: GithubEvi
   if (!Number.isSafeInteger(request.prNumber) || Number(request.prNumber) < 1 || typeof request.expectedHead !== "string" || !/^[0-9a-f]{40}$/iu.test(request.expectedHead)) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
   if (typeof request.baseRepository !== "string" || request.baseRepository !== GITHUB_PR_WRITE_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (typeof request.headRepository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(request.headRepository)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
-  if (operation !== undefined && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation) && request.headRepository !== GITHUB_PR_WRITE_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
-  if (evidence && evidence.account.login !== GITHUB_PR_WRITE_ACCOUNT) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  const codeOperation = operation !== undefined && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation);
+  if (codeOperation && request.headRepository !== GITHUB_PR_WRITE_REPOSITORY && request.headRepository !== GITHUB_PR_WRITE_FORK_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  if (evidence && (evidence.account.login !== GITHUB_PR_WRITE_ACCOUNT || evidence.expectedHead !== request.expectedHead)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
 }
 function reviewContext(input: z.infer<typeof requestSchema>) {
   const request = input.request;
@@ -201,6 +202,8 @@ function codeContext(input: z.infer<typeof requestSchema>, workspaceRoot: string
     repository: requiredString(request, "repository"),
     prNumber: typeof request.prNumber === "number" ? request.prNumber : NaN,
     expectedHead: requiredString(request, "expectedHead"),
+    baseRepository: requiredString(request, "baseRepository"),
+    headRepository: requiredString(request, "headRepository"),
     headRef: typeof request.headRef === "string" ? request.headRef : undefined,
     evidence: input.evidence as GithubEvidence,
   };
@@ -307,7 +310,9 @@ export function registerGithubPrMonitorWriteTools(server: McpServer, ctx: ToolCo
     validateRequestPayload(input);
     const a = authorityOrThrow(authority);
     const stage = writeStage();
-    assertOperationAllowed(input.operation, input.evidence as GithubEvidence, stage);
+    assertOperationAllowed(input.operation, input.evidence as GithubEvidence, stage, (input.operation === "apply_suggestions" || input.operation === "push_prepared_worktree")
+      ? { baseRepository: requiredString(input.request, "baseRepository"), headRepository: requiredString(input.request, "headRepository") }
+      : undefined);
     const p = a.assertRequestAuthorized(input.sessionId, input.previewId, input.approvalId, input.operation, input.request);
     const boundSession = a.assertSession(input.sessionId);
     if (ctx.remote && input.idempotencyKey !== undefined) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT", "caller idempotency keys are not accepted on remote transports");
