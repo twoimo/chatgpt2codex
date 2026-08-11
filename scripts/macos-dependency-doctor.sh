@@ -85,6 +85,15 @@ if [[ ! -f "$ROOT/dist/cli.js" ]]; then
 else
   ok "runtime CLI found"
 fi
+if [[ "${CHATGPT2CODEX_ACTIONS_MODE:-}" == "github-pr-monitor-write" ]]; then
+  if ! command -v security >/dev/null 2>&1; then
+    block "write mode requires macOS Security.framework and a real Apple code-signing identity."
+  elif ! security find-identity -v -p codesigning 2>/dev/null | grep -Eq '"(Developer ID Application|Apple Development):'; then
+    block "write mode requires an Apple Development or Developer ID Application identity; ad-hoc signing cannot authorize Secure Enclave writes."
+  else
+    ok "write-mode Apple signing identity available"
+  fi
+fi
 
 if [[ ! -x "$ROOT/start-chatgpt.sh" ]]; then
   block "start-chatgpt.sh is missing or not executable. Reinstall ChatGPT To Codex."
