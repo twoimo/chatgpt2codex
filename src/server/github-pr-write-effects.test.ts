@@ -1,0 +1,37 @@
+import { describe, expect, it } from "vitest";
+import { GithubPrWriteEffects, type GhCommand } from "./github-pr-write-effects.js";
+
+const context = { repository: "acme/project", prNumber: 7, expectedHead: "0123456789abcdef0123456789abcdef01234567", actor: "alice", author: "alice" };
+const evidence = JSON.stringify({ state: "OPEN", author: { login: "alice" }, headRefOid: context.expectedHead, repository: { nameWithOwner: context.repository }, baseRepository: { nameWithOwner: context.repository }, headRepository: { nameWithOwner: context.repository } });
+function fake(responses: string[], calls: string[][]): GhCommand { return async (argv) => { calls.push([...argv]); return { stdout: responses.shift() ?? "{}", exitCode: 0 }; }; }
+
+describe("GithubPrWriteEffects", () => {
+  it("uses fixed host and operation argv for a comment", async () => {
+    const calls: string[][] = [];
+    const effect = new GithubPrWriteEffects(fake(["alice", evidence, "{}"], calls));
+    const receipt = await effect.execute(context, { operation: "post_comment", body: "hello", effectIdentity: "effect-1" });
+    expect(receipt.status).toBe("completed");
+    expect(calls[0]).toEqual(["api", "user", "--hostname", "github.com", "--jq", ".login"]);
+    expect(calls[2]).toContain("repos/acme/project/issues/7/comments");
+    expect(calls[2]).toContain("--hostname");
+  });
+  it("rejects authenticated account mismatch before mutation", async () => {
+    const calls: string[][] = [];
+    const effect = new GithubPrWriteEffects(fake(["mallory"], calls));
+    await expect(effect.execute(context, { operation: "post_comment", body: "hello", effectIdentity: "effect-1" })).rejects.toThrow(/authenticated/);
+    expect(calls).toHaveLength(1);
+  });
+  it("rejects closed or drifted pull requests", async () => {
+    const calls: string[][] = [];
+    const closed = evidence.replace('"OPEN"', '"CLOSED"');
+    const effect = new GithubPrWriteEffects(fake(["alice", closed], calls));
+    await expect(effect.execute(context, { operation: "request_reviewer", reviewer: "bob" })).rejects.toThrow(/evidence/);
+    expect(calls).toHaveLength(2);
+  });
+  it("does not expose hostile command output", async () => {
+    const calls: string[][] = [];
+    const effect = new GithubPrWriteEffects(fake(["alice", evidence, "SECRET token stdout"], calls));
+    const receipt = await effect.execute(context, { operation: "request_reviewer", reviewer: "bob" });
+    expect(JSON.stringify(receipt)).not.toContain("SECRET");
+  });
+});
