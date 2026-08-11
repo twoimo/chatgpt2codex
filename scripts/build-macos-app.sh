@@ -10,6 +10,9 @@ BUILD_DIR="$ROOT/build/macos"
 APP_DIR="$BUILD_DIR/${APP_NAME}.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
+HELPER_APP_DIR="$CONTENTS_DIR/Helpers/ChatGPTToCodexOperatorHelper.app"
+HELPER_APP_CONTENTS_DIR="$HELPER_APP_DIR/Contents"
+HELPER_APP_MACOS_DIR="$HELPER_APP_CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 RUNTIME_DIR="$RESOURCES_DIR/chatgpt2codex"
 DEPS_DIR="$BUILD_DIR/deps"
@@ -134,16 +137,25 @@ fi
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-$(find_basic_identity "Developer ID Installer")}"
 HELPER_BUNDLE_ID="${OPERATOR_HELPER_BUNDLE_ID:-${BUNDLE_ID}.operator-helper}"
 PROVISIONING_PROFILE_PATH="${PROVISIONING_PROFILE_PATH:-}"
-TEAM_ID="${CODESIGN_TEAM_ID:-}"
-if [[ -z "$TEAM_ID" && "$APP_SIGN_IDENTITY" =~ \(([A-Z0-9]{10})\)$ ]]; then
-  TEAM_ID="${BASH_REMATCH[1]}"
-fi
 if [[ -z "$APP_SIGN_IDENTITY" || "$APP_SIGN_IDENTITY" == "-" ]]; then
   echo "error: a real Apple code-signing identity is required for the Secure Enclave operator helper." >&2
   exit 1
 fi
+identity_team_id() {
+  local subject
+  subject="$(security find-certificate -a -c "$APP_SIGN_IDENTITY" -p | openssl x509 -noout -subject 2>/dev/null || true)"
+  if [[ "$subject" =~ OU=([A-Z0-9]{10}) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+IDENTITY_TEAM_ID="$(identity_team_id)"
+TEAM_ID="${CODESIGN_TEAM_ID:-$IDENTITY_TEAM_ID}"
 if [[ ! "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
-  echo "error: CODESIGN_TEAM_ID or a ten-character team ID in CODESIGN_IDENTITY is required." >&2
+  echo "error: CODESIGN_TEAM_ID or the signing certificate OU team ID is required." >&2
+  exit 1
+fi
+if [[ -n "$IDENTITY_TEAM_ID" && "$TEAM_ID" != "$IDENTITY_TEAM_ID" ]]; then
+  echo "error: CODESIGN_TEAM_ID '$TEAM_ID' does not match signing certificate team ID '$IDENTITY_TEAM_ID'." >&2
   exit 1
 fi
 if [[ ! "$BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ || ! "$HELPER_BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ ]]; then
@@ -170,25 +182,90 @@ Path(output_path).write_text(rendered, encoding="utf-8")
 PY
 }
 
+validate_operator_profile() {
+  python3 - "$PROVISIONING_PROFILE_PATH" "$TEAM_ID" "$HELPER_BUNDLE_ID" "$BUNDLE_ID" <<'PY'
+import plistlib
+import subprocess
+import sys
+
+profile_path, team_id, helper_bundle_id, bundle_id = sys.argv[1:]
+try:
+    decoded = subprocess.run(
+        ["security", "cms", "-D", "-i", profile_path],
+        check=True,
+        capture_output=True,
+    ).stdout
+    profile = plistlib.loads(decoded)
+except Exception as exc:
+    raise SystemExit(f"invalid provisioning profile: {exc}")
+
+entitlements = profile.get("Entitlements", {})
+expected_app_id = f"{team_id}.{helper_bundle_id}"
+profile_app_id = entitlements.get("com.apple.application-identifier")
+if profile_app_id not in (expected_app_id, f"{team_id}.*"):
+    raise SystemExit(
+        f"provisioning profile does not authorize helper identifier {expected_app_id}"
+    )
+if entitlements.get("com.apple.developer.team-identifier") != team_id:
+    raise SystemExit("provisioning profile team identifier does not match signing identity")
+groups = entitlements.get("keychain-access-groups", [])
+expected_group = f"{team_id}.{bundle_id}.operator"
+default_group = expected_app_id
+if f"{team_id}.*" not in groups and expected_group not in groups and default_group not in groups:
+    raise SystemExit("provisioning profile does not authorize the operator keychain groups")
+PY
+}
+
+write_operator_helper_info() {
+  cat >"$HELPER_APP_CONTENTS_DIR/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>chatgpt2codex-operator-helper</string>
+  <key>CFBundleIdentifier</key>
+  <string>${HELPER_BUNDLE_ID}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>ChatGPT To Codex Operator Helper</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${VERSION}</string>
+  <key>CFBundleVersion</key>
+  <string>${VERSION}</string>
+</dict>
+</plist>
+EOF
+}
+
 cd "$ROOT"
 npm run build
 python3 "$ROOT/scripts/generate-macos-icon.py" --out "build/macos/generated-icons"
 
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$RUNTIME_DIR"
+mkdir -p "$MACOS_DIR" "$HELPER_APP_MACOS_DIR" "$RESOURCES_DIR" "$RUNTIME_DIR"
 write_operator_helper_entitlements
+write_operator_helper_info
 
 cp "$ROOT/macos/ChatGPTToCodexStatusBar/Info.plist" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS_DIR/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$CONTENTS_DIR/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$CONTENTS_DIR/Info.plist" >/dev/null
-if [[ -n "$PROVISIONING_PROFILE_PATH" ]]; then
-  if [[ ! -f "$PROVISIONING_PROFILE_PATH" || -L "$PROVISIONING_PROFILE_PATH" ]]; then
-    echo "error: PROVISIONING_PROFILE_PATH must name a regular provisioning profile file." >&2
-    exit 1
-  fi
-  cp "$PROVISIONING_PROFILE_PATH" "$CONTENTS_DIR/embedded.provisionprofile"
+if [[ -z "$PROVISIONING_PROFILE_PATH" ]]; then
+  echo "error: PROVISIONING_PROFILE_PATH is required for the provisioned Secure Enclave helper." >&2
+  exit 1
 fi
+if [[ ! -f "$PROVISIONING_PROFILE_PATH" || -L "$PROVISIONING_PROFILE_PATH" ]]; then
+  echo "error: PROVISIONING_PROFILE_PATH must name a regular provisioning profile file." >&2
+  exit 1
+fi
+validate_operator_profile
+cp "$PROVISIONING_PROFILE_PATH" "$HELPER_APP_CONTENTS_DIR/embedded.provisionprofile"
 
 swiftc -O \
   -framework AppKit \
@@ -200,12 +277,12 @@ swiftc -O \
   -framework Foundation \
   -framework Security \
   "$ROOT/macos/ChatGPTToCodexStatusBar/operator-helper.swift" \
-  -o "$MACOS_DIR/chatgpt2codex-operator-helper"
+  -o "$HELPER_APP_MACOS_DIR/chatgpt2codex-operator-helper"
 
 # Native AX semantic-targeting helper for Option B desktop control (see
-# src/control/mac-input.ts resolveHelperPath). Lives next to the status-bar
-# binary so it inherits the same code signature and Accessibility TCC grant
-# (both are covered by the single `codesign --deep` below).
+# src/control/mac-input.ts resolveHelperPath). It is signed with the
+# containing application below and remains separate from the provisioned
+# Secure Enclave operator-helper app.
 swiftc -O \
   -framework AppKit \
   -framework ApplicationServices \
@@ -261,19 +338,20 @@ find "$RUNTIME_DIR/node_modules" -name '*.map' -type f -delete
 find "$RUNTIME_DIR/node_modules" -name '*.ts' ! -name '*.d.ts' -type f -delete
 find "$APP_DIR" -name '._*' -type f -delete
 
-chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$MACOS_DIR/chatgpt2codex-ax" "$MACOS_DIR/chatgpt2codex-operator-helper" "$RUNTIME_DIR/start-chatgpt.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh"
+chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$MACOS_DIR/chatgpt2codex-ax" "$HELPER_APP_MACOS_DIR/chatgpt2codex-operator-helper" "$RUNTIME_DIR/start-chatgpt.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh"
 write_pkg_scripts
 xattr -cr "$APP_DIR" || true
 
-codesign --force --deep --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$APP_DIR"
-codesign --force --options runtime --timestamp \
+codesign --force --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$MACOS_DIR/ChatGPTToCodexStatusBar"
+codesign --force --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$MACOS_DIR/chatgpt2codex-ax"
+codesign --force --deep --options runtime --timestamp \
   --entitlements "$OPERATOR_ENTITLEMENTS" \
   --identifier "$HELPER_BUNDLE_ID" \
   --sign "$APP_SIGN_IDENTITY" \
-  "$MACOS_DIR/chatgpt2codex-operator-helper"
+  "$HELPER_APP_DIR"
 codesign --force --options runtime --timestamp --sign "$APP_SIGN_IDENTITY" "$APP_DIR"
-codesign --verify --strict --verbose=2 "$MACOS_DIR/chatgpt2codex-operator-helper"
-codesign --display --entitlements :- "$MACOS_DIR/chatgpt2codex-operator-helper" | grep -Fq "${TEAM_ID}.${BUNDLE_ID}.operator" || {
+codesign --verify --deep --strict --verbose=2 "$HELPER_APP_DIR"
+codesign --display --entitlements :- "$HELPER_APP_MACOS_DIR/chatgpt2codex-operator-helper" | grep -Fq "${TEAM_ID}.${BUNDLE_ID}.operator" || {
   echo "error: signed operator helper is missing its team-scoped keychain entitlement." >&2
   exit 1
 }

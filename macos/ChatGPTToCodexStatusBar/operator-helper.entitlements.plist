@@ -8,6 +8,7 @@
 	<string>__TEAM_ID__</string>
 	<key>keychain-access-groups</key>
 	<array>
+		<string>__TEAM_ID__.__HELPER_BUNDLE_ID__</string>
 		<string>__TEAM_ID__.__BUNDLE_ID__.operator</string>
 	</array>
 </dict>

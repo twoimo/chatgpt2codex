@@ -747,6 +747,9 @@ private final class ServiceController {
         let socketPath = stateDir.appendingPathComponent("github-pr-write-helper.sock")
         let bundledHelper = Bundle.main.bundleURL
             .appendingPathComponent("Contents")
+            .appendingPathComponent("Helpers")
+            .appendingPathComponent("ChatGPTToCodexOperatorHelper.app")
+            .appendingPathComponent("Contents")
             .appendingPathComponent("MacOS")
             .appendingPathComponent("chatgpt2codex-operator-helper")
         let developmentHelper = runtimeRoot.appendingPathComponent("chatgpt2codex-operator-helper")
