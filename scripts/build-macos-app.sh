@@ -124,9 +124,16 @@ EOF
   chmod +x "$PKG_SCRIPTS_DIR/postinstall"
 }
 
-APP_SIGN_IDENTITY="${CODESIGN_IDENTITY:-$(find_codesign_identity "Developer ID Application")}"
+APP_SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
+if [[ -z "$APP_SIGN_IDENTITY" ]]; then
+  APP_SIGN_IDENTITY="$(find_codesign_identity "Developer ID Application")"
+fi
+if [[ -z "$APP_SIGN_IDENTITY" ]]; then
+  APP_SIGN_IDENTITY="$(find_codesign_identity "Apple Development")"
+fi
 PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-$(find_basic_identity "Developer ID Installer")}"
 HELPER_BUNDLE_ID="${OPERATOR_HELPER_BUNDLE_ID:-${BUNDLE_ID}.operator-helper}"
+PROVISIONING_PROFILE_PATH="${PROVISIONING_PROFILE_PATH:-}"
 TEAM_ID="${CODESIGN_TEAM_ID:-}"
 if [[ -z "$TEAM_ID" && "$APP_SIGN_IDENTITY" =~ \(([A-Z0-9]{10})\)$ ]]; then
   TEAM_ID="${BASH_REMATCH[1]}"
@@ -175,6 +182,13 @@ cp "$ROOT/macos/ChatGPTToCodexStatusBar/Info.plist" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS_DIR/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$CONTENTS_DIR/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$CONTENTS_DIR/Info.plist" >/dev/null
+if [[ -n "$PROVISIONING_PROFILE_PATH" ]]; then
+  if [[ ! -f "$PROVISIONING_PROFILE_PATH" || -L "$PROVISIONING_PROFILE_PATH" ]]; then
+    echo "error: PROVISIONING_PROFILE_PATH must name a regular provisioning profile file." >&2
+    exit 1
+  fi
+  cp "$PROVISIONING_PROFILE_PATH" "$CONTENTS_DIR/embedded.provisionprofile"
+fi
 
 swiftc -O \
   -framework AppKit \
