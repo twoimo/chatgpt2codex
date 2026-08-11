@@ -2,24 +2,35 @@ import { createHash, randomUUID } from "node:crypto";
 
 export const GITHUB_PR_WRITE_PROTOCOL_VERSION = 5 as const;
 export const GITHUB_PR_WRITE_SCHEMA_VERSION = 5 as const;
+export const CAPABILITY_TTL_MS = 1_800_000 as const;
+export const WRITE_SESSION_TTL_MS = 900_000 as const;
+export const PREVIEW_TTL_MS = 300_000 as const;
+export const CHALLENGE_TTL_MS = 120_000 as const;
+export const APPROVAL_TTL_MS = 90_000 as const;
+export const STATUS_POLL_TTL_MS = 600_000 as const;
+export const CLOCK_SKEW_MS = 30_000 as const;
+
 export const WRITE_TTL_MS = {
-  capability: 30 * 60_000,
-  session: 15 * 60_000,
-  preview: 5 * 60_000,
-  challenge: 2 * 60_000,
-  approval: 90_000,
-  statusHandle: 10 * 60_000,
-  skew: 30_000,
+  capability: CAPABILITY_TTL_MS,
+  session: WRITE_SESSION_TTL_MS,
+  preview: PREVIEW_TTL_MS,
+  challenge: CHALLENGE_TTL_MS,
+  approval: APPROVAL_TTL_MS,
+  statusHandle: STATUS_POLL_TTL_MS,
+  skew: CLOCK_SKEW_MS,
 } as const;
 
 export const WRITE_STAGES = ["off", "shadow", "prepare", "enabled"] as const;
 export type WriteStage = (typeof WRITE_STAGES)[number];
 export const WRITE_OPERATIONS = [
-  "post_comment", "post_reply", "resolve_thread", "request_reviewer",
-  "prepare_suggestions", "commit", "push",
+  "post_comment", "post_reply", "resolve_thread", "rerequest_reviewer",
+  "apply_suggestions", "push_prepared_worktree",
 ] as const;
+export const GITHUB_PR_WRITE_REPOSITORY = "Yeachan-Heo/gajae-code" as const;
+export const GITHUB_PR_WRITE_ACCOUNT = "twoimo" as const;
 export type WriteOperation = (typeof WRITE_OPERATIONS)[number];
 
+export const OPERATOR_PROFILE_ID = "p256-secure-enclave-private-key-usage-user-presence-x962-sha256-v1" as const;
 export const OPERATOR_KEY_PROFILE = {
   curve: "P-256",
   keySize: 256,
@@ -36,12 +47,18 @@ export type WriteErrorCode =
   | "GITHUB_WRITE_CAPABILITY_REQUIRED" | "GITHUB_WRITE_SESSION_REQUIRED"
   | "GITHUB_WRITE_EXPIRED" | "GITHUB_WRITE_CONFLICT"
   | "GITHUB_WRITE_PREVIEW_LIMIT" | "GITHUB_WRITE_APPROVAL_REQUIRED"
-  | "GITHUB_WRITE_RECOVERY_REQUIRED" | "GITHUB_WRITE_MUTATION_DENIED";
+  | "GITHUB_WRITE_RECOVERY_REQUIRED" | "GITHUB_WRITE_MUTATION_DENIED"
+  | "GITHUB_WRITE_PERMISSION_REQUIRED" | "GITHUB_WRITE_OPERATOR_REQUIRED"
+  | "GITHUB_WRITE_SESSION_INVALID" | "GITHUB_WRITE_APPROVAL_INVALID"
+  | "GITHUB_WRITE_PREVIEW_EXPIRED" | "GITHUB_WRITE_CAPABILITY_REVOKED"
+  | "GITHUB_WRITE_ATTESTATION_INVALID" | "GITHUB_WRITE_ROLLOUT_BLOCKED"
+  | "GITHUB_WRITE_ACTOR_UNAUTHORIZED" | "GITHUB_WRITE_PERMISSION_DENIED"
+  | "GITHUB_WRITE_BYPASS_DENIED" | "GITHUB_WRITE_CLOCK_INVALID";
 
 export class GithubPrWriteError extends Error {
   readonly code: WriteErrorCode;
   readonly details?: Record<string, unknown>;
-  constructor(code: WriteErrorCode, message = code, details?: Record<string, unknown>) {
+  constructor(code: WriteErrorCode, message: string = code, details?: Record<string, unknown>) {
     super(message); this.name = "GithubPrWriteError"; this.code = code; this.details = details;
   }
 }
@@ -52,13 +69,61 @@ export class AuthorityClock {
   private readonly mono: () => number;
   private readonly wallAtStart: number;
   private readonly monoAtStart: number;
-  constructor(wall: () => number = Date.now, mono: () => number = () => Number(process.hrtime.bigint() / 1_000_000n)) {
-    this.wall = wall; this.mono = mono; this.wallAtStart = wall(); this.monoAtStart = mono();
+  private lastWall: number;
+  constructor(
+    wall: () => number = Date.now,
+    mono: () => number = () => Number(process.hrtime.bigint() / 1_000_000n),
+  ) {
+    this.wall = wall;
+    this.mono = mono;
+    this.wallAtStart = wall();
+    this.monoAtStart = mono();
+    this.lastWall = this.wallAtStart;
   }
-  now(): number { return this.wall(); }
-  elapsedNow(): number { return this.wallAtStart + (this.mono() - this.monoAtStart); }
-  isExpired(expiresAt: number, now = this.now()): boolean { return now >= expiresAt; }
-  isFuture(value: number, now = this.now()): boolean { return value > now + WRITE_TTL_MS.skew; }
+  /**
+   * Return the single authority timestamp. UTC is persisted; a monotonic
+   * projection is used while this process is alive to detect wall-clock
+   * tampering/sleep jumps.
+   */
+  now(): number {
+    const wall = this.wall();
+    const projected = this.elapsedNow();
+    if (!Number.isSafeInteger(wall) || !Number.isSafeInteger(projected) || Math.abs(wall - projected) > CLOCK_SKEW_MS) {
+      throw new GithubPrWriteError("GITHUB_WRITE_CLOCK_INVALID", "authority clocks diverged");
+    }
+    if (wall < this.lastWall - CLOCK_SKEW_MS) {
+      throw new GithubPrWriteError("GITHUB_WRITE_CLOCK_INVALID", "authority wall clock moved backwards");
+    }
+    this.lastWall = wall;
+    return wall;
+  }
+  elapsedNow(): number {
+    const elapsed = this.mono() - this.monoAtStart;
+    return this.wallAtStart + elapsed;
+  }
+  isExpired(expiresAt: number, now = this.now()): boolean {
+    return now >= expiresAt;
+  }
+  isFuture(value: number, now = this.now()): boolean {
+    return value > now + CLOCK_SKEW_MS;
+  }
+  assertPersistedWindow(
+    issuedAt: number,
+    expiresAt: number,
+    ttl: number,
+    now = this.now(),
+  ): void {
+    if (
+      !Number.isSafeInteger(issuedAt) ||
+      !Number.isSafeInteger(expiresAt) ||
+      !Number.isSafeInteger(ttl) ||
+      expiresAt !== issuedAt + ttl ||
+      issuedAt > now + CLOCK_SKEW_MS ||
+      expiresAt <= now
+    ) {
+      throw new GithubPrWriteError("GITHUB_WRITE_CLOCK_INVALID", "invalid persisted authority window");
+    }
+  }
 }
 
 export function canonicalJson(value: unknown): string {
@@ -73,10 +138,24 @@ export function sha256(value: string | Uint8Array): string {
 }
 export function digest(value: unknown): string { return sha256(canonicalJson(value)); }
 export function newEffectIdentity(): string { return randomUUID(); }
+export function effectIdentityFor(binding: unknown): string {
+  return `v5-${sha256(canonicalJson(binding)).slice(0, 48)}`;
+}
 
-export function assertFreshExpiry(expiresAt: number, now: number, ttl: number): void {
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt > now + ttl + WRITE_TTL_MS.skew) {
-    throw new GithubPrWriteError("GITHUB_WRITE_EXPIRED", "invalid or expired write authority timestamp");
+export function assertFreshExpiry(
+  expiresAt: number,
+  now: number,
+  ttl: number,
+  issuedAt = expiresAt - ttl,
+): void {
+  if (
+    !Number.isSafeInteger(expiresAt) ||
+    !Number.isSafeInteger(issuedAt) ||
+    expiresAt !== issuedAt + ttl ||
+    expiresAt <= now ||
+    issuedAt > now + CLOCK_SKEW_MS
+  ) {
+    throw new GithubPrWriteError("GITHUB_WRITE_CLOCK_INVALID", "invalid or expired write authority timestamp");
   }
 }
 

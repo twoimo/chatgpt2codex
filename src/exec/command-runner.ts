@@ -22,6 +22,12 @@ const DEFAULT_TIMEOUT_SEC = 30;
 /** Head+tail bytes kept per stream when truncating output. */
 const OUTPUT_HEAD_BYTES = 4000;
 const OUTPUT_TAIL_BYTES = 2000;
+const isGithubMutationIntent = (argv: readonly string[]): boolean => {
+  const text = argv.join(" ").toLowerCase();
+  return /(^|[\s;&|])(?:gh|hub)(?:[\s;&|]|$)/.test(text)
+    || /git\s+(?:push|commit|update-ref|send-pack|receive-pack|fetch|pull|clone)\b/.test(text)
+    || /(?:graphql|api\.github\.com|github\.com)[^\n]*(?:mutation|post|put|patch|delete|push)/.test(text);
+};
 
 /** Env vars allowed to reach the child process (PRD §8.5 execution tools). */
 const ENV_ALLOWLIST = [
@@ -62,8 +68,8 @@ const SECRET_SCRIPT_PATTERN =
 // flags, so `rm -rf *`/`rm -rf .`/`rm -rf $DIR` all slipped past it into a
 // non-destructive riskTier). Also cover `find -delete` and `git clean`.
 const DESTRUCTIVE_SCRIPT_PATTERN =
-  /\bsudo\b|\brm\s+-\w*r\w*f\w*\b|\brm\s+-\w*f\w*r\w*\b|\bfind\b[^\n]*-delete\b|\bgit\s+clean\b|\bdiskutil\s+erase|\bmkfs\b|\bshutdown\b|\breboot\b/i;
-const NETWORK_SCRIPT_PATTERN = /\b(npm|pnpm|yarn|bun)\s+(install|add|update)|\b(curl|wget)\b|\bgit\s+(pull|fetch|clone|push)\b/i;
+  /\bsudo\b|\brm\s+-\w*r\w*f\w*\b|\brm\s+-\w*f\w*r\w*\b|\bfind\b[^\n]*-delete\b|\bgit\s+clean\b|\bgit\s+(?:push|commit|update-ref|send-pack|receive-pack)\b|\b(?:gh|hub)\b|\b(?:graphql|api\.github\.com)[^\n]*(?:mutation|post|put|patch|delete)\b|\bdiskutil\s+erase|\bmkfs\b|\bshutdown\b|\breboot\b/i;
+const NETWORK_SCRIPT_PATTERN = /\b(npm|pnpm|yarn|bun)\s+(install|add|update)|\b(curl|wget)\b|\bgit\s+(pull|fetch|clone|push)\b|\b(?:github\.com|api\.github\.com)\b/i;
 
 function classifyByName(name: string): string {
   if (DESTRUCTIVE_NAME_PATTERN.test(name)) return "destructive";
@@ -100,7 +106,13 @@ async function discoverPackageJsonCommands(root: string): Promise<DiscoveredComm
 
 function npmRunArgv(name: string): string[] {
   const npmExecPath = process.env.npm_execpath;
-  if (npmExecPath && existsSync(npmExecPath)) {
+  // Bun exposes its own executable as `npm_execpath`; passing that binary to
+  // Node as a script makes the child exit before command-runner's timeout.
+  if (
+    npmExecPath &&
+    existsSync(npmExecPath) &&
+    !/(?:^|[/\\])bun(?:\.exe)?$/i.test(npmExecPath)
+  ) {
     return [process.execPath, npmExecPath, "run", name];
   }
   return [process.platform === "win32" ? "npm.cmd" : "npm", "run", name];
@@ -303,6 +315,9 @@ export async function runCommand(
   }
   const extraArgs = args ?? [];
   const fullArgs = [...baseArgs, ...extraArgs];
+  if (isGithubMutationIntent([cmd, ...fullArgs])) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "GitHub mutation commands require the dedicated write workflow");
+  }
   const invocation = buildExecFileInvocation(cmd, fullArgs);
 
   const start = Date.now();

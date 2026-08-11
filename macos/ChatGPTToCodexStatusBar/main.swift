@@ -208,6 +208,7 @@ private final class ServiceController {
     private let autoCheckUpdatesKey = "autoCheckUpdates"
     private let chatGPTReadOnlyKey = "chatGPTReadOnly"
     private(set) var process: Process?
+    private(set) var operatorHelperProcess: Process?
 
     let appName = "ChatGPT To Codex"
     let defaultWorkspace: String
@@ -737,6 +738,53 @@ private final class ServiceController {
         }.resume()
     }
 
+    func startOperatorHelper() {
+        if let helper = operatorHelperProcess, helper.isRunning { return }
+        let stateDir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".local")
+            .appendingPathComponent("share")
+            .appendingPathComponent("chatgpt2codex")
+        let socketPath = stateDir.appendingPathComponent("github-pr-write-helper.sock")
+        let bundledHelper = Bundle.main.bundleURL
+            .appendingPathComponent("Contents")
+            .appendingPathComponent("MacOS")
+            .appendingPathComponent("chatgpt2codex-operator-helper")
+        let developmentHelper = runtimeRoot.appendingPathComponent("chatgpt2codex-operator-helper")
+        let helperURL = FileManager.default.fileExists(atPath: bundledHelper.path) ? bundledHelper : developmentHelper
+        guard FileManager.default.fileExists(atPath: helperURL.path) else {
+            appendLog("operator helper unavailable: \(helperURL.path)\n")
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stateDir.path)
+            let helper = Process()
+            helper.executableURL = helperURL
+            helper.arguments = ["--socket", socketPath.path]
+            helper.standardOutput = FileHandle.nullDevice
+            helper.standardError = FileHandle.nullDevice
+            helper.terminationHandler = { [weak self] terminated in
+                DispatchQueue.main.async {
+                    if self?.operatorHelperProcess === helper {
+                        self?.operatorHelperProcess = nil
+                    }
+                }
+                if terminated.terminationStatus != 0 {
+                    self?.appendLog("operator helper exited with status \(terminated.terminationStatus)\n")
+                }
+            }
+            try helper.run()
+            operatorHelperProcess = helper
+        } catch {
+            appendLog("operator helper launch failed: \(error.localizedDescription)\n")
+        }
+    }
+
+    func stopOperatorHelper() {
+        guard let helper = operatorHelperProcess else { return }
+        if helper.isRunning { helper.terminate() }
+        operatorHelperProcess = nil
+    }
     func start(completion: @escaping (Bool) -> Void) {
         checkHealth { [weak self] alreadyRunning in
             guard let self else { return }
@@ -999,6 +1047,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        controller.startOperatorHelper()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             if let image = NSImage(named: "AppIcon") ?? NSImage(named: "StatusIconTemplate") {
@@ -1043,6 +1092,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         if let monitor = killHotkeyGlobalMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = killHotkeyLocalMonitor { NSEvent.removeMonitor(monitor) }
         controller.stop()
+        controller.stopOperatorHelper()
     }
 
     private func rebuildMenu() {

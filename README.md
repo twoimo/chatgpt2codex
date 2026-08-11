@@ -140,6 +140,7 @@ PRs authored by, or directly requesting review from, the authenticated account
 across visible repositories, with bounded discovery/snapshot output and
 redacted review/check metadata. It does not comment, edit, commit, push, or run
 monitor state, migration, or reconciliation operations.
+A separately selected `CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write` surface exists for phase-2 bounded writes. It exposes only dedicated v5 preview, approval/request, status, review-effect, disposable-worktree commit, and compare-and-swap non-force push routes. It requires the fixed `Yeachan-Heo/gajae-code` / `twoimo` target, fresh GitHub evidence, `CHATGPT2CODEX_MONITOR_ROLLOUT=enabled`, and a same-UID macOS helper using a P-256 Secure Enclave key with `WhenUnlockedThisDeviceOnly` + user presence and DER/X9.62 signatures; owner/OAuth authentication, `confirm:true`, browser dialogs, noninteractive approval, and generic call-tool/GitHub mutation commands cannot authorize a write. The only administrative CLI vectors are `github-pr-write --enable`, `--revoke`, `--status`, and `quarantine-v4`; challenge IDs and approval IDs are rejected. Ambiguous remote outcomes remain pending for explicit recovery and are never retried automatically.
 The monitor caps each discovery list at 1,000 issues, limits child feedback pages and
 thread comments, and reports `complete: false` whenever a PR closes or a reviewer
 request changes during the read. Repository keys are canonical lowercase

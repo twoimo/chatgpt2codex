@@ -21,7 +21,7 @@ import type { AutoActionKind } from "./control/auto.js";
 const execFileAsync = promisify(execFile);
 const MAX_DIRECT_ACTION_INPUT_BYTES = 256 * 1024;
 const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
-type ActionsMode = "general" | "github-pr-monitor";
+type ActionsMode = "general" | "github-pr-monitor" | "github-pr-monitor-write";
 
 function configuredActionsMode(): ActionsMode {
   const raw = process.env[ACTIONS_MODE_ENV];
@@ -29,7 +29,8 @@ function configuredActionsMode(): ActionsMode {
   const mode = raw.trim().toLowerCase();
   if (mode === "" || mode === "general") return "general";
   if (mode === "github-pr-monitor") return "github-pr-monitor";
-  throw new Error(`${ACTIONS_MODE_ENV} must be either "general" or "github-pr-monitor".`);
+  if (mode === "github-pr-monitor-write") return "github-pr-monitor-write";
+  throw new Error(`${ACTIONS_MODE_ENV} must be either "general", "github-pr-monitor", or "github-pr-monitor-write".`);
 }
 
 interface ParsedArgs {
@@ -178,7 +179,7 @@ async function applyStartupProjectSelection(ctx: ToolContext, flags: Record<stri
   });
 }
 async function cmdServeStdio(flags: Record<string, string | boolean>, actionsMode: ActionsMode): Promise<void> {
-  const [{ StdioServerTransport }, { isControlEnabled }, { startExecutor }, { createServer, createMonitorServer }] =
+  const [{ StdioServerTransport }, { isControlEnabled }, { startExecutor }, { createServer, createMonitorServer, createMonitorWriteServer }] =
     await Promise.all([
       import("@modelcontextprotocol/sdk/server/stdio.js"),
       import("./control/policy.js"),
@@ -187,12 +188,17 @@ async function cmdServeStdio(flags: Record<string, string | boolean>, actionsMod
     ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const monitorMode = actionsMode === "github-pr-monitor";
-  const ctx = monitorMode ? buildReadOnlyMonitorContext(workspace) : await buildToolContext(workspace);
-  if (!monitorMode) {
+  const writeMode = actionsMode === "github-pr-monitor-write";
+  const ctx = monitorMode || writeMode ? buildReadOnlyMonitorContext(workspace) : await buildToolContext(workspace);
+  if (!monitorMode && !writeMode) {
     await applyStartupProjectSelection(ctx, flags);
     if (isControlEnabled()) startExecutor(ctx);
   }
-  const server = monitorMode ? await createMonitorServer(ctx) : await createServer(ctx);
+  const server = monitorMode
+    ? await createMonitorServer(ctx)
+    : writeMode
+      ? await createMonitorWriteServer(ctx)
+      : await createServer(ctx);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   await ctx.ledger.append({ type: "workspace.opened", workspaceRoot: ctx.workspaceRoot });
@@ -215,7 +221,8 @@ async function cmdServeHttp(
   ]);
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const monitorMode = actionsMode === "github-pr-monitor";
-  const ctx = monitorMode ? buildReadOnlyMonitorContext(workspace) : await buildToolContext(workspace);
+  const writeMode = actionsMode === "github-pr-monitor-write";
+  const ctx = monitorMode || writeMode ? buildReadOnlyMonitorContext(workspace) : await buildToolContext(workspace);
 
   if (!(await hasOwnerToken(ctx.stateDir))) {
     console.error(
@@ -405,11 +412,22 @@ async function cmdOwnerToken(flags: Record<string, string | boolean>): Promise<v
   process.exitCode = 1;
 }
 async function cmdDirectAction(positional: string[], flags: Record<string, string | boolean>): Promise<void> {
-  const { createDirectActionClient, isDirectMonitorTool } = await import("./server/direct-action-client.js");
+  const {
+    createDirectActionClient,
+    createDirectWriteActionClient,
+    isDirectMonitorTool,
+    isDirectMonitorWriteTool,
+  } = await import("./server/direct-action-client.js");
   const tool = positional[0];
-  if (!tool || positional.length !== 1 || !isDirectMonitorTool(tool)) {
+  const writeMode = process.env.CHATGPT2CODEX_ACTIONS_MODE?.trim().toLowerCase() === "github-pr-monitor-write";
+  const validTool = typeof tool === "string" && (
+    writeMode ? isDirectMonitorWriteTool(tool) : isDirectMonitorTool(tool)
+  );
+  if (!tool || positional.length !== 1 || !validTool) {
     throw new Error(
-      "usage: chatgpt2codex direct-action <github_pr_monitor_read> [--workspace <path>]",
+      writeMode
+        ? "usage: chatgpt2codex direct-action <github_pr_monitor_write_*> [--workspace <path>]"
+        : "usage: chatgpt2codex direct-action <github_pr_monitor_read> [--workspace <path>]",
     );
   }
 
@@ -427,15 +445,37 @@ async function cmdDirectAction(positional: string[], flags: Record<string, strin
 
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const ctx = buildReadOnlyMonitorContext(workspace);
-
+  if (writeMode) {
+    const client = await createDirectWriteActionClient(ctx);
+    try {
+      const response = await client.call(tool as Parameters<typeof client.call>[0], parsed as Record<string, unknown>);
+      console.log(JSON.stringify(response));
+      if (response.ok !== true) process.exitCode = 1;
+    } finally {
+      await client.close();
+    }
+    return;
+  }
   const client = await createDirectActionClient(ctx);
   try {
-    const response = await client.call(tool, parsed as Record<string, unknown>);
+    const response = await client.call(tool as Parameters<typeof client.call>[0], parsed as Record<string, unknown>);
     console.log(JSON.stringify(response));
     if (response.ok !== true) process.exitCode = 1;
   } finally {
     await client.close();
   }
+}
+async function cmdGithubPrWrite(argv: readonly string[]): Promise<void> {
+  const { requestGithubPrWriteAdmin, isAdminSuccess } = await import("./server/github-pr-write-operator-client.js");
+  if (process.env.CHATGPT2CODEX_ACTIONS_MODE?.trim().toLowerCase() !== "github-pr-monitor-write") {
+    throw new Error("github-pr-write requires CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write");
+  }
+  const response = await requestGithubPrWriteAdmin(argv);
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new Error("github-pr-write operator returned an invalid response");
+  }
+  console.log(JSON.stringify(response));
+  if (!isAdminSuccess(response)) process.exitCode = 1;
 }
 async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
@@ -727,12 +767,17 @@ async function main(): Promise<void> {
     case "direct-action":
       await cmdDirectAction(positional, flags);
       break;
+    case "github-pr-write":
+      await cmdGithubPrWrite(process.argv.slice(2));
+      break;
+    case "github-pr-write-approve":
+      throw new Error("github-pr-write-approve has been removed; approval by challenge ID is not supported");
     case "direct-monitor-cycle":
       await cmdDirectMonitorCycle(flags);
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|github-pr-write|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

@@ -5,6 +5,7 @@ import { DomainError, ErrorCode } from "../types.js";
 import { redact } from "../policy/secrets.js";
 import { resolveInProject } from "../policy/paths.js";
 import { buildSafeChildEnv } from "./command-runner.js";
+import { isGithubMutationIntent } from "../server/github-pr-write-policy.js";
 
 const DEFAULT_TIMEOUT_SEC = 60;
 const MAX_TIMEOUT_SEC = 900;
@@ -66,6 +67,9 @@ function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
 }
 
 export function guardShellCommand(command: string): void {
+  if (isGithubMutationIntent(command)) {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "local_shell_run blocked a GitHub mutation command");
+  }
   for (const pattern of SECRET_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
       throw new DomainError(

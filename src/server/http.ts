@@ -11,7 +11,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { ToolContext } from "../types.js";
-import { createServer as createMcpServer, createMonitorServer } from "./mcp-server.js";
+import { createServer as createMcpServer, createMonitorServer, createMonitorWriteServer } from "./mcp-server.js";
 import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provider.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
@@ -19,9 +19,9 @@ import { registerActionRoutes } from "./actions.js";
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
  * §7 auth, §11 SR-05/SR-12) exposing the configured MCP surface over a
- * Streamable HTTP `/mcp` endpoint. When CHATGPT2CODEX_ACTIONS_MODE is
- * `github-pr-monitor`, `/mcp` is monitor-only and exposes only the dynamic
- * read adapter; general mode keeps the regular catalog.
+ * Streamable HTTP `/mcp` endpoint. `github-pr-monitor` exposes only the
+ * dynamic read adapter, while `github-pr-monitor-write` exposes only the
+ * separately gated v5 write adapter; general mode keeps the regular catalog.
  *
  * Does not alter or remove the stdio transport path in src/cli.ts.
  */
@@ -71,7 +71,7 @@ export function defaultHttpServerConfig(overrides: Partial<HttpServerConfig> = {
   };
 }
 
-type HttpMcpMode = "general" | "github-pr-monitor";
+type HttpMcpMode = "general" | "github-pr-monitor" | "github-pr-monitor-write";
 const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
 
 function configuredHttpMcpMode(): HttpMcpMode {
@@ -79,8 +79,8 @@ function configuredHttpMcpMode(): HttpMcpMode {
   if (raw === undefined) return "general";
   const mode = raw.trim().toLowerCase();
   if (mode === "") return "general";
-  if (mode === "general" || mode === "github-pr-monitor") return mode;
-  throw new Error(`${ACTIONS_MODE_ENV} must be either "general" or "github-pr-monitor".`);
+  if (mode === "general" || mode === "github-pr-monitor" || mode === "github-pr-monitor-write") return mode;
+  throw new Error(`${ACTIONS_MODE_ENV} must be either "general", "github-pr-monitor", or "github-pr-monitor-write".`);
 }
 interface TrackedSession {
   transport: StreamableHTTPServerTransport;
@@ -390,7 +390,9 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         // isControlChatGptExposed) — lease arming stays local-only (stdio).
         const mcpServer = mcpMode === "github-pr-monitor"
           ? await createMonitorServer({ ...ctx, remote: true })
-          : await createMcpServer({ ...ctx, remote: true });
+          : mcpMode === "github-pr-monitor-write"
+            ? await createMonitorWriteServer({ ...ctx, remote: true })
+            : await createMcpServer({ ...ctx, remote: true });
         await mcpServer.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");

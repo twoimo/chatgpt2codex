@@ -110,6 +110,7 @@ import {
   validateMonitorSuccess,
 } from "./github-pr-monitor-contract.js";
 import { runGithubPrMonitorRead } from "./github-pr-monitor-read.js";
+import { isGithubMutationIntent } from "./github-pr-write-policy.js";
 
 // ---------------------------------------------------------------------------
 // Session helpers
@@ -144,6 +145,22 @@ async function saveSession(ctx: ToolContext, session: SessionState): Promise<voi
 }
 
 // ---------------------------------------------------------------------------
+const REMOTE_GITHUB_MUTATION_TOOLS = new Set([
+  "file_apply_patch", "file_create", "git_commit", "git_push", "local_shell_run", "command_run",
+  "e2e_start_server", "e2e_run_command", "e2e_test_and_show_screenshot", "e2e_open_target", "e2e_open_url_screenshot",
+]);
+function rejectRemoteGithubMutation(ctx: ToolContext, tool: string, input: unknown): void {
+  if (!ctx.remote || !REMOTE_GITHUB_MUTATION_TOOLS.has(tool)) return;
+  let serialized = "";
+  try { serialized = JSON.stringify(input) ?? ""; } catch { serialized = ""; }
+  const target = serialized.toLowerCase();
+  const canonicalGithubOrigin = /(?:github\.com|api\.github\.com|yeachan-heo[/:]gajae-code)/u.test(target);
+  const genericIntent = isGithubMutationIntent(serialized);
+  const directGitWriter = tool === "git_commit" || tool === "git_push";
+  if (canonicalGithubOrigin || genericIntent || directGitWriter) {
+    throw new DomainError(ErrorCode.GITHUB_WRITE_BYPASS_DENIED, "generic remote GitHub mutation is unavailable; use the dedicated local-approval write workflow");
+  }
+}
 // Registry helpers
 // ---------------------------------------------------------------------------
 
@@ -4199,6 +4216,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "file_apply_patch", input, async () => {
+        rejectRemoteGithubMutation(ctx, "file_apply_patch", input);
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await applyPatch(entry.root, input.patch, input.preconditionHashes);
@@ -4242,6 +4260,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "file_create", input, async () => {
+        rejectRemoteGithubMutation(ctx, "file_create", input);
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await createFile(entry.root, input.path, input.content, input.overwrite);
@@ -4305,6 +4324,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "command_run", input, async () => {
+        rejectRemoteGithubMutation(ctx, "command_run", input);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const commandsForPolicy = await listCommands(entry.root);
         const commandForPolicy = commandsForPolicy.find((c) => c.commandId === input.commandId);
@@ -4395,6 +4415,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "local_shell_run", input, async () => {
+        rejectRemoteGithubMutation(ctx, "local_shell_run", input);
         await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
         if (input.intent?.needsNetwork || input.intent?.destructive) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This local shell request requires explicit approval");
@@ -4454,6 +4475,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "e2e_start_server", { ...input, command: redact(input.command) }, async () => {
+        rejectRemoteGithubMutation(ctx, "e2e_start_server", input);
         await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
         if (input.intent?.needsNetwork || input.intent?.destructive) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This E2E server request requires explicit approval");
@@ -4504,6 +4526,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "e2e_open_target", input, async () => {
+        rejectRemoteGithubMutation(ctx, "e2e_open_target", input);
         let appPath = input.appPath;
         if (input.url !== undefined) {
           if (!input.projectId) {
@@ -4568,6 +4591,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async () => {
+        rejectRemoteGithubMutation(ctx, "e2e_run_command", input);
         await requireProjectLease(ctx, input.projectId, input.intent?.writesWorkspace ? "write" : "verify");
         if (input.intent?.needsNetwork || input.intent?.destructive) {
           throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "This E2E command request requires explicit approval");
@@ -4658,6 +4682,7 @@ export function registerTools(
           instruction: input.instruction ? "[instruction redacted]" : undefined,
         },
         async () => {
+          rejectRemoteGithubMutation(ctx, "e2e_test_and_show_screenshot", input);
           const project = await resolveProjectForE2e(ctx, input.projectId);
           let server:
             | {
@@ -4803,6 +4828,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "e2e_screenshot", input, async () => {
+        rejectRemoteGithubMutation(ctx, "e2e_screenshot", input);
         await requireProjectLease(ctx, input.projectId, "verify");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await captureE2eScreenshot(entry.root, {
@@ -4834,6 +4860,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "e2e_open_url_screenshot", input, async () => {
+        rejectRemoteGithubMutation(ctx, "e2e_open_url_screenshot", input);
         if (!isLocalHttpUrl(input.url)) {
           throw new DomainError(
             ErrorCode.APPROVAL_REQUIRED,
@@ -4980,6 +5007,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "git_commit", input, async () => {
+        rejectRemoteGithubMutation(ctx, "git_commit", input);
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         if (input.paths) {
@@ -5946,6 +5974,7 @@ export function registerTools(
     },
     async (input) => {
       return withErrorMapping(ctx, "git_push", input, async () => {
+        rejectRemoteGithubMutation(ctx, "git_push", input);
         await requireProjectLease(ctx, input.projectId, "remote");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await gitPush(entry.root, input.remote, input.branch);

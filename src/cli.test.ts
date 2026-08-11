@@ -39,7 +39,7 @@ describe("CLI Actions mode startup", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain(
-      'CHATGPT2CODEX_ACTIONS_MODE must be either "general" or "github-pr-monitor".',
+      'CHATGPT2CODEX_ACTIONS_MODE must be either "general", "github-pr-monitor", or "github-pr-monitor-write".',
     );
     await expect(fs.stat(stateDir)).rejects.toMatchObject({ code: "ENOENT" });
   });

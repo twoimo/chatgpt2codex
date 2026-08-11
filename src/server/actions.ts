@@ -5,7 +5,7 @@ import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { CONTROL_TOOL_NAMES, isControlChatGptExposed } from "../control/policy.js";
-import { createServer as createMcpServer } from "./mcp-server.js";
+import { createServer as createMcpServer, createMonitorWriteServer } from "./mcp-server.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
 import { normalizeObjectSchema, safeParseAsync, getParseErrorMessage } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 import {
@@ -43,18 +43,28 @@ interface ActionRoute {
 interface MonitorActionContext extends ToolContext {
   githubPrMonitorReadOptions?: GithubPrMonitorReadOptions;
 }
-type ActionsMode = "general" | "github-pr-monitor";
-
+type ActionsMode = "general" | "github-pr-monitor" | "github-pr-monitor-write";
 const ACTIONS_MODE_ENV = "CHATGPT2CODEX_ACTIONS_MODE";
 const GITHUB_PR_MONITOR_TOOL_NAMES = new Set(["github_pr_monitor_read"]);
+const GITHUB_PR_MONITOR_WRITE_TOOL_NAMES = new Set([
+  "github_pr_monitor_write_preview",
+  "github_pr_monitor_write_request",
+  "github_pr_monitor_write_status",
+  "github_pr_monitor_write_post_comment",
+  "github_pr_monitor_write_post_reply",
+  "github_pr_monitor_write_resolve_thread",
+  "github_pr_monitor_write_rerequest_reviewer",
+  "github_pr_monitor_write_apply_suggestions",
+  "github_pr_monitor_write_push_prepared_worktree",
+]);
 
 function configuredActionsMode(): ActionsMode {
   const raw = process.env[ACTIONS_MODE_ENV];
   if (raw === undefined) return "general";
   const mode = raw.trim().toLowerCase();
   if (mode === "") return "general";
-  if (mode === "general" || mode === "github-pr-monitor") return mode;
-  throw new Error(`${ACTIONS_MODE_ENV} must be either "general" or "github-pr-monitor".`);
+  if (mode === "general" || mode === "github-pr-monitor" || mode === "github-pr-monitor-write") return mode;
+  throw new Error(`${ACTIONS_MODE_ENV} must be either "general", "github-pr-monitor", or "github-pr-monitor-write".`);
 }
 
 const ACTION_ROUTES: ActionRoute[] = [
@@ -341,6 +351,45 @@ const ACTION_ROUTES: ActionRoute[] = [
       "Read-only open pull request snapshots for the authenticated GitHub account, including authored and requested-reviewer roles. This route performs no local state or screenshot-share writes.",
     schema: "GithubPrMonitorReadInput",
   },
+  {
+    path: "/actions/github-pr-monitor-write-preview",
+    tool: "github_pr_monitor_write_preview",
+    operationId: "github_pr_monitor_write_preview",
+    summary: "Preview a bounded GitHub PR write",
+    description: "Create a redacted v5 write preview; no remote effect occurs.",
+    schema: "GithubPrWritePreviewInput",
+  },
+  {
+    path: "/actions/github-pr-monitor-write-request",
+    tool: "github_pr_monitor_write_request",
+    operationId: "github_pr_monitor_write_request",
+    summary: "Request an approved GitHub PR write",
+    description: "Submit one operation after local approval and fresh evidence.",
+    schema: "GithubPrWriteRequestInput",
+  },
+  {
+    path: "/actions/github-pr-monitor-write-status",
+    tool: "github_pr_monitor_write_status",
+    operationId: "github_pr_monitor_write_status",
+    summary: "Read GitHub PR write status",
+    description: "Read bounded pending effect status from the host authority.",
+    schema: "GithubPrWriteStatusInput",
+  },
+  ...[
+    "post_comment",
+    "post_reply",
+    "resolve_thread",
+    "rerequest_reviewer",
+    "apply_suggestions",
+    "push_prepared_worktree",
+  ].map((operation) => ({
+    path: `/actions/github-pr-monitor-write-${operation.replaceAll("_", "-")}`,
+    tool: `github_pr_monitor_write_${operation}`,
+    operationId: `github_pr_monitor_write_${operation}`,
+    summary: `Execute bounded ${operation.replaceAll("_", " ")} operation`,
+    description: "Execute one operation only after the v5 authority and local approval gates pass.",
+    schema: "GithubPrWriteRequestInput",
+  })),
 ];
 
 const OPENAPI_ACTION_TOOL_NAMES = new Set([
@@ -412,8 +461,11 @@ function openApiActionRoutes(mode: ActionsMode): ActionRoute[] {
   if (mode === "github-pr-monitor") {
     return ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool));
   }
+  if (mode === "github-pr-monitor-write") {
+    return ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(route.tool));
+  }
   return ACTION_ROUTES.filter((route) =>
-    OPENAPI_ACTION_TOOL_NAMES.has(route.tool) && !GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool),
+    OPENAPI_ACTION_TOOL_NAMES.has(route.tool) && !GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool) && !GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(route.tool),
   );
 }
 const MONITOR_OPENAPI_SCHEMA_NAMES = new Set([
@@ -422,6 +474,11 @@ const MONITOR_OPENAPI_SCHEMA_NAMES = new Set([
   "GithubPrMonitorErrorResult",
   "GithubPrMonitorReadInput",
   "GithubPrMonitorReadResult",
+  "GithubPrWritePreviewInput",
+  "GithubPrWriteRequestInput",
+  "GithubPrWriteStatusInput",
+  "GithubPrWriteResult",
+  "GithubPrWriteActionResponse",
   "HealthResponse",
   "ToolAvailabilityGate",
   "ToolCallProof",
@@ -483,6 +540,17 @@ function safeMonitorActionInput(body: unknown): Record<string, unknown> {
   const runId = raw.runId;
   const actionPlanId = raw.actionPlanId;
   return isSafeId(runId) && isSafeId(actionPlanId) ? { runId, actionPlanId } : {};
+}
+function safeWriteActionInput(body: unknown): Record<string, unknown> {
+  const raw = isRecord(body) ? body : {};
+  const safe: Record<string, unknown> = {};
+  for (const key of ["sessionId", "previewId", "approvalId", "idempotencyKey", "effectId"]) {
+    if (isSafeId(raw[key])) safe[key] = raw[key];
+  }
+  if (typeof raw.operation === "string" && raw.operation.length <= 64 && /^[a-z_]+$/u.test(raw.operation)) {
+    safe.operation = raw.operation;
+  }
+  return safe;
 }
 
 function actionInputForRoute(route: ActionRoute, body: unknown): Record<string, unknown> {
@@ -696,12 +764,15 @@ async function callRegisteredTool(
     };
   }
   if (toolName.startsWith("github_pr_monitor_")) {
-    const message = `Tool ${toolName} is unavailable through the generic Actions bridge.`;
-    return {
-      isError: true,
-      structuredContent: { code: "PERMISSION_DENIED", error: message },
-      content: [{ type: "text", text: message }],
-    };
+    const writeTool = GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(toolName);
+    if (!(writeTool && configuredActionsMode() === "github-pr-monitor-write")) {
+      const message = `Tool ${toolName} is unavailable through the generic Actions bridge.`;
+      return {
+        isError: true,
+        structuredContent: { code: "PERMISSION_DENIED", error: message },
+        content: [{ type: "text", text: message }],
+      };
+    }
   }
   // project_select isn't itself a control tool (so it isn't caught by
   // CONTROL_TOOL_NAMES above), but preset="control" is the only way to grant
@@ -722,7 +793,9 @@ async function callRegisteredTool(
       content: [{ type: "text", text: message }],
     };
   }
-  const server = await createMcpServer(ctx);
+  const server = GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(toolName)
+    ? await createMonitorWriteServer(ctx)
+    : await createMcpServer(ctx);
   const tools = (server as unknown as { _registeredTools?: Record<string, RegisteredToolLike> })._registeredTools;
   const registered = tools?.[toolName];
   const handler = registered?.handler;
@@ -901,9 +974,10 @@ async function actionResponse(
   toolCallInput: Record<string, unknown>,
   result: CallToolResultLike,
 ): Promise<Record<string, unknown>> {
-  const monitor = GITHUB_PR_MONITOR_TOOL_NAMES.has(tool);
   const monitorRead = tool === "github_pr_monitor_read";
-  const enriched = monitorRead
+  const monitorWrite = GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(tool);
+  const monitor = monitorRead || monitorWrite;
+  const enriched = monitorRead || monitorWrite
     ? { value: result.structuredContent ?? {}, markdown: [] as string[] }
     : await attachInlineScreenshotShares(ctx, publicOrigin, result.structuredContent ?? {});
   const text = resultText(result);
@@ -914,19 +988,23 @@ async function actionResponse(
   const validMonitorRead = monitorRead && (validateMonitorSuccess(structuredValue) || validateMonitorError(structuredValue));
   const structuredContent = validMonitorRead
     ? structuredValue
-    : monitor
-      ? {
-          ...structuredValue,
-          protocolVersion: 1,
-          schemaVersion: 4,
-          requestDigest,
-          chatgpt2codexToolCall: toolCallProof(tool, ok),
-        }
-      : enriched.value;
+    : monitorWrite
+      ? structuredValue
+      : monitor
+        ? {
+            ...structuredValue,
+            protocolVersion: 1,
+            schemaVersion: 4,
+            requestDigest,
+            chatgpt2codexToolCall: toolCallProof(tool, ok),
+          }
+        : enriched.value;
+  const responseProtocolVersion = monitorWrite ? 5 : 1;
+  const responseSchemaVersion = monitorWrite ? 5 : 4;
   return {
     ok,
-    protocolVersion: 1,
-    schemaVersion: 4,
+    protocolVersion: responseProtocolVersion,
+    schemaVersion: responseSchemaVersion,
     requestDigest,
     tool,
     toolCall: {
@@ -1013,7 +1091,7 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
       },
     },
   };
-  if (mode === "github-pr-monitor") {
+  if (mode === "github-pr-monitor" || mode === "github-pr-monitor-write") {
     delete paths["/actions/call-tool"];
   }
 
@@ -1035,7 +1113,9 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
               "application/json": {
                 schema: route.tool === "github_pr_monitor_read"
                   ? GITHUB_PR_MONITOR_ACTION_RESPONSE_SCHEMA
-                  : { "$ref": "#/components/schemas/ActionToolResponse" },
+                  : GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(route.tool)
+                    ? { "$ref": "#/components/schemas/GithubPrWriteActionResponse" }
+                    : { "$ref": "#/components/schemas/ActionToolResponse" },
               },
             },
           },
@@ -1056,7 +1136,9 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
       description:
         mode === "github-pr-monitor"
           ? "OpenAPI bridge for Custom GPTs in github-pr-monitor mode. Use /actions/github-pr-monitor-read for the read-only GitHub PR monitor; mutation and state authorities are unavailable. ChatGPT's sandbox cannot write /Users/... directly."
-          : "OpenAPI bridge for Custom GPTs. Monitor authorities are not exposed on Actions; use the read-only monitor MCP surface instead. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
+          : mode === "github-pr-monitor-write"
+            ? "OpenAPI bridge for the bounded, host-authorized GitHub PR monitor write mode. Use only the dedicated write routes; the read-only monitor and generic call-tool bridge are unavailable."
+            : "OpenAPI bridge for Custom GPTs. Monitor authorities are not exposed on Actions; use the read-only monitor MCP surface instead. Use goal_intake or goal_loop for broad work; use code_search followed by narrow file_read_slice calls. It exposes E2E server/app launch plus screenshot capture. ChatGPT's sandbox cannot write /Users/... directly; for images use save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes(mode).map((route) => route.tool),
@@ -1551,6 +1633,105 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
         },
         GithubPrMonitorReadResult: GITHUB_PR_MONITOR_OPENAPI.success,
         GithubPrMonitorErrorResult: GITHUB_PR_MONITOR_OPENAPI.error,
+        GithubPrWritePreviewInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["sessionId", "operation", "request"],
+          properties: {
+            sessionId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
+            operation: { type: "string", enum: ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "apply_suggestions", "push_prepared_worktree"] },
+            request: { type: "object", additionalProperties: true, maxProperties: 32 },
+          },
+        },
+        GithubPrWriteRequestInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["sessionId", "previewId", "approvalId", "operation", "request", "evidence"],
+          properties: {
+            sessionId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
+            previewId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
+            approvalId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
+            operation: { type: "string", enum: ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "apply_suggestions", "push_prepared_worktree"] },
+            request: { type: "object", additionalProperties: true, maxProperties: 32 },
+            evidence: { type: "object", additionalProperties: false },
+          },
+        },
+        GithubPrWriteStatusInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["effectId"],
+          properties: {
+            effectId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
+            sessionId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
+          },
+        },
+        GithubPrWriteResult: {
+          oneOf: [
+            {
+              type: "object",
+              additionalProperties: true,
+              required: ["ok", "protocolVersion", "schemaVersion", "preview"],
+              properties: {
+                ok: { const: true },
+                protocolVersion: { const: 5 },
+                schemaVersion: { const: 5 },
+                preview: { type: "object", additionalProperties: true },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: true,
+              required: ["ok", "protocolVersion", "schemaVersion", "effect"],
+              properties: {
+                ok: { const: true },
+                protocolVersion: { const: 5 },
+                schemaVersion: { const: 5 },
+                effect: { type: "object", additionalProperties: true },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: true,
+              required: ["ok", "protocolVersion", "schemaVersion", "status", "effectId"],
+              properties: {
+                ok: { const: true },
+                protocolVersion: { const: 5 },
+                schemaVersion: { const: 5 },
+                status: { type: "string" },
+                effectId: { type: "string" },
+                outcomeDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+              },
+            },
+            {
+              type: "object",
+              additionalProperties: true,
+              required: ["ok", "protocolVersion", "schemaVersion", "error"],
+              properties: {
+                ok: { const: false },
+                protocolVersion: { const: 5 },
+                schemaVersion: { const: 5 },
+                error: { type: "object", additionalProperties: true },
+              },
+            },
+          ],
+        },
+        GithubPrWriteActionResponse: {
+          type: "object",
+          additionalProperties: false,
+          required: ["ok", "protocolVersion", "schemaVersion", "requestDigest", "tool", "toolCall", "text", "imageMarkdownList", "structuredContent"],
+          properties: {
+            ok: { type: "boolean" },
+            protocolVersion: { const: 5 },
+            schemaVersion: { const: 5 },
+            requestDigest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+            tool: { type: "string", pattern: "^github_pr_monitor_write_[a-z_]+$" },
+            toolCall: { "$ref": "#/components/schemas/ToolCallProof" },
+            text: { type: "string", maxLength: MAX_TEXT_BYTES },
+            imageMarkdownList: { type: "array", maxItems: 0, items: { type: "string" } },
+            structuredContent: { "$ref": "#/components/schemas/GithubPrWriteResult" },
+            isError: { type: "boolean" },
+          },
+        },
         ActionToolResponse: {
           type: "object",
           required: ["ok", "protocolVersion", "schemaVersion", "requestDigest", "tool", "toolCall", "text", "imageMarkdownList", "structuredContent"],
@@ -1625,7 +1806,8 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
           },
         },
       }).filter(([name]) => {
-        if (mode === "github-pr-monitor") return MONITOR_OPENAPI_SCHEMA_NAMES.has(name);
+        if (mode === "github-pr-monitor") return MONITOR_OPENAPI_SCHEMA_NAMES.has(name) && !name.startsWith("GithubPrWrite");
+        if (mode === "github-pr-monitor-write") return MONITOR_OPENAPI_SCHEMA_NAMES.has(name);
         if (name === "MonitorAuthorizationBindingV1") return false;
         return !name.startsWith("GithubPrMonitor");
       })),
@@ -1638,10 +1820,12 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
   const mode = configuredActionsMode();
   const actionRoutes = mode === "github-pr-monitor"
     ? ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool))
-    : ACTION_ROUTES.filter((route) => !GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool));
+    : mode === "github-pr-monitor-write"
+      ? ACTION_ROUTES.filter((route) => GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(route.tool))
+      : ACTION_ROUTES.filter((route) => !GITHUB_PR_MONITOR_TOOL_NAMES.has(route.tool) && !GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(route.tool));
   const openApiRoutes = openApiActionRoutes(mode);
 
-  if (mode === "github-pr-monitor") {
+  if (mode === "github-pr-monitor" || mode === "github-pr-monitor-write") {
     const allowedRequests = new Set([
       "GET /actions/health",
       "GET /actions/openapi.json",
@@ -1652,7 +1836,7 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
       if (!allowedRequests.has(`${req.method.toUpperCase()} ${path}`)) {
         res.status(404).json({
           ok: false,
-          error: "Action route is not available in github-pr-monitor mode.",
+          error: `Action route is not available in ${mode} mode.`,
         });
         return;
       }
@@ -1723,16 +1907,19 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
     app.post(route.path, async (req, res) => {
       if (!(await requireOwnerBearer(ctx, req, res))) return;
       const monitorRead = route.tool === "github_pr_monitor_read";
-      const strictInput = monitorRead ? undefined : strictGithubPrActionInput(route, req.body);
+      const monitorWrite = GITHUB_PR_MONITOR_WRITE_TOOL_NAMES.has(route.tool);
+      const strictInput = monitorRead || monitorWrite ? undefined : strictGithubPrActionInput(route, req.body);
       const parsedMonitorInput = monitorRead ? GithubPrMonitorReadInputSchema.safeParse(req.body) : undefined;
       const monitorInput = monitorRead ? safeMonitorActionInput(req.body) : undefined;
       const routeInput = monitorRead
         ? (parsedMonitorInput?.success ? parsedMonitorInput.data : monitorInput ?? {})
-        : strictInput
-          ? "error" in strictInput
-            ? undefined
-            : strictInput.input
-          : actionInputForRoute(route, req.body);
+        : monitorWrite
+          ? (isRecord(req.body) ? req.body : {})
+          : strictInput
+            ? "error" in strictInput
+              ? undefined
+              : strictInput.input
+            : actionInputForRoute(route, req.body);
       const result = monitorRead
         ? await callGithubPrMonitorRead(
           req.body,
@@ -1741,29 +1928,34 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
         : strictInput && "error" in strictInput
           ? strictInput.error
           : await callRegisteredTool(ctx, route.tool, routeInput ?? {});
-      const response = await actionResponse(ctx, publicOrigin, route.tool, routeInput ?? {}, result);
-      if (routeInput) {
-        response.toolCall = {
-          ...(response.toolCall as Record<string, unknown>),
-          toolName: route.tool,
-          input: routeInput,
-        };
-      }
+      const responseInput = monitorWrite ? safeWriteActionInput(routeInput) : routeInput ?? {};
+      const response = await actionResponse(ctx, publicOrigin, route.tool, responseInput, result);
+      response.toolCall = {
+        ...(response.toolCall as Record<string, unknown>),
+        toolName: route.tool,
+        input: responseInput,
+      };
       if (monitorRead && isRecord(response.structuredContent) && typeof response.structuredContent.requestDigest === "string") {
         response.requestDigest = response.structuredContent.requestDigest;
       }
-      res.json(await boundedActionResponse(ctx, publicOrigin, route.tool, routeInput ?? {}, response));
+      res.json(await boundedActionResponse(ctx, publicOrigin, route.tool, responseInput, response));
     });
   }
   app.use(async (error: unknown, req: Request, res: Response, next: NextFunction) => {
     const errorType = isRecord(error) && typeof error.type === "string" ? error.type : undefined;
     const pathName = req.originalUrl.split("?", 1)[0] ?? "";
-    if (
-      mode !== "github-pr-monitor"
-      || pathName !== "/actions/github-pr-monitor-read"
-      || (errorType !== "entity.parse.failed" && errorType !== "entity.too.large")
-    ) {
+    const isReadParseError = mode === "github-pr-monitor"
+      && pathName === "/actions/github-pr-monitor-read";
+    const isWriteParseError = mode === "github-pr-monitor-write"
+      && pathName.startsWith("/actions/github-pr-monitor-write-");
+    if ((!isReadParseError && !isWriteParseError)
+      || (errorType !== "entity.parse.failed" && errorType !== "entity.too.large")) {
       next(error);
+      return;
+    }
+    if (isWriteParseError) {
+      if (!(await requireOwnerBearer(ctx, req, res))) return;
+      res.status(400).json({ ok: false, code: "INVALID_INPUT", error: "Write request JSON is invalid or exceeds its bound." });
       return;
     }
     try {

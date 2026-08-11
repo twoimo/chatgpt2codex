@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { ToolContext } from "../types.js";
-import { createMonitorServer } from "./mcp-server.js";
+import { createMonitorServer, createMonitorWriteServer } from "./mcp-server.js";
 import {
   GithubPrMonitorErrorResultSchema,
   GithubPrMonitorReadResultSchema,
@@ -19,6 +19,23 @@ import {
 export const DIRECT_MONITOR_TOOLS = [
   "github_pr_monitor_read",
 ] as const;
+export const DIRECT_MONITOR_WRITE_TOOLS = [
+  "github_pr_monitor_write_preview",
+  "github_pr_monitor_write_request",
+  "github_pr_monitor_write_status",
+  "github_pr_monitor_write_post_comment",
+  "github_pr_monitor_write_post_reply",
+  "github_pr_monitor_write_resolve_thread",
+  "github_pr_monitor_write_rerequest_reviewer",
+  "github_pr_monitor_write_apply_suggestions",
+  "github_pr_monitor_write_push_prepared_worktree",
+] as const;
+
+export type DirectMonitorWriteTool = (typeof DIRECT_MONITOR_WRITE_TOOLS)[number];
+
+export function isDirectMonitorWriteTool(value: string): value is DirectMonitorWriteTool {
+  return (DIRECT_MONITOR_WRITE_TOOLS as readonly string[]).includes(value);
+}
 
 export type DirectMonitorTool = (typeof DIRECT_MONITOR_TOOLS)[number];
 
@@ -342,6 +359,62 @@ export async function createDirectActionClient(ctx: ToolContext): Promise<Direct
       }
       const result: unknown = await client.callTool({ name: tool, arguments: input });
       return actionResponseFromMcpResult(tool, input, result);
+    },
+    async close() {
+      await client.close();
+      await server.close();
+    },
+  };
+}
+
+function safeWriteInput(input: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const key of ["sessionId", "previewId", "approvalId", "idempotencyKey", "effectId"]) {
+    if (isSafeId(input[key])) output[key] = input[key];
+  }
+  if (typeof input.operation === "string" && /^[a-z_]{1,64}$/u.test(input.operation)) output.operation = input.operation;
+  return output;
+}
+
+function directWriteResponse(tool: DirectMonitorWriteTool, input: Record<string, unknown>, raw: unknown): Record<string, unknown> {
+  const result = record(raw, `${tool} MCP response is invalid`);
+  const structured = record(result.structuredContent, `${tool} MCP response omitted structuredContent`);
+  if (structured.protocolVersion !== 5 || structured.schemaVersion !== 5 || typeof structured.ok !== "boolean") {
+    throw new Error(`${tool} MCP response is not a valid v5 write envelope`);
+  }
+  const text = materializedText(result.content);
+  const response = {
+    ok: result.isError !== true,
+    protocolVersion: 5 as const,
+    schemaVersion: 5 as const,
+    requestDigest: actionRequestDigest(safeWriteInput(input)),
+    tool,
+    toolCall: { toolName: tool, input: safeWriteInput(input) },
+    text,
+    imageMarkdownList: [],
+    structuredContent: structured,
+    ...(result.isError === true ? { isError: true } : {}),
+  };
+  enforceWireCap(response, `${tool} direct response`);
+  return response;
+}
+
+export interface DirectWriteActionClient {
+  call(tool: DirectMonitorWriteTool, input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  close(): Promise<void>;
+}
+
+export async function createDirectWriteActionClient(ctx: ToolContext): Promise<DirectWriteActionClient> {
+  const server = await createMonitorWriteServer(ctx);
+  const client = new Client({ name: "chatgpt2codex-direct-monitor-write", version: "0.1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  return {
+    async call(tool, input) {
+      if (!isDirectMonitorWriteTool(tool)) throw new Error("Direct monitor write tool is not allowlisted");
+      const result = await client.callTool({ name: tool, arguments: input });
+      return directWriteResponse(tool, input, result);
     },
     async close() {
       await client.close();

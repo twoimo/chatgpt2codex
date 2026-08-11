@@ -429,6 +429,36 @@ describe("Custom GPT action bridge", () => {
     expect(calls).toHaveLength(3);
     expect(calls[0]).toEqual(["api", "user", "--jq", ".login"]);
   });
+  it("exposes only dedicated write routes in explicit write mode and fails closed without a session", async () => {
+    process.env.CHATGPT2CODEX_ACTIONS_MODE = "github-pr-monitor-write";
+    const server = await startApp(makeCtx(stateDir, projectRoot));
+    stop = server.stop;
+    const openapi = await fetch(`${server.baseUrl}/actions/openapi.json`).then((response) => response.json()) as {
+      paths: Record<string, unknown>;
+      info: { description: string };
+    };
+    expect(Object.keys(openapi.paths)).toContain("/actions/github-pr-monitor-write-preview");
+    expect(Object.keys(openapi.paths)).not.toContain("/actions/github-pr-monitor-read");
+    expect(openapi.info.description).toContain("host-authorized GitHub PR monitor write mode");
+
+    const response = await postAction(server.baseUrl, "/actions/github-pr-monitor-write-preview", {
+      sessionId: "missing-session",
+      operation: "post_comment",
+      request: { body: "hello" },
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      structuredContent: { error: { code: "GITHUB_WRITE_SESSION_REQUIRED" } },
+    });
+    const malformed = await fetch(`${server.baseUrl}/actions/github-pr-monitor-write-preview`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${OWNER_TOKEN}`, "content-type": "application/json" },
+      body: "{\"request\":",
+    });
+    expect(malformed.status).toBe(400);
+    await expect(malformed.json()).resolves.toEqual({ ok: false, code: "INVALID_INPUT", error: "Write request JSON is invalid or exceeds its bound." });
+  });
   it("keeps monitor read responses metadata-only for hostile screenshot-like thread paths", async () => {
     process.env.CHATGPT2CODEX_ACTIONS_MODE = "github-pr-monitor";
     const screenshotPath = path.join(projectRoot, ".chatgpt2codex", "e2e", "screenshots", "hostile.png");
@@ -679,7 +709,7 @@ describe("Custom GPT action bridge", () => {
   it("fails closed during server creation for an unknown Actions mode", async () => {
     process.env.CHATGPT2CODEX_ACTIONS_MODE = "unknown-mode";
     await expect(startApp(makeCtx(stateDir, projectRoot))).rejects.toThrow(
-      'CHATGPT2CODEX_ACTIONS_MODE must be either "general" or "github-pr-monitor".',
+      'CHATGPT2CODEX_ACTIONS_MODE must be either "general", "github-pr-monitor", or "github-pr-monitor-write".',
     );
   });
   it("exposes the tool-call gate on action health", async () => {
