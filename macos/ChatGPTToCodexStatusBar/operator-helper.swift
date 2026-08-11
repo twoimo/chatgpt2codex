@@ -179,6 +179,7 @@ private final class SecureEnclaveOperatorKey {
             kSecAttrApplicationTag: OperatorHelperContract.keyTag,
             kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrTokenID: kSecAttrTokenIDSecureEnclave,
+            kSecUseDataProtectionKeychain: true,
             kSecReturnRef: true,
             kSecMatchLimit: kSecMatchLimitOne,
         ]
@@ -218,6 +219,7 @@ private final class SecureEnclaveOperatorKey {
             kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits: 256,
             kSecAttrTokenID: kSecAttrTokenIDSecureEnclave,
+            kSecUseDataProtectionKeychain: true,
             kSecPrivateKeyAttrs: privateAttributes,
         ]
         var keyError: Unmanaged<CFError>?
