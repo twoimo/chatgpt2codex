@@ -477,6 +477,31 @@ async function cmdGithubPrWrite(argv: readonly string[]): Promise<void> {
   console.log(JSON.stringify(response));
   if (!isAdminSuccess(response)) process.exitCode = 1;
 }
+async function cmdGithubPrWriteHost(flags: Record<string, string | boolean>): Promise<void> {
+  const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
+  const helperSocket = typeof flags["helper-socket"] === "string"
+    ? flags["helper-socket"]
+    : path.join(defaultStateDir(), ".operator-helper", "github-pr-write-helper.sock");
+  const helperBinary = typeof flags["helper-binary"] === "string" ? flags["helper-binary"] : undefined;
+  if (!helperBinary) throw new Error("github-pr-write-host requires --helper-binary");
+  const { startGithubPrWriteAdminHost } = await import("./server/github-pr-write-admin-host.js");
+  const host = await startGithubPrWriteAdminHost({
+    stateDir: defaultStateDir(),
+    helperSocketPath: helperSocket,
+    helperBinaryPath: helperBinary,
+  });
+  let closing = false;
+  const close = async (exitCode: number) => {
+    if (closing) return;
+    closing = true;
+    await host.close();
+    process.exitCode = exitCode;
+  };
+  process.once("SIGINT", () => { void close(130); });
+  process.once("SIGTERM", () => { void close(143); });
+  console.error(`github-pr-write admin host listening on ${host.socketPath} (workspace=${path.resolve(workspace)})`);
+  await new Promise<void>(() => {});
+}
 async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const [{ createDirectActionClient }, { runDirectMonitorCycle }] = await Promise.all([
@@ -766,6 +791,9 @@ async function main(): Promise<void> {
       break;
     case "direct-action":
       await cmdDirectAction(positional, flags);
+      break;
+    case "github-pr-write-host":
+      await cmdGithubPrWriteHost(flags);
       break;
     case "github-pr-write":
       await cmdGithubPrWrite(process.argv.slice(2));

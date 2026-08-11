@@ -209,6 +209,7 @@ private final class ServiceController {
     private let chatGPTReadOnlyKey = "chatGPTReadOnly"
     private(set) var process: Process?
     private(set) var operatorHelperProcess: Process?
+    private(set) var operatorHostProcess: Process?
 
     let appName = "ChatGPT To Codex"
     let defaultWorkspace: String
@@ -744,7 +745,8 @@ private final class ServiceController {
             .appendingPathComponent(".local")
             .appendingPathComponent("share")
             .appendingPathComponent("chatgpt2codex")
-        let socketPath = stateDir.appendingPathComponent("github-pr-write-helper.sock")
+        let helperStateDir = stateDir.appendingPathComponent(".operator-helper")
+        let socketPath = helperStateDir.appendingPathComponent("github-pr-write-helper.sock")
         let bundledHelper = Bundle.main.bundleURL
             .appendingPathComponent("Contents")
             .appendingPathComponent("Helpers")
@@ -761,6 +763,8 @@ private final class ServiceController {
         do {
             try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stateDir.path)
+            try FileManager.default.createDirectory(at: helperStateDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helperStateDir.path)
             let helper = Process()
             helper.executableURL = helperURL
             helper.arguments = ["--socket", socketPath.path]
@@ -778,14 +782,66 @@ private final class ServiceController {
             }
             try helper.run()
             operatorHelperProcess = helper
+
+            let cliURL = runtimeRoot.appendingPathComponent("dist/cli.js")
+            guard FileManager.default.fileExists(atPath: cliURL.path) else {
+                appendLog("operator host unavailable: \(cliURL.path)\n")
+                return
+            }
+            let bundledNode = runtimeRoot.appendingPathComponent("bin/node")
+            let host = Process()
+            if FileManager.default.isExecutableFile(atPath: bundledNode.path) {
+                host.executableURL = bundledNode
+                host.arguments = [
+                    cliURL.path,
+                    "github-pr-write-host",
+                    "--workspace", defaultWorkspace,
+                    "--helper-socket", socketPath.path,
+                    "--helper-binary", helperURL.path,
+                ]
+            } else {
+                host.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                host.arguments = [
+                    "node", cliURL.path,
+                    "github-pr-write-host",
+                    "--workspace", defaultWorkspace,
+                    "--helper-socket", socketPath.path,
+                    "--helper-binary", helperURL.path,
+                ]
+            }
+            host.currentDirectoryURL = runtimeRoot
+            var hostEnvironment = environment
+            let bundledManifest = runtimeRoot
+                .appendingPathComponent("deployment")
+                .appendingPathComponent("github-pr-write-manifest.v1.json")
+            if FileManager.default.fileExists(atPath: bundledManifest.path) {
+                hostEnvironment["CHATGPT2CODEX_WRITE_MANIFEST"] = bundledManifest.path
+                hostEnvironment["CHATGPT2CODEX_REQUIRE_WRITE_ATTESTATION"] = "1"
+            }
+            host.environment = hostEnvironment
+            host.standardOutput = FileHandle.nullDevice
+            host.standardError = FileHandle.nullDevice
+            host.terminationHandler = { [weak self] terminated in
+                DispatchQueue.main.async {
+                    if self?.operatorHostProcess === host {
+                        self?.operatorHostProcess = nil
+                    }
+                }
+                if terminated.terminationStatus != 0 {
+                    self?.appendLog("operator host exited with status \(terminated.terminationStatus)\n")
+                }
+            }
+            try host.run()
+            operatorHostProcess = host
         } catch {
             appendLog("operator helper launch failed: \(error.localizedDescription)\n")
         }
     }
 
     func stopOperatorHelper() {
-        guard let helper = operatorHelperProcess else { return }
-        if helper.isRunning { helper.terminate() }
+        if let host = operatorHostProcess, host.isRunning { host.terminate() }
+        operatorHostProcess = nil
+        if let helper = operatorHelperProcess, helper.isRunning { helper.terminate() }
         operatorHelperProcess = nil
     }
     func start(completion: @escaping (Bool) -> Void) {

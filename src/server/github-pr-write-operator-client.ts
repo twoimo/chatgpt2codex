@@ -23,7 +23,7 @@ export type GithubPrWriteAdminOperation = (typeof GITHUB_PR_WRITE_ADMIN_OPERATIO
 
 /** Keep request and response frames bounded before writing or parsing them. */
 export const MAX_ADMIN_FRAME_BYTES = 16 * 1024;
-export const ADMIN_REQUEST_TIMEOUT_MS = 15_000;
+export const ADMIN_REQUEST_TIMEOUT_MS = 120_000;
 
 const DEFAULT_STATE_DIR_PARTS = [".local", "share", "chatgpt2codex"] as const;
 const SOCKET_MODE = 0o600;

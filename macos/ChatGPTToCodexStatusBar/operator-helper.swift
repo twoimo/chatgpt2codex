@@ -280,6 +280,7 @@ private struct AdminEnvelope {
 
 private enum ParsedRequest {
     case challenge(challengeId: String)
+    case publicKey
     case admin(AdminEnvelope)
 
     init(json: Data) throws {
@@ -288,9 +289,18 @@ private enum ParsedRequest {
         }
 
         if object["protocol"] != nil {
+            guard let protocolValue = object["protocol"] as? String,
+                  protocolValue == OperatorHelperContract.protocolVersion else {
+                throw OperatorHelperError.invalidRequest
+            }
+            if object["operation"] as? String == "public-key" {
+                guard Set(object.keys) == ["protocol", "operation"] else {
+                    throw OperatorHelperError.invalidRequest
+                }
+                self = .publicKey
+                return
+            }
             guard Set(object.keys).isSubset(of: ["protocol", "operation", "challengeId"]),
-                  let protocolValue = object["protocol"] as? String,
-                  protocolValue == OperatorHelperContract.protocolVersion,
                   let challengeId = object["challengeId"] as? String,
                   isSafeIdentifier(challengeId),
                   object["operation"] == nil || object["operation"] as? String == "challenge" else {
@@ -352,6 +362,8 @@ private final class OperatorHelper {
             switch try ParsedRequest(json: requestData) {
             case let .challenge(challengeId):
                 return try challengeResponse(challengeId: challengeId)
+            case .publicKey:
+                return publicKeyResponse()
             case let .admin(envelope):
                 return try adminResponse(envelope)
             }
@@ -369,6 +381,22 @@ private final class OperatorHelper {
         let payload = Data("{\"challengeId\":\"\(challengeId)\",\"profile\":\(OperatorHelperContract.canonicalProfileJSON)}".utf8)
         let signature = try key.sign(message: payload)
         return baseResponse(operation: "challenge", challengeId: challengeId, signedPayload: payload, signature: signature)
+    }
+    private func publicKeyResponse() -> [String: Any] {
+        [
+            "protocol": OperatorHelperContract.protocolVersion,
+            "ok": true,
+            "operation": "public-key",
+            "userPresence": false,
+            "profile": OperatorHelperContract.profile,
+            "publicKeyDerBase64": key.publicKeyDER.base64EncodedString(),
+            "operatorKeyId": OperatorHelperContract.operatorKeyId,
+            "operatorProfileId": OperatorHelperContract.operatorProfileId,
+            "operatorKeyProfileDigest": hexDigest(Data(OperatorHelperContract.canonicalProfileJSON.utf8)),
+            "operatorPublicKeyDigest": hexDigest(key.publicKeyDER),
+            "socketIdentity": OperatorHelperContract.socketIdentity,
+            "attestationHook": OperatorHelperContract.attestationHook,
+        ]
     }
 
     private func adminResponse(_ envelope: AdminEnvelope) throws -> [String: Any] {
