@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError } from "./github-pr-write-contract.js";
+import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, summarizeGithubCheckRollup } from "./github-pr-write-contract.js";
 import { AUTO_MARKER_PREFIX, MAX_COMMENT_BYTES, assertSafeBody, unattendedWriteEnabled } from "./github-pr-write-policy.js";
 
 export interface GhResult { stdout: string; stderr?: string; exitCode?: number; timedOut?: boolean; }
@@ -40,7 +40,9 @@ export type ReviewEffect =
   | { operation: "post_comment"; body: string; effectIdentity: string }
   | { operation: "post_reply"; body: string; effectIdentity: string; threadId: string; replyReceiptId: string }
   | { operation: "resolve_thread"; threadId: string; replyReceiptId: string }
-  | { operation: "rerequest_reviewer"; reviewer: string };
+  | { operation: "rerequest_reviewer"; reviewer: string }
+  | { operation: "approve"; body?: string }
+  | { operation: "merge"; mergeMethod: "squash" };
 
 export interface EffectReceipt {
   operation: ReviewEffect["operation"];
@@ -82,6 +84,17 @@ function assertRemoteSuccess(operation: ReviewEffect["operation"], parsed: Recor
     const teams = parsed.teams;
     if (!Array.isArray(users) || (teams !== undefined && (!Array.isArray(teams) || teams.length > 0)) || typeof reviewer !== "string" || !users.some((user) => user && typeof user === "object" && (user as Record<string, unknown>).login === reviewer)) fail("rerequest_reviewer remote result is ambiguous");
   }
+  if (operation === "approve") {
+    if (parsed.state !== "APPROVED" || (typeof parsed.id !== "number" && typeof parsed.id !== "string")) {
+      fail("approve remote result is ambiguous");
+    }
+  }
+  if (operation === "merge") {
+    if (parsed.merged === false) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "pull request was not merged");
+    if (parsed.merged !== true || typeof parsed.sha !== "string" || !SHA.test(parsed.sha)) {
+      fail("merge remote result is ambiguous");
+    }
+  }
 }
 
 /** Executes only fixed GitHub review mutations. The command implementation must not invoke a shell. */
@@ -114,6 +127,13 @@ export class GithubPrWriteEffects {
     if (context.actorType && context.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "review effects require a User actor");
   }
 
+  private assertOwnedRepositoryForDecision(context: RemoteReviewContext, operation: "approve" | "merge"): void {
+    const repository = context.baseRepository ?? context.repository;
+    if (!REPO.test(repository) || repository.split("/", 1)[0]?.toLowerCase() !== GITHUB_PR_WRITE_ACCOUNT.toLowerCase()) {
+      throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", `${operation} is limited to repositories owned by ${GITHUB_PR_WRITE_ACCOUNT}`);
+    }
+  }
+
   private async evidence(context: RemoteReviewContext): Promise<void> {
     const user = json(await this.run(["api", "user", "--hostname", "github.com", "--jq", ".login"], "authenticated user"), "authenticated user");
     if (user !== context.actor) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "authenticated account does not match actor");
@@ -123,6 +143,38 @@ export class GithubPrWriteEffects {
     const baseName = typeof context.baseRepository === "string" ? context.baseRepository : context.repository;
     const headName = typeof context.headRepository === "string" ? context.headRepository : context.repository;
     if (view.state !== "OPEN" || String(view.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase() || author?.login !== context.author || context.repository !== baseName || headRepo?.nameWithOwner !== headName) fail("pull request evidence is stale or mismatched");
+  }
+
+  private async mergeEvidence(context: RemoteReviewContext): Promise<void> {
+    const user = json(await this.run(["api", "user", "--hostname", "github.com", "--jq", ".login"], "authenticated user"), "authenticated user");
+    if (user !== context.actor) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "authenticated account does not match actor");
+    const view = parse<Record<string, unknown>>(
+      await this.run(
+        ["pr", "view", String(context.prNumber), "--repo", context.repository, "--json", "state,author,headRefOid,headRepository,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup"],
+        "merge evidence",
+      ),
+      "merge evidence",
+    );
+    const author = view.author as Record<string, unknown> | undefined;
+    const headRepo = view.headRepository as Record<string, unknown> | undefined;
+    const baseName = typeof context.baseRepository === "string" ? context.baseRepository : context.repository;
+    const headName = typeof context.headRepository === "string" ? context.headRepository : context.repository;
+    if (
+      view.state !== "OPEN"
+      || view.isDraft !== false
+      || view.reviewDecision !== "APPROVED"
+      || view.mergeable !== "MERGEABLE"
+      || view.mergeStateStatus !== "CLEAN"
+      || String(view.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase()
+      || author?.login !== context.author
+      || context.repository !== baseName
+      || headRepo?.nameWithOwner !== headName
+    ) {
+      throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "pull request is not ready for automatic merge");
+    }
+    if (summarizeGithubCheckRollup(view.statusCheckRollup) !== "passing") {
+      throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "pull request checks are not passing");
+    }
   }
   private async reconcileComment(
     context: RemoteReviewContext,
@@ -170,6 +222,12 @@ export class GithubPrWriteEffects {
   async execute(context: RemoteReviewContext, effect: ReviewEffect): Promise<EffectReceipt> {
     this.validateContext(context);
     if (effect.operation === "rerequest_reviewer" && context.author !== context.actor) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "reviewer re-request requires an authored PR");
+    if (effect.operation === "approve") {
+      this.assertOwnedRepositoryForDecision(context, effect.operation);
+      if (context.author === context.actor) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "GitHub does not allow self-approval");
+      if (effect.body !== undefined) assertSafeBody(effect.body);
+    }
+    if (effect.operation === "merge") this.assertOwnedRepositoryForDecision(context, effect.operation);
     if (effect.operation === "post_comment" || effect.operation === "post_reply") {
       assertSafeBody(effect.body);
       const marker = `${AUTO_MARKER_PREFIX}${effect.effectIdentity} -->`;
@@ -177,10 +235,15 @@ export class GithubPrWriteEffects {
       if (Buffer.byteLength(`${effect.body}\n${marker}`, "utf8") > MAX_COMMENT_BYTES) throw new GithubPrWriteError("GITHUB_WRITE_PREVIEW_LIMIT", "comment marker exceeds UTF-8 byte limit");
     }
     if (effect.operation === "rerequest_reviewer" && !LOGIN.test(effect.reviewer)) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT", "invalid reviewer");
+    if (effect.operation === "merge" && effect.mergeMethod !== "squash") throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT", "only squash merges are supported");
     let renderedBody: string | undefined;
     if (effect.operation === "post_comment" || effect.operation === "post_reply") renderedBody = `${effect.body}\n${AUTO_MARKER_PREFIX}${effect.effectIdentity} -->`;
-    if (effect.operation !== "post_comment" && effect.operation !== "rerequest_reviewer" && (!effect.threadId || !effect.replyReceiptId)) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT", "thread provenance is required");
-    await this.evidence(context);
+    if ((effect.operation === "post_reply" || effect.operation === "resolve_thread")
+      && (!effect.threadId || !effect.replyReceiptId)) {
+      throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT", "thread provenance is required");
+    }
+    if (effect.operation === "merge") await this.mergeEvidence(context);
+    else await this.evidence(context);
     if (effect.operation === "rerequest_reviewer") {
       const reviewerType = json(await this.run(["api", `users/${effect.reviewer}`, "--hostname", "github.com", "--jq", ".type"], "reviewer evidence"), "reviewer evidence");
       if (reviewerType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "requested reviewer must be a direct User");
@@ -189,7 +252,12 @@ export class GithubPrWriteEffects {
     if (effect.operation === "post_comment") argv = ["api", `repos/${context.repository}/issues/${context.prNumber}/comments`, "--hostname", "github.com", "--method", "POST", "-f", `body=${renderedBody}`];
     else if (effect.operation === "post_reply") argv = ["api", "graphql", "--hostname", "github.com", "-f", `threadId=${effect.threadId}`, "-f", `body=${renderedBody}`, "-f", "query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id body}}}"];
     else if (effect.operation === "resolve_thread") argv = ["api", "graphql", "--hostname", "github.com", "-f", `threadId=${effect.threadId}`, "-f", "query=mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"];
-    else argv = ["api", `repos/${context.repository}/pulls/${context.prNumber}/requested_reviewers`, "--hostname", "github.com", "--method", "POST", "-f", `reviewers[]=${effect.reviewer}`];
+    else if (effect.operation === "rerequest_reviewer") argv = ["api", `repos/${context.repository}/pulls/${context.prNumber}/requested_reviewers`, "--hostname", "github.com", "--method", "POST", "-f", `reviewers[]=${effect.reviewer}`];
+    else if (effect.operation === "approve") argv = [
+      "api", `repos/${context.repository}/pulls/${context.prNumber}/reviews`, "--hostname", "github.com", "--method", "POST", "-f", "event=APPROVE",
+      ...(effect.body === undefined ? [] : ["-f", `body=${effect.body}`]),
+    ];
+    else argv = ["api", `repos/${context.repository}/pulls/${context.prNumber}/merge`, "--hostname", "github.com", "--method", "PUT", "-f", `sha=${context.expectedHead}`, "-f", `merge_method=${effect.mergeMethod}`];
     const result = await this.run(argv, effect.operation);
     if (effect.operation === "post_comment" || effect.operation === "post_reply") {
       if (result.timedOut === true || result.exitCode !== 0) return this.reconcileComment(context, effect, renderedBody!);
@@ -203,7 +271,8 @@ export class GithubPrWriteEffects {
       throw error;
     }
     const remoteValue = parsed.id ?? (((parsed.data as Record<string, unknown> | undefined)?.addPullRequestReviewThreadReply as Record<string, unknown> | undefined)?.comment as Record<string, unknown> | undefined)?.id;
-    const remoteId = typeof remoteValue === "string" || typeof remoteValue === "number" ? digest(String(remoteValue)) : undefined;
+    const mergeRemoteValue = effect.operation === "merge" ? parsed.sha : remoteValue;
+    const remoteId = typeof mergeRemoteValue === "string" || typeof mergeRemoteValue === "number" ? digest(String(mergeRemoteValue)) : undefined;
     return { operation: effect.operation, status: "completed", ...(remoteId ? { remoteId } : {}), effectDigest: digest({ context: { repository: context.repository, prNumber: context.prNumber, expectedHead: context.expectedHead }, effect, outputDigest: digest(result.stdout) }) };
   }
 }

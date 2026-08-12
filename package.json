@@ -20,6 +20,7 @@
     "macos:icon": "python3 scripts/generate-macos-icon.py",
     "macos:package": "bash scripts/build-macos-app.sh",
     "macos:e2e:statusbar": "bash scripts/e2e-macos-statusbar-menu.sh",
+    "macos:supervisor:install": "bash scripts/install-github-pr-feedback-supervisor.sh",
     "start": "node dist/cli.js",
     "windows:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File windows/Build-ChatGPTToCodexExe.ps1",
     "windows:package": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1",

@@ -54,6 +54,8 @@ const GITHUB_PR_MONITOR_WRITE_TOOL_NAMES = new Set([
   "github_pr_monitor_write_post_reply",
   "github_pr_monitor_write_resolve_thread",
   "github_pr_monitor_write_rerequest_reviewer",
+  "github_pr_monitor_write_approve",
+  "github_pr_monitor_write_merge",
   "github_pr_monitor_write_apply_suggestions",
   "github_pr_monitor_write_push_prepared_worktree",
 ]);
@@ -380,6 +382,8 @@ const ACTION_ROUTES: ActionRoute[] = [
     "post_reply",
     "resolve_thread",
     "rerequest_reviewer",
+    "approve",
+    "merge",
     "apply_suggestions",
     "push_prepared_worktree",
   ].map((operation) => ({
@@ -1639,7 +1643,7 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
           required: ["sessionId", "operation", "request"],
           properties: {
             sessionId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
-            operation: { type: "string", enum: ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "apply_suggestions", "push_prepared_worktree"] },
+            operation: { type: "string", enum: ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "approve", "merge", "apply_suggestions", "push_prepared_worktree"] },
             request: { type: "object", additionalProperties: true, maxProperties: 32 },
           },
         },
@@ -1651,7 +1655,7 @@ function openApiSpec(publicOrigin: string, mode: ActionsMode): Record<string, un
             sessionId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
             previewId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
             approvalId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,128}$" },
-            operation: { type: "string", enum: ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "apply_suggestions", "push_prepared_worktree"] },
+            operation: { type: "string", enum: ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "approve", "merge", "apply_suggestions", "push_prepared_worktree"] },
             request: { type: "object", additionalProperties: true, maxProperties: 32 },
             evidence: { type: "object", additionalProperties: false },
           },

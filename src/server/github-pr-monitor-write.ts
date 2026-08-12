@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "../types.js";
 import { toolCallProof } from "./tool-proof.js";
 import { GithubPrWriteAuthority } from "./github-pr-write-authority.js";
-import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, WRITE_OPERATIONS, digest, effectIdentityFor, type WriteStage } from "./github-pr-write-contract.js";
+import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, WRITE_OPERATIONS, digest, effectIdentityFor, summarizeGithubCheckRollup, type WriteStage } from "./github-pr-write-contract.js";
 import { assertOperationAllowed, assertSafeBody, renderComment, type GithubEvidence, unattendedWriteEnabled } from "./github-pr-write-policy.js";
 import { GithubPrWriteEffects, defaultGhCommand, type GhCommand } from "./github-pr-write-effects.js";
 import { GithubPrWriteCodeEffects, defaultGitCommand, type GitCommand, type Suggestion } from "./github-pr-write-code-effects.js";
@@ -86,6 +86,14 @@ function assertTransportBoundSession(ctx: ToolContext, sessionId: string): void 
   if (ctx.remote && !ctx.writeSessionId) throw new GithubPrWriteError("GITHUB_WRITE_SESSION_REQUIRED", "remote transport has no host-bound write session");
   if (ctx.writeSessionId && ctx.writeSessionId !== sessionId) throw new GithubPrWriteError("GITHUB_WRITE_SESSION_INVALID", "write session is bound to a different transport");
 }
+function assertUnattendedSupervisorTransport(ctx: ToolContext): void {
+  if (
+    unattendedWriteEnabled()
+    && (ctx.remote || ctx.transportKind !== "operator" || typeof ctx.writeSessionId !== "string" || ctx.writeSessionId.length === 0)
+  ) {
+    throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "unattended writes require the supervisor operator transport");
+  }
+}
 function rejectCallerFields(value: Record<string, unknown>): void {
   for (const key of ["capabilityId", "generation", "signature", "confirm"]) {
     if (key in value) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
@@ -112,19 +120,42 @@ function assertOperationFields(operation: typeof WRITE_OPERATIONS[number], reque
         ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "threadId", "replyReceiptId"]
         : operation === "rerequest_reviewer"
           ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "reviewer"]
+          : operation === "approve"
+            ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "body"]
+            : operation === "merge"
+              ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "approvalReceiptId"]
           : operation === "apply_suggestions"
             ? ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "worktreePath", "suggestions", "message"]
             : ["repository", "prNumber", "expectedHead", "baseRepository", "headRepository", "worktreePath", "headRef", "verificationReceiptId", "verificationProofDigest", "noForce"];
   const allowedKeys = new Set(allowed);
   if (Object.keys(request).some((key) => !allowedKeys.has(key))) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
 }
-function assertHostTarget(request: Record<string, unknown>, evidence?: GithubEvidence, operation?: typeof WRITE_OPERATIONS[number]): void {
+function assertHostTarget(
+  request: Record<string, unknown>,
+  evidence?: GithubEvidence,
+  operation?: typeof WRITE_OPERATIONS[number],
+  repositoryAllowlist?: readonly string[],
+): void {
   const unattended = unattendedWriteEnabled();
   if (typeof request.repository !== "string" || (unattended ? !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(request.repository) : request.repository !== GITHUB_PR_WRITE_REPOSITORY)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  if (unattended) {
+    const allowlist = new Set((repositoryAllowlist ?? []).map((value) => value.trim().toLowerCase()));
+    if (
+      request.repository.includes("..")
+      || !allowlist.has(request.repository.toLowerCase())
+      || request.repository.toLowerCase() === GITHUB_PR_WRITE_REPOSITORY.toLowerCase()
+    ) {
+      throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+    }
+  }
   if (!Number.isSafeInteger(request.prNumber) || Number(request.prNumber) < 1 || typeof request.expectedHead !== "string" || !/^[0-9a-f]{40}$/iu.test(request.expectedHead)) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
   if (typeof request.baseRepository !== "string" || (unattended ? request.baseRepository !== request.repository : request.baseRepository !== GITHUB_PR_WRITE_REPOSITORY)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (typeof request.headRepository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(request.headRepository)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
-  const codeOperation = operation !== undefined && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation);
+  const codeOperation = operation !== undefined && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "approve", "merge"].includes(operation);
+  const decisionOperation = operation === "approve" || operation === "merge";
+  if (decisionOperation && unattended && !request.repository.toLowerCase().startsWith(`${GITHUB_PR_WRITE_ACCOUNT.toLowerCase()}/`)) {
+    throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  }
   if (codeOperation && !unattended && request.headRepository !== GITHUB_PR_WRITE_REPOSITORY && request.headRepository !== GITHUB_PR_WRITE_FORK_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (codeOperation && unattended && request.headRepository !== request.baseRepository && !request.headRepository.toLowerCase().startsWith(`${GITHUB_PR_WRITE_ACCOUNT.toLowerCase()}/`)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (evidence && (evidence.account.login !== GITHUB_PR_WRITE_ACCOUNT || evidence.expectedHead !== request.expectedHead)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
@@ -160,6 +191,16 @@ function reviewEffect(input: z.infer<typeof requestSchema>, effectId: string) {
     return { operation: input.operation, threadId: requiredString(request, "threadId"), replyReceiptId: requiredString(request, "replyReceiptId") } as const;
   }
   if (input.operation === "rerequest_reviewer") return { operation: input.operation, reviewer: requiredString(request, "reviewer") } as const;
+  if (input.operation === "approve") {
+    return {
+      operation: input.operation,
+      ...(request.body === undefined ? {} : { body: requiredString(request, "body", 6_000) }),
+    } as const;
+  }
+  if (input.operation === "merge") {
+    requiredString(request, "approvalReceiptId", 64);
+    return { operation: input.operation, mergeMethod: "squash" } as const;
+  }
   throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
 }
 async function assertReviewerPreIntent(input: z.infer<typeof requestSchema>, gh: GhCommand): Promise<void> {
@@ -178,6 +219,39 @@ async function assertReviewerPreIntent(input: z.infer<typeof requestSchema>, gh:
   if (!Array.isArray(users) || !Array.isArray(teams)) throw new GithubPrWriteError("GITHUB_WRITE_RECOVERY_REQUIRED", "reviewer pre-intent evidence is incomplete");
   if (teams.length > 0 || users.some((item) => item && typeof item === "object" && (item as Record<string, unknown>).login === reviewer)) {
     throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "reviewer is already requested");
+  }
+}
+async function assertMergePreIntent(input: z.infer<typeof requestSchema>, gh: GhCommand): Promise<void> {
+  if (input.operation !== "merge") return;
+  const result = await gh([
+    "pr", "view", String(input.request.prNumber), "--repo", String(input.request.repository),
+    "--json", "state,author,headRefOid,headRepository,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup",
+  ], 15_000);
+  if (result.timedOut || result.exitCode !== 0 || typeof result.stdout !== "string" || Buffer.byteLength(result.stdout, "utf8") > 128 * 1024) {
+    throw new GithubPrWriteError("GITHUB_WRITE_RECOVERY_REQUIRED", "merge pre-intent evidence is ambiguous");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(result.stdout); } catch { throw new GithubPrWriteError("GITHUB_WRITE_RECOVERY_REQUIRED", "merge pre-intent evidence is invalid"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new GithubPrWriteError("GITHUB_WRITE_RECOVERY_REQUIRED", "merge pre-intent evidence is invalid");
+  const view = parsed as Record<string, unknown>;
+  const author = view.author && typeof view.author === "object" && !Array.isArray(view.author) ? view.author as Record<string, unknown> : undefined;
+  const headRepository = view.headRepository && typeof view.headRepository === "object" && !Array.isArray(view.headRepository)
+    ? view.headRepository as Record<string, unknown>
+    : undefined;
+  if (
+    view.state !== "OPEN"
+    || view.isDraft !== false
+    || view.reviewDecision !== "APPROVED"
+    || view.mergeable !== "MERGEABLE"
+    || view.mergeStateStatus !== "CLEAN"
+    || String(view.headRefOid).toLowerCase() !== String(input.request.expectedHead).toLowerCase()
+    || author?.login !== input.evidence.author.login
+    || headRepository?.nameWithOwner !== input.request.headRepository
+  ) {
+    throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "pull request is not ready for automatic merge");
+  }
+  if (summarizeGithubCheckRollup(view.statusCheckRollup) !== "passing") {
+    throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "pull request checks are not passing");
   }
 }
 async function executeReviewEffect(input: z.infer<typeof requestSchema>, effectId: string, gh: GhCommand) {
@@ -238,9 +312,10 @@ async function executeCodeEffect(input: z.infer<typeof requestSchema>, effectId:
   throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
 }
 function validateRequestPayload(input: Pick<z.infer<typeof requestSchema>, "operation" | "request">): void {
-  if (input.operation === "post_comment" || input.operation === "post_reply" || input.operation === "resolve_thread" || input.operation === "rerequest_reviewer") {
+  if (input.operation === "post_comment" || input.operation === "post_reply" || input.operation === "resolve_thread" || input.operation === "rerequest_reviewer" || input.operation === "approve" || input.operation === "merge") {
     const request = input.request;
     if (input.operation === "post_comment" || input.operation === "post_reply") assertSafeBody(requiredString(request, "body", 6_000));
+    if (input.operation === "approve" && request.body !== undefined) assertSafeBody(requiredString(request, "body", 6_000));
     reviewEffect(input as z.infer<typeof requestSchema>, "validation-effect");
     return;
   }
@@ -267,10 +342,11 @@ export function registerGithubPrMonitorWriteTools(server: McpServer, ctx: ToolCo
     const input = previewSchema.parse(raw);
     const authorityValue = authorityOrThrow(authority);
     assertTransportBoundSession(ctx, input.sessionId);
+    assertUnattendedSupervisorTransport(ctx);
     const previewSession = authorityValue.assertSession(input.sessionId);
     rejectCallerFields(input);
     rejectCallerFields(input.request);
-    assertHostTarget(input.request, undefined, input.operation);
+    assertHostTarget(input.request, undefined, input.operation, ctx.githubPrWriteRepositoryAllowlist);
     assertOperationFields(input.operation, input.request);
     validateRequestPayload(input);
     const p = authorityValue.createPreview(input.sessionId, input.operation, input.request);
@@ -305,9 +381,10 @@ export function registerGithubPrMonitorWriteTools(server: McpServer, ctx: ToolCo
   const handleRequest = async (raw: unknown, fixedOperation?: typeof WRITE_OPERATIONS[number]) => {
     const input = (fixedOperation ? requestSchema.extend({ operation: z.literal(fixedOperation) }) : requestSchema).parse(raw);
     assertTransportBoundSession(ctx, input.sessionId);
+    assertUnattendedSupervisorTransport(ctx);
     rejectCallerFields(input);
     rejectCallerFields(input.request);
-    assertHostTarget(input.request, input.evidence as GithubEvidence, input.operation);
+    assertHostTarget(input.request, input.evidence as GithubEvidence, input.operation, ctx.githubPrWriteRepositoryAllowlist);
     assertOperationFields(input.operation, input.request);
     validateRequestPayload(input);
     const a = authorityOrThrow(authority);
@@ -337,15 +414,36 @@ export function registerGithubPrMonitorWriteTools(server: McpServer, ctx: ToolCo
       throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "thread resolution requires a recorded reply outcome");
     }
     if (input.operation === "push_prepared_worktree" && !a.hasOutcomeDigest(String(input.request.verificationReceiptId), "apply_suggestions", String(input.request.verificationProofDigest))) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+    if (input.operation === "approve" && input.evidence.author.login === GITHUB_PR_WRITE_ACCOUNT) {
+      throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "GitHub does not allow self-approval");
+    }
+    if (input.operation === "merge") {
+      const approvalRequest = {
+        repository: requiredString(input.request, "repository"),
+        prNumber: input.request.prNumber,
+        expectedHead: requiredString(input.request, "expectedHead"),
+        baseRepository: requiredString(input.request, "baseRepository"),
+        headRepository: requiredString(input.request, "headRepository"),
+      };
+      const approvalReceiptId = requiredString(input.request, "approvalReceiptId", 64);
+      if (!a.hasOutcomeDigest(approvalReceiptId, "approve", undefined, digest(approvalRequest))) {
+        throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "merge approval receipt is invalid or not bound to this PR head");
+      }
+    }
     await assertReviewerPreIntent(input, gh);
+    await assertMergePreIntent(input, gh);
     const existingIntent = a.effectIntent(idempotencyKey);
     if (existingIntent && existingIntent.status !== "completed") throw new GithubPrWriteError("GITHUB_WRITE_RECOVERY_REQUIRED");
-    const e = a.recordEffectIntent(p.previewId, idempotencyKey);
+    const e = a.recordEffectIntent(
+      p.previewId,
+      idempotencyKey,
+      { operation: input.operation, requestDigest: p.requestDigest, idempotencyKey },
+    );
     if (e.status === "completed") return output({
       ...successEnvelope(`github_pr_monitor_write_${input.operation}`, input.operation, boundSession, p, input.approvalId, e.effectId, { status: "already_completed" }),
       effect: { effectId: e.effectId, status: e.status, operation: input.operation },
     }, "Write request already completed.");
-    if (input.operation === "post_comment" || input.operation === "post_reply" || input.operation === "resolve_thread" || input.operation === "rerequest_reviewer") {
+    if (input.operation === "post_comment" || input.operation === "post_reply" || input.operation === "resolve_thread" || input.operation === "rerequest_reviewer" || input.operation === "approve" || input.operation === "merge") {
       try {
         const receipt = await executeReviewEffect(input, e.effectId, gh);
         a.recordEffectOutcome(e.effectId, receipt);

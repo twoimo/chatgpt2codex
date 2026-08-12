@@ -64,6 +64,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 /** Default state dir per PRD §10: `~/.local/share/chatgpt2codex/`. */
 function defaultStateDir(): string {
+  const configured = process.env.CHATGPT2CODEX_STATE_DIR?.trim();
+  if (configured) {
+    if (!path.isAbsolute(configured)) throw new Error("CHATGPT2CODEX_STATE_DIR must be an absolute path");
+    return path.resolve(configured);
+  }
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
 }
 
@@ -512,11 +517,22 @@ async function cmdGithubPrFeedbackSupervisor(flags: Record<string, string | bool
   if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 86_400) {
     throw new Error("github-pr-feedback-supervisor interval must be between 60 and 86400 seconds");
   }
+  const durationHours = typeof flags["duration-hours"] === "string"
+    ? Number(flags["duration-hours"])
+    : undefined;
+  if (durationHours !== undefined && (!Number.isSafeInteger(durationHours) || durationHours < 1 || durationHours > 24)) {
+    throw new Error("github-pr-feedback-supervisor duration must be between 1 and 24 hours");
+  }
+  const repositoryAllowlist = typeof flags.repositories === "string"
+    ? flags.repositories.split(",").map((value) => value.trim())
+    : undefined;
   const { runGithubPrFeedbackSupervisor } = await import("./server/github-pr-feedback-supervisor.js");
   const supervisor = await runGithubPrFeedbackSupervisor({
     stateDir: defaultStateDir(),
     workspaceRoot: path.resolve(workspace),
     intervalMs: intervalSeconds * 1_000,
+    ...(durationHours === undefined ? {} : { durationMs: durationHours * 60 * 60 * 1_000 }),
+    ...(repositoryAllowlist === undefined ? {} : { repositoryAllowlist }),
     once: flags.once === true,
     chatgptCdpUrl: typeof flags["chatgpt-cdp-url"] === "string" ? flags["chatgpt-cdp-url"] : undefined,
   });
@@ -530,8 +546,12 @@ async function cmdGithubPrFeedbackSupervisor(flags: Record<string, string | bool
   process.once("SIGINT", () => { void close(130); });
   process.once("SIGTERM", () => { void close(143); });
   if (flags.once === true) return;
-  console.error(`github-pr-feedback-supervisor listening (interval=${intervalSeconds}s, workspace=${path.resolve(workspace)})`);
-  await new Promise<void>(() => {});
+  console.error(
+    `github-pr-feedback-supervisor listening (interval=${intervalSeconds}s` +
+    `${durationHours === undefined ? "" : `, duration=${durationHours}h`}, workspace=${path.resolve(workspace)})`,
+  );
+  if (durationHours === undefined) await new Promise<void>(() => {});
+  else await supervisor.waitUntilFinished();
 }
 async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();

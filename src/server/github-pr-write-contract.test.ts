@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AuthorityClock, WRITE_TTL_MS, canonicalJson, assertNoAuthorityFields } from "./github-pr-write-contract";
+import { AuthorityClock, WRITE_TTL_MS, canonicalJson, assertNoAuthorityFields, summarizeGithubCheckRollup } from "./github-pr-write-contract";
 import { assertSafeBody, isGithubMutationIntent, renderComment } from "./github-pr-write-policy";
 
 describe("github PR write v5 contract", () => {
@@ -16,6 +16,11 @@ describe("github PR write v5 contract", () => {
     expect(isGithubMutationIntent(["git", "push", "origin", "HEAD"])).toBe(true);
     expect(isGithubMutationIntent("make test")).toBe(false);
     expect(isGithubMutationIntent("npm run github-pr-write -- --status")).toBe(true);
+  });
+  it("requires an explicit successful check result", () => {
+    expect(summarizeGithubCheckRollup([{ status: "COMPLETED" }])).toBe("unknown");
+    expect(summarizeGithubCheckRollup([{ status: "COMPLETED", conclusion: "SUCCESS" }])).toBe("passing");
+    expect(summarizeGithubCheckRollup([{ status: "COMPLETED", conclusion: "FAILURE" }])).toBe("failing");
   });
   it("renders complete UTF-8 body with deterministic marker", () => {
     const result = renderComment("héllo", "effect-1");

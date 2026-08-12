@@ -54,7 +54,7 @@ export function canWriteCodeUnattended(e: GithubEvidence, topology?: RepositoryT
 }
 export function assertOperationAllowed(operation: WriteOperation, e: GithubEvidence, stage: WriteStage, topology?: RepositoryTopology): void {
   if (stage === "off" || (stage === "prepare" && operation !== "apply_suggestions")) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "operation is disabled at rollout stage");
-  const reviewOperation = ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation);
+  const reviewOperation = ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer", "approve", "merge"].includes(operation);
   if (stage !== "shadow" && !reviewOperation && !canWriteCode(e, topology) && !canWriteCodeUnattended(e, topology)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
   if (e.account.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "the authenticated account must be a User");
   if (!reviewOperation && e.author.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require a User-authored PR");

@@ -140,24 +140,32 @@ PRs authored by, or directly requesting review from, the authenticated account
 across visible repositories, with bounded discovery/snapshot output and
 redacted review/check metadata. It does not comment, edit, commit, push, or run
 monitor state, migration, or reconciliation operations.
-A separately selected `CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write` surface exists for phase-2 bounded writes. It exposes only dedicated v5 preview, approval/request, status, review-effect, disposable-worktree commit, and compare-and-swap non-force push routes. It requires the fixed `Yeachan-Heo/gajae-code` / `twoimo` target, fresh GitHub evidence, `CHATGPT2CODEX_MONITOR_ROLLOUT=enabled`, and a same-UID macOS helper using a P-256 Secure Enclave key with `WhenUnlockedThisDeviceOnly` + user presence and DER/X9.62 signatures; owner/OAuth authentication, `confirm:true`, browser dialogs, noninteractive approval, and generic call-tool/GitHub mutation commands cannot authorize a write. The only administrative CLI vectors are `github-pr-write --enable`, `--revoke`, `--status`, and `quarantine-v4`; challenge IDs and approval IDs are rejected. Ambiguous remote outcomes remain pending for explicit recovery and are never retried automatically.
+A separately selected `CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write` surface exists for phase-2 bounded writes. It exposes only dedicated v5 preview, approval/request, status, review-effect, owned-repository PR approval/merge, disposable-worktree commit, and compare-and-swap non-force push routes. It requires fresh GitHub evidence and `CHATGPT2CODEX_MONITOR_ROLLOUT=enabled`; interactive remote writes still require the same-UID macOS helper using a P-256 Secure Enclave key with `WhenUnlockedThisDeviceOnly` + user presence and DER/X9.62 signatures. The explicitly launched unattended supervisor may bypass that per-effect gesture only for operator-owned repositories, and only after the fixed account, ownership, non-self-approval, clean mergeability, passing-check, idempotency, and recovery gates pass. It never force-pushes or merges the upstream repository. Owner/OAuth authentication, `confirm:true`, browser dialogs, and generic call-tool/GitHub mutation commands cannot authorize a write.
 The macOS package requires a real Apple code-signing identity, an exact Xcode/macOS development provisioning profile for the nested `app.ezbuilder.chatgpt2codex.operator-helper` bundle, and team-scoped keychain entitlements for the Secure Enclave helper; ad-hoc signing or an unprovisioned helper is refused for write-capable packaging. Local development may use an Apple Development Personal Team identity with an Xcode-generated profile via `CODESIGN_IDENTITY`, `CODESIGN_TEAM_ID`, and `PROVISIONING_PROFILE_PATH`; the profile must authorize the helper bundle identifier and both the helper default and operator keychain groups. The helper is launched from `Contents/Helpers/ChatGPTToCodexOperatorHelper.app` so macOS can validate its restricted entitlements. The status-bar app also starts the host admin relay; keep it running before invoking `github-pr-write` so the public socket can create, verify, and commit the helper-signed envelope.
-Authored source updates and pushes may target only the operator-owned `twoimo/gajae-code` fork; the upstream repository owner retains merge authority.
+Authored source updates and pushes may target only repositories in the explicit
+unattended allowlist; the upstream `Yeachan-Heo/gajae-code` repository is always
+excluded from unattended approval and merge.
 For explicit local unattended feedback handling, start
 `github-pr-feedback-supervisor` with
 `CHATGPT2CODEX_UNATTENDED_WRITE=1`,
 `CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write`, and
 `CHATGPT2CODEX_MONITOR_ROLLOUT=enabled`. It polls every five minutes for open
 PRs authored by `twoimo` or directly requesting review from `twoimo`, excludes
-both `Yeachan-Heo/gajae-code` and `twoimo/gajae-code`, sends bounded evidence to
-the logged-in ChatGPT Web tab through the local CDP endpoint, and performs only
-the dedicated local MCP review/code-write tools. The unattended flag is a
+anything outside the explicit `--repositories` allowlist (and always excludes
+`Yeachan-Heo/gajae-code`), sends bounded evidence to
+the logged-in ChatGPT Web tab through the local CDP endpoint. Its control prompt
+may remain English for deterministic parsing, but all natural-language ChatGPT
+outputs used for GitHub replies and commit messages are requested in Korean;
+decision rationales are also logged in Korean when returned. It performs only
+the dedicated local MCP review/code-write/owned-PR-approval/merge tools. The unattended flag is a
 deliberate opt-in that bypasses the per-effect Secure Enclave gesture; without
 it the supervisor refuses to start. While that flag remains set, the supervisor
-renews its short-lived capability only while the authority rollout is
-`enabled`; clearing the flag immediately prevents renewal and writes. It never force-pushes, treats ambiguous
-remote outcomes as recovery-required, and stops handling a PR after it is
-approved, merged, closed, or explicitly classified terminal. Keep the CDP
+renews its short-lived capability only while the authority rollout
+`enabled`; clearing the flag immediately prevents renewal and writes. It never force-pushes,
+auto-approves a self-authored PR, merges a draft, merges before `APPROVED` +
+`MERGEABLE` + `CLEAN` + passing checks, or treats ambiguous remote outcomes as
+successful. It stops handling a PR after it is merged, closed, or explicitly
+classified terminal. Keep the CDP
 endpoint loopback-only and do not expose this supervisor or its local write MCP
 service to a public network.
 
@@ -166,12 +174,25 @@ CHATGPT2CODEX_UNATTENDED_WRITE=1 \
 CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write \
 CHATGPT2CODEX_MONITOR_ROLLOUT=enabled \
 chatgpt2codex github-pr-feedback-supervisor \
-  --interval-seconds 300 --workspace "$HOME/workspace" \
+  --interval-seconds 300 --duration-hours 24 \
+  --repositories "twoimo/chatgpt2codex,twoimo/tzudong" \
+  --workspace "$HOME/workspace" \
   --chatgpt-cdp-url http://127.0.0.1:9229
 ```
 
 The command requires a logged-in `gh` account for `twoimo` and a logged-in
 ChatGPT Web tab exposed only on the loopback CDP endpoint.
+An exact repository allowlist is required; wildcard entries and upstream
+repositories are rejected. The CDP endpoint is also restricted to loopback
+HTTP, and its discovery and request calls have bounded timeouts.
+For launchd installation, set `CHATGPT2CODEX_GITHUB_PR_ALLOWLIST` and run
+`scripts/install-github-pr-feedback-supervisor.sh`; it writes a bounded
+24-hour service, restarts unexpected failures with throttling, and does not
+restart a normal successful expiry.
+`--duration-hours 24` bounds the unattended window to 24 hours; the
+`CHATGPT2CODEX_UNATTENDED_WRITE=1` flag bypasses per-effect interactive approval
+only for this explicitly launched supervisor. The fixed repository/account
+checks, fresh GitHub evidence, idempotency, and recovery handling remain active.
 The monitor caps each discovery list at 1,000 issues, limits child feedback pages and
 thread comments, and reports `complete: false` whenever a PR closes or a reviewer
 request changes during the read. Repository keys are canonical lowercase

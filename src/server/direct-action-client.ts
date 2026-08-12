@@ -27,6 +27,8 @@ export const DIRECT_MONITOR_WRITE_TOOLS = [
   "github_pr_monitor_write_post_reply",
   "github_pr_monitor_write_resolve_thread",
   "github_pr_monitor_write_rerequest_reviewer",
+  "github_pr_monitor_write_approve",
+  "github_pr_monitor_write_merge",
   "github_pr_monitor_write_apply_suggestions",
   "github_pr_monitor_write_push_prepared_worktree",
 ] as const;

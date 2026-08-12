@@ -54,4 +54,103 @@ describe("GithubPrWriteEffects", () => {
     const receipt = await effect.execute({ ...context, author: "twoimo" }, { operation: "rerequest_reviewer", reviewer: "bob" });
     expect(receipt.status).toBe("completed");
   });
+  it("approves a non-self PR only in an operator-owned repository", async () => {
+    const previous = process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+    process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+    const calls: string[][] = [];
+    const repository = "twoimo/tzudong";
+    const head = context.expectedHead;
+    const view = JSON.stringify({
+      state: "OPEN",
+      author: { login: "alice" },
+      headRefOid: head,
+      headRepository: { nameWithOwner: repository },
+    });
+    const effect = new GithubPrWriteEffects(fake(["twoimo", view, JSON.stringify({ id: 123, state: "APPROVED" })], calls));
+    try {
+      const receipt = await effect.execute({
+        repository,
+        baseRepository: repository,
+        headRepository: repository,
+        prNumber: context.prNumber,
+        expectedHead: head,
+        actor: "twoimo",
+        author: "alice",
+      }, { operation: "approve" });
+      expect(receipt.status).toBe("completed");
+      expect(calls.at(-1)).toContain("event=APPROVE");
+    } finally {
+      if (previous === undefined) delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      else process.env.CHATGPT2CODEX_UNATTENDED_WRITE = previous;
+    }
+  });
+  it("merges only an approved, clean, passing PR with a compare-and-swap head", async () => {
+    const previous = process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+    process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+    const calls: string[][] = [];
+    const repository = "twoimo/tzudong";
+    const head = context.expectedHead;
+    const view = JSON.stringify({
+      state: "OPEN",
+      author: { login: "alice" },
+      headRefOid: head,
+      headRepository: { nameWithOwner: repository },
+      isDraft: false,
+      reviewDecision: "APPROVED",
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN",
+      statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }],
+    });
+    const effect = new GithubPrWriteEffects(fake(["twoimo", view, JSON.stringify({ merged: true, sha: "abcdef0123456789abcdef0123456789abcdef01" })], calls));
+    try {
+      const receipt = await effect.execute({
+        repository,
+        baseRepository: repository,
+        headRepository: repository,
+        prNumber: context.prNumber,
+        expectedHead: head,
+        actor: "twoimo",
+        author: "alice",
+      }, { operation: "merge", mergeMethod: "squash" });
+      expect(receipt.status).toBe("completed");
+      expect(calls.at(-1)).toEqual(expect.arrayContaining(["-f", `sha=${head}`, "-f", "merge_method=squash"]));
+    } finally {
+      if (previous === undefined) delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      else process.env.CHATGPT2CODEX_UNATTENDED_WRITE = previous;
+    }
+  });
+  it("rejects a completed check without an explicit successful conclusion", async () => {
+    const previous = process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+    process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+    const calls: string[][] = [];
+    const repository = "twoimo/tzudong";
+    const head = context.expectedHead;
+    const view = JSON.stringify({
+      state: "OPEN",
+      author: { login: "alice" },
+      headRefOid: head,
+      headRepository: { nameWithOwner: repository },
+      isDraft: false,
+      reviewDecision: "APPROVED",
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN",
+      statusCheckRollup: [{ status: "COMPLETED" }],
+    });
+    const effect = new GithubPrWriteEffects(fake(["twoimo", view], calls));
+    try {
+      await expect(effect.execute({
+        repository,
+        baseRepository: repository,
+        headRepository: repository,
+        prNumber: context.prNumber,
+        expectedHead: head,
+        actor: "twoimo",
+        author: "alice",
+      }, { operation: "merge", mergeMethod: "squash" })).rejects.toThrow(/checks are not passing/);
+      expect(calls).toHaveLength(2);
+    } finally {
+      if (previous === undefined) delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      else process.env.CHATGPT2CODEX_UNATTENDED_WRITE = previous;
+    }
+  });
 });

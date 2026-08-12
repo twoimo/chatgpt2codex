@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { GithubPrWriteAuthority } from "./github-pr-write-authority.js";
 import { SECURE_ENCLAVE_OPERATOR_PROFILE, WRITE_HELPER_PROTOCOL, approvalPayloadDigest } from "./github-pr-write-attestation.js";
-import { canonicalJson, GithubPrWriteError, AuthorityClock, WRITE_TTL_MS } from "./github-pr-write-contract.js";
+import { canonicalJson, digest, GithubPrWriteError, AuthorityClock, WRITE_TTL_MS } from "./github-pr-write-contract.js";
 
 const dir = () => mkdtempSync(join(tmpdir(), "gjc-write-authority-"));
 const sqlite = () => (createRequire(import.meta.url)(`node:${"sqlite"}`) as { DatabaseSync: new (p: string) => { exec(s: string): void; close(): void } }).DatabaseSync;
@@ -34,9 +34,15 @@ describe("GithubPrWriteAuthority v5", () => {
     const preview = authority.createPreview(session.sessionId, "post_comment", { body: "hello" });
     const challenge = authority.createChallenge(preview.previewId);
     authority.approve(challenge.challengeId, proof(challenge.challengeId));
-    const first = authority.recordEffectIntent(preview.previewId, "request-1");
-    const second = authority.recordEffectIntent(preview.previewId, "request-1");
+    const binding = { operation: "post_comment", requestDigest: preview.requestDigest, idempotencyKey: "request-1" };
+    const first = authority.recordEffectIntent(preview.previewId, "request-1", binding);
+    const second = authority.recordEffectIntent(preview.previewId, "request-1", binding);
     expect(second.effectId).toBe(first.effectId);
+    const retryPreview = authority.createPreview(session.sessionId, "post_comment", { body: "hello" });
+    const retryChallenge = authority.createChallenge(retryPreview.previewId);
+    authority.approve(retryChallenge.challengeId, proof(retryChallenge.challengeId));
+    const retried = authority.recordEffectIntent(retryPreview.previewId, "request-1", binding);
+    expect(retried.effectId).toBe(first.effectId);
     const outcome = { operation: "apply_suggestions", status: "ok" };
     authority.recordEffectOutcome(first.effectId, outcome);
     const outcomeDigest = authority.outcomeDigest(first.effectId);
@@ -140,5 +146,28 @@ describe("GithubPrWriteAuthority v5", () => {
       else process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = previousStage;
       authority.close();
     }
+  });
+
+  it("binds approval outcome receipts to the exact PR request digest", async () => {
+    const authority = await GithubPrWriteAuthority.open(dir());
+    const request = {
+      repository: "twoimo/tzudong",
+      prNumber: 2514,
+      expectedHead: "a".repeat(40),
+      baseRepository: "twoimo/tzudong",
+      headRepository: "twoimo/tzudong",
+    };
+    const capability = authority.issueCapability("twoimo");
+    const session = authority.openSession(capability.capabilityId, capability.generation);
+    const preview = authority.createPreview(session.sessionId, "approve", request);
+    const challenge = authority.createChallenge(preview.previewId);
+    authority.approve(challenge.challengeId, proof(challenge.challengeId));
+    const intent = authority.recordEffectIntent(preview.previewId, "approval-request");
+    authority.recordEffectOutcome(intent.effectId, { operation: "approve", status: "completed" });
+    const outcome = authority.outcomeDigest(intent.effectId);
+    expect(outcome).toBeTruthy();
+    expect(authority.hasOutcomeDigest(outcome!, "approve", undefined, digest(request))).toBe(true);
+    expect(authority.hasOutcomeDigest(outcome!, "approve", undefined, digest({ ...request, expectedHead: "b".repeat(40) }))).toBe(false);
+    authority.close();
   });
 });

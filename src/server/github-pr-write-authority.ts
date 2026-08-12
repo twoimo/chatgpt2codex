@@ -318,7 +318,9 @@ export class GithubPrWriteAuthority {
     }
     try {
       const active = this.activeCapability(principal);
-      if (active) return active;
+      const expectedScopeDigest = digest(scope);
+      if (active?.scopeDigest === expectedScopeDigest) return active;
+      if (active) this.revokeCapability(active.capabilityId);
     } catch (error) {
       if (!(error instanceof GithubPrWriteError) || error.code !== "GITHUB_WRITE_EXPIRED") throw error;
     }
@@ -506,11 +508,25 @@ export class GithubPrWriteAuthority {
     return row ? String(row.outcome_digest) : undefined;
   }
 
-  hasOutcomeDigest(value: string, operation = "apply_suggestions", proofDigest?: string): boolean {
-    if (!/^[0-9a-f]{64}$/iu.test(value) || (proofDigest !== undefined && !/^[0-9a-f]{64}$/iu.test(proofDigest))) return false;
-    const row = proofDigest === undefined
-      ? this.db.prepare("SELECT effect_id FROM effect_outcomes WHERE outcome_digest = ? AND operation = ? LIMIT 1").get(value, operation)
-      : this.db.prepare("SELECT effect_id FROM effect_outcomes WHERE outcome_digest = ? AND operation = ? AND proof_digest = ? LIMIT 1").get(value, operation, proofDigest);
+  hasOutcomeDigest(value: string, operation = "apply_suggestions", proofDigest?: string, requestDigest?: string): boolean {
+    if (
+      !/^[0-9a-f]{64}$/iu.test(value)
+      || (proofDigest !== undefined && !/^[0-9a-f]{64}$/iu.test(proofDigest))
+      || (requestDigest !== undefined && !/^[0-9a-f]{64}$/iu.test(requestDigest))
+    ) return false;
+    const conditions = ["o.outcome_digest = ?", "o.operation = ?"];
+    const args: unknown[] = [value, operation];
+    if (proofDigest !== undefined) {
+      conditions.push("o.proof_digest = ?");
+      args.push(proofDigest);
+    }
+    if (requestDigest !== undefined) {
+      conditions.push("i.request_digest = ?");
+      args.push(requestDigest);
+    }
+    const row = this.db.prepare(
+      `SELECT o.effect_id FROM effect_outcomes o JOIN effect_intents i ON i.effect_id = o.effect_id WHERE ${conditions.join(" AND ")} LIMIT 1`,
+    ).get(...args);
     return Boolean(row);
   }
   assertEffectSession(effectId: string, sessionId: string): void {

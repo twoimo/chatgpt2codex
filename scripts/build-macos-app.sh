@@ -323,6 +323,8 @@ cp "$ROOT/package.json" "$RUNTIME_DIR/package.json"
 cp "$ROOT/package-lock.json" "$RUNTIME_DIR/package-lock.json"
 cp "$ROOT/start-chatgpt.sh" "$RUNTIME_DIR/start-chatgpt.sh"
 cp "$ROOT/scripts/macos-dependency-doctor.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh"
+mkdir -p "$RUNTIME_DIR/scripts"
+cp "$ROOT/scripts/install-github-pr-feedback-supervisor.sh" "$RUNTIME_DIR/scripts/install-github-pr-feedback-supervisor.sh"
 cp -R "$ROOT/assets" "$RUNTIME_DIR/assets"
 mkdir -p "$RUNTIME_DIR/docs"
 cp "$ROOT/docs/INSTALL.md" "$RUNTIME_DIR/docs/INSTALL.md"
@@ -338,7 +340,7 @@ find "$RUNTIME_DIR/node_modules" -name '*.map' -type f -delete
 find "$RUNTIME_DIR/node_modules" -name '*.ts' ! -name '*.d.ts' -type f -delete
 find "$APP_DIR" -name '._*' -type f -delete
 
-chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$MACOS_DIR/chatgpt2codex-ax" "$HELPER_APP_MACOS_DIR/chatgpt2codex-operator-helper" "$RUNTIME_DIR/start-chatgpt.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh"
+chmod +x "$MACOS_DIR/ChatGPTToCodexStatusBar" "$MACOS_DIR/chatgpt2codex-ax" "$HELPER_APP_MACOS_DIR/chatgpt2codex-operator-helper" "$RUNTIME_DIR/start-chatgpt.sh" "$RUNTIME_DIR/macos-dependency-doctor.sh" "$RUNTIME_DIR/scripts/install-github-pr-feedback-supervisor.sh"
 write_pkg_scripts
 xattr -cr "$APP_DIR" || true
 

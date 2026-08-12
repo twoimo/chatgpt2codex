@@ -116,6 +116,8 @@ export interface ToolContext {
   writeSessionId?: string;
   transportKind?: "stdio" | "http" | "mcp" | "direct" | "operator";
   writeAuthorityHandle?: unknown;
+  /** Exact repository allowlist bound to an unattended supervisor write session. */
+  githubPrWriteRepositoryAllowlist?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------

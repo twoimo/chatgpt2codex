@@ -20,11 +20,35 @@ export const WRITE_TTL_MS = {
   skew: CLOCK_SKEW_MS,
 } as const;
 
+export type GithubCheckSummary = "passing" | "pending" | "failing" | "unknown";
+const SUCCESS_CHECK_VALUES = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
+const FAILURE_CHECK_VALUES = new Set(["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "ERROR", "STALE"]);
+const PENDING_CHECK_VALUES = new Set(["EXPECTED", "QUEUED", "IN_PROGRESS", "PENDING", "REQUESTED", "WAITING"]);
+
+/** Require explicit successful check evidence; transport completion alone is not success. */
+export function summarizeGithubCheckRollup(value: unknown): GithubCheckSummary {
+  if (!Array.isArray(value) || value.length === 0) return "unknown";
+  for (const rawCheck of value) {
+    if (!rawCheck || typeof rawCheck !== "object" || Array.isArray(rawCheck)) return "unknown";
+    const check = rawCheck as Record<string, unknown>;
+    const state = typeof check.state === "string" ? check.state.toUpperCase() : undefined;
+    const conclusion = typeof check.conclusion === "string" ? check.conclusion.toUpperCase() : undefined;
+    const status = typeof check.status === "string" ? check.status.toUpperCase() : undefined;
+    const values = [state, conclusion, status].filter((item): item is string => item !== undefined);
+    if (values.length === 0) return "unknown";
+    if (values.some((item) => FAILURE_CHECK_VALUES.has(item))) return "failing";
+    if (values.some((item) => PENDING_CHECK_VALUES.has(item))) return "pending";
+    const explicitSuccess = SUCCESS_CHECK_VALUES.has(state ?? "") || SUCCESS_CHECK_VALUES.has(conclusion ?? "");
+    if (!explicitSuccess) return "unknown";
+  }
+  return "passing";
+}
+
 export const WRITE_STAGES = ["off", "shadow", "prepare", "enabled"] as const;
 export type WriteStage = (typeof WRITE_STAGES)[number];
 export const WRITE_OPERATIONS = [
   "post_comment", "post_reply", "resolve_thread", "rerequest_reviewer",
-  "apply_suggestions", "push_prepared_worktree",
+  "approve", "merge", "apply_suggestions", "push_prepared_worktree",
 ] as const;
 export const GITHUB_PR_WRITE_REPOSITORY = "Yeachan-Heo/gajae-code" as const;
 export const GITHUB_PR_WRITE_FORK_REPOSITORY = "twoimo/gajae-code" as const;
