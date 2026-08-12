@@ -85,15 +85,35 @@ describe("GitHub PR feedback supervisor lifetime", () => {
     await supervisor.close();
   });
 
-  it("rejects a duration longer than 24 hours", async () => {
+  it("accepts a seven-day unattended window", async () => {
+    process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-supervisor-seven-day-"));
+    temporaryRoots.push(stateDir);
+    const supervisor = await runGithubPrFeedbackSupervisor({
+      stateDir,
+      workspaceRoot: stateDir,
+      durationMs: 7 * 24 * 60 * 60 * 1000,
+      repositoryAllowlist: ["twoimo/tzudong"],
+      once: true,
+      gh: emptyGh,
+    });
+    await supervisor.waitUntilFinished();
+    const state = JSON.parse(await fs.readFile(path.join(stateDir, "github-pr-feedback-supervisor.json"), "utf8")) as {
+      unattendedStartedAt: number;
+      unattendedExpiresAt: number;
+    };
+    expect(state.unattendedExpiresAt - state.unattendedStartedAt).toBe(7 * 24 * 60 * 60 * 1000);
+  });
+
+  it("rejects a duration longer than seven days", async () => {
     process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
     await expect(runGithubPrFeedbackSupervisor({
       stateDir: os.tmpdir(),
       workspaceRoot: os.tmpdir(),
-      durationMs: 24 * 60 * 60 * 1000 + 1,
+      durationMs: 7 * 24 * 60 * 60 * 1000 + 1,
       repositoryAllowlist: ["twoimo/tzudong"],
       gh: emptyGh,
-    })).rejects.toThrow("duration must be between 60000 and 86400000 milliseconds");
+    })).rejects.toThrow("duration must be between 60000 and 604800000 milliseconds");
   });
 
   it("does not enter the supervisor merge path for completed-only checks", async () => {
@@ -277,7 +297,7 @@ describe("GitHub PR feedback supervisor lifetime", () => {
     } as never, workspaceRoot)).rejects.toThrow("worktree path is invalid");
   });
 
-  it("rejects a persisted unattended window longer than 24 hours", async () => {
+  it("rejects a persisted unattended window longer than seven days", async () => {
     process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
     const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-supervisor-state-"));
     temporaryRoots.push(stateDir);
@@ -287,7 +307,7 @@ describe("GitHub PR feedback supervisor lifetime", () => {
       processed: {},
       terminal: {},
       unattendedStartedAt: startedAt,
-      unattendedExpiresAt: startedAt + 24 * 60 * 60 * 1000 + 1,
+      unattendedExpiresAt: startedAt + 7 * 24 * 60 * 60 * 1000 + 1,
     }));
     await expect(runGithubPrFeedbackSupervisor({
       stateDir,
@@ -297,6 +317,37 @@ describe("GitHub PR feedback supervisor lifetime", () => {
       once: true,
       gh: emptyGh,
     })).rejects.toThrow("unattended window state is invalid");
+  });
+
+  it("allows an explicit operator reset to start a fresh seven-day window", async () => {
+    process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "chatgpt2codex-supervisor-reset-"));
+    temporaryRoots.push(stateDir);
+    const startedAt = Date.now() - 60 * 60 * 1000;
+    await fs.writeFile(path.join(stateDir, "github-pr-feedback-supervisor.json"), JSON.stringify({
+      version: 1,
+      processed: { "review:1": "digest" },
+      terminal: {},
+      unattendedStartedAt: startedAt,
+      unattendedExpiresAt: startedAt + 60 * 60 * 1000,
+    }));
+    const supervisor = await runGithubPrFeedbackSupervisor({
+      stateDir,
+      workspaceRoot: stateDir,
+      durationMs: 7 * 24 * 60 * 60 * 1000,
+      repositoryAllowlist: ["twoimo/tzudong"],
+      once: true,
+      resetUnattendedWindow: true,
+      gh: emptyGh,
+    });
+    await supervisor.waitUntilFinished();
+    const state = JSON.parse(await fs.readFile(path.join(stateDir, "github-pr-feedback-supervisor.json"), "utf8")) as {
+      processed: Record<string, string>;
+      unattendedStartedAt: number;
+      unattendedExpiresAt: number;
+    };
+    expect(state.unattendedExpiresAt - state.unattendedStartedAt).toBe(7 * 24 * 60 * 60 * 1000);
+    expect(state.processed).toEqual({ "review:1": "digest" });
   });
 
   it("does not renew the unattended window after a restart", async () => {
@@ -327,7 +378,7 @@ describe("GitHub PR feedback supervisor lifetime", () => {
       stateDir,
       workspaceRoot: stateDir,
       repositoryAllowlist: ["twoimo/tzudong"],
-      durationMs: 24 * 60 * 60 * 1000,
+      durationMs: 7 * 24 * 60 * 60 * 1000,
       gh: emptyGh,
     });
     await second.waitUntilFinished();

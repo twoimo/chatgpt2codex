@@ -15,7 +15,8 @@ NODE="${CHATGPT2CODEX_NODE:-$(command -v node || true)}"
 ALLOWLIST="${CHATGPT2CODEX_GITHUB_PR_ALLOWLIST:-}"
 CDP_URL="${CHATGPT2CODEX_CHATGPT_CDP_URL:-http://127.0.0.1:9229}"
 INTERVAL_SECONDS="${CHATGPT2CODEX_SUPERVISOR_INTERVAL_SECONDS:-300}"
-DURATION_HOURS="${CHATGPT2CODEX_SUPERVISOR_DURATION_HOURS:-24}"
+DURATION_HOURS="${CHATGPT2CODEX_SUPERVISOR_DURATION_HOURS:-168}"
+RESET_WINDOW="${CHATGPT2CODEX_RESET_UNATTENDED_WINDOW:-1}"
 
 if [[ -z "$NODE" || ! -x "$NODE" ]]; then
   printf '%s\n' "error: a usable Node.js executable is required." >&2
@@ -29,12 +30,16 @@ if [[ ! "$INTERVAL_SECONDS" =~ ^[0-9]+$ || "$INTERVAL_SECONDS" -lt 60 || "$INTER
   printf '%s\n' "error: interval must be between 60 and 86400 seconds." >&2
   exit 1
 fi
-if [[ ! "$DURATION_HOURS" =~ ^[0-9]+$ || "$DURATION_HOURS" -lt 1 || "$DURATION_HOURS" -gt 24 ]]; then
-  printf '%s\n' "error: duration must be between 1 and 24 hours." >&2
+if [[ ! "$DURATION_HOURS" =~ ^[0-9]+$ || "$DURATION_HOURS" -lt 1 || "$DURATION_HOURS" -gt 168 ]]; then
+  printf '%s\n' "error: duration must be between 1 and 168 hours (7 days)." >&2
   exit 1
 fi
 if [[ "$CDP_URL" != "http://127.0.0.1:"* && "$CDP_URL" != "http://localhost:"* && "$CDP_URL" != "http://[::1]:"* ]]; then
   printf '%s\n' "error: ChatGPT CDP URL must be loopback HTTP." >&2
+  exit 1
+fi
+if [[ "$RESET_WINDOW" != "0" && "$RESET_WINDOW" != "1" ]]; then
+  printf '%s\n' "error: CHATGPT2CODEX_RESET_UNATTENDED_WINDOW must be 0 or 1." >&2
   exit 1
 fi
 if [[ -z "$ALLOWLIST" ]]; then
@@ -119,16 +124,23 @@ PY
 
 UID_VALUE="$(id -u)"
 launchctl bootout "gui/$UID_VALUE/$LABEL" || true
+if [[ "$RESET_WINDOW" == "1" ]]; then
+  CHATGPT2CODEX_UNATTENDED_WRITE=1 \
+  CHATGPT2CODEX_MONITOR_ROLLOUT=enabled \
+  CHATGPT2CODEX_STATE_DIR="$STATE_DIR" \
+  "$NODE" "$ROOT/dist/cli.js" github-pr-feedback-supervisor-reset --duration-hours "$DURATION_HOURS"
+fi
 bootstrapped=0
-for attempt in 1 2 3; do
+sleep 2
+for attempt in 1 2 3 4 5; do
   if launchctl bootstrap "gui/$UID_VALUE" "$PLIST"; then
     bootstrapped=1
     break
   fi
-  sleep 1
+  sleep 2
 done
 if [[ "$bootstrapped" -ne 1 ]]; then
-  printf '%s\n' "error: launchd could not bootstrap $LABEL after three attempts." >&2
+  printf '%s\n' "error: launchd could not bootstrap $LABEL after five attempts." >&2
   exit 1
 fi
 launchctl kickstart -k "gui/$UID_VALUE/$LABEL"

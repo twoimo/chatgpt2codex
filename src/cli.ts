@@ -304,6 +304,17 @@ async function cmdServeHttp(
   // once the server is asked to stop.
   await new Promise<void>(() => {});
 }
+async function cmdGithubPrFeedbackSupervisorReset(flags: Record<string, string | boolean>): Promise<void> {
+  const durationHours = typeof flags["duration-hours"] === "string"
+    ? Number(flags["duration-hours"])
+    : 168;
+  if (!Number.isSafeInteger(durationHours) || durationHours < 1 || durationHours > 168) {
+    throw new Error("github-pr-feedback-supervisor duration must be between 1 and 168 hours");
+  }
+  const { resetGithubPrFeedbackSupervisorWindow } = await import("./server/github-pr-feedback-supervisor.js");
+  const window = await resetGithubPrFeedbackSupervisorWindow(defaultStateDir(), durationHours * 60 * 60 * 1_000);
+  console.error(`github-pr-feedback-supervisor unattended window reset: ${new Date(window.unattendedStartedAt).toISOString()} -> ${new Date(window.unattendedExpiresAt).toISOString()}`);
+}
 
 async function cmdServe(flags: Record<string, string | boolean>): Promise<void> {
   const actionsMode = configuredActionsMode();
@@ -520,8 +531,8 @@ async function cmdGithubPrFeedbackSupervisor(flags: Record<string, string | bool
   const durationHours = typeof flags["duration-hours"] === "string"
     ? Number(flags["duration-hours"])
     : undefined;
-  if (durationHours !== undefined && (!Number.isSafeInteger(durationHours) || durationHours < 1 || durationHours > 24)) {
-    throw new Error("github-pr-feedback-supervisor duration must be between 1 and 24 hours");
+  if (durationHours !== undefined && (!Number.isSafeInteger(durationHours) || durationHours < 1 || durationHours > 168)) {
+    throw new Error("github-pr-feedback-supervisor duration must be between 1 and 168 hours");
   }
   const repositoryAllowlist = typeof flags.repositories === "string"
     ? flags.repositories.split(",").map((value) => value.trim())
@@ -534,6 +545,7 @@ async function cmdGithubPrFeedbackSupervisor(flags: Record<string, string | bool
     ...(durationHours === undefined ? {} : { durationMs: durationHours * 60 * 60 * 1_000 }),
     ...(repositoryAllowlist === undefined ? {} : { repositoryAllowlist }),
     once: flags.once === true,
+    resetUnattendedWindow: flags["reset-unattended-window"] === true,
     chatgptCdpUrl: typeof flags["chatgpt-cdp-url"] === "string" ? flags["chatgpt-cdp-url"] : undefined,
   });
   let closing = false;
@@ -849,6 +861,9 @@ async function main(): Promise<void> {
     case "github-pr-feedback-supervisor":
       await cmdGithubPrFeedbackSupervisor(flags);
       break;
+    case "github-pr-feedback-supervisor-reset":
+      await cmdGithubPrFeedbackSupervisorReset(flags);
+      break;
     case "github-pr-write":
       await cmdGithubPrWrite(process.argv.slice(2));
       break;
@@ -859,7 +874,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|github-pr-write|github-pr-feedback-supervisor|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|github-pr-write|github-pr-feedback-supervisor|github-pr-feedback-supervisor-reset|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

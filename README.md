@@ -174,7 +174,7 @@ CHATGPT2CODEX_UNATTENDED_WRITE=1 \
 CHATGPT2CODEX_ACTIONS_MODE=github-pr-monitor-write \
 CHATGPT2CODEX_MONITOR_ROLLOUT=enabled \
 chatgpt2codex github-pr-feedback-supervisor \
-  --interval-seconds 300 --duration-hours 24 \
+  --interval-seconds 300 --duration-hours 168 \
   --repositories "twoimo/chatgpt2codex,twoimo/tzudong" \
   --workspace "$HOME/workspace" \
   --chatgpt-cdp-url http://127.0.0.1:9229
@@ -187,12 +187,14 @@ repositories are rejected. The CDP endpoint is also restricted to loopback
 HTTP, and its discovery and request calls have bounded timeouts.
 For launchd installation, set `CHATGPT2CODEX_GITHUB_PR_ALLOWLIST` and run
 `scripts/install-github-pr-feedback-supervisor.sh`; it writes a bounded
-24-hour service, restarts unexpected failures with throttling, and does not
+7-day (168-hour) service, restarts unexpected failures with throttling, and does not
 restart a normal successful expiry.
-`--duration-hours 24` bounds the unattended window to 24 hours; the
+`--duration-hours 168` bounds the unattended window to 7 days; the
 `CHATGPT2CODEX_UNATTENDED_WRITE=1` flag bypasses per-effect interactive approval
 only for this explicitly launched supervisor. The fixed repository/account
 checks, fresh GitHub evidence, idempotency, and recovery handling remain active.
+Reinstalling through the installer intentionally starts a fresh 7-day window;
+set `CHATGPT2CODEX_RESET_UNATTENDED_WINDOW=0` to preserve the existing expiry.
 The monitor caps each discovery list at 1,000 issues, limits child feedback pages and
 thread comments, and reports `complete: false` whenever a PR closes or a reviewer
 request changes during the read. Repository keys are canonical lowercase

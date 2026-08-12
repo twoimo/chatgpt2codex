@@ -20,7 +20,7 @@ const SUPERVISOR_STATE_VERSION = 1 as const;
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_INTERVAL_MS = 60 * 1000;
 const MAX_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const MAX_DURATION_MS = 24 * 60 * 60 * 1000;
+const MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_STATE_BYTES = 512 * 1024;
 const MAX_FEEDBACK_ITEMS = 24;
 const MAX_LLM_FEEDBACK_ITEMS = 8;
@@ -70,6 +70,8 @@ export interface GithubPrFeedbackSupervisorOptions {
   /** Exact lowercase owner/name repositories eligible for automated handling. */
   readonly repositoryAllowlist?: readonly string[];
   readonly once?: boolean;
+  /** Explicit operator action to start a fresh bounded unattended window. */
+  readonly resetUnattendedWindow?: boolean;
   readonly gh?: GhCommand;
   readonly chatgptCdpUrl?: string;
 }
@@ -1126,7 +1128,7 @@ export async function runGithubPrFeedbackSupervisor(options: GithubPrFeedbackSup
   const repositoryAllowlist = normalizeRepositoryAllowlist(options.repositoryAllowlist);
   const durationMs = options.durationMs ?? MAX_DURATION_MS;
   if (!Number.isSafeInteger(durationMs) || durationMs < MIN_INTERVAL_MS || durationMs > MAX_DURATION_MS) {
-    throw new Error("github-pr-feedback-supervisor duration must be between 60000 and 86400000 milliseconds");
+    throw new Error("github-pr-feedback-supervisor duration must be between 60000 and 604800000 milliseconds");
   }
   const chatgptCdpUrl = normalizeCdpEndpoint(options.chatgptCdpUrl);
   const statePath = defaultStatePath(options.stateDir);
@@ -1136,7 +1138,7 @@ export async function runGithubPrFeedbackSupervisor(options: GithubPrFeedbackSup
   }
   const state = await loadState(statePath);
   const now = Date.now();
-  if (state.unattendedStartedAt === undefined) {
+  if (options.resetUnattendedWindow || state.unattendedStartedAt === undefined) {
     state.unattendedStartedAt = now;
     state.unattendedExpiresAt = now + durationMs;
     await saveState(statePath, state);
@@ -1215,4 +1217,30 @@ export async function runGithubPrFeedbackSupervisor(options: GithubPrFeedbackSup
     },
     waitUntilFinished: () => finishedPromise,
   };
+}
+
+export async function resetGithubPrFeedbackSupervisorWindow(
+  stateDir: string,
+  durationMs = MAX_DURATION_MS,
+): Promise<{ unattendedStartedAt: number; unattendedExpiresAt: number }> {
+  if (process.platform !== "darwin") throw new Error("GitHub PR feedback supervisor requires Darwin");
+  if (process.env.CHATGPT2CODEX_UNATTENDED_WRITE !== "1") {
+    throw new Error("set CHATGPT2CODEX_UNATTENDED_WRITE=1 to reset the unattended window");
+  }
+  if (!Number.isSafeInteger(durationMs) || durationMs < MIN_INTERVAL_MS || durationMs > MAX_DURATION_MS) {
+    throw new Error("github-pr-feedback-supervisor duration must be between 60000 and 604800000 milliseconds");
+  }
+  const stateDirInfo = await lstat(stateDir).catch(() => undefined);
+  if (stateDirInfo && (stateDirInfo.isSymbolicLink() || !stateDirInfo.isDirectory())) {
+    throw new Error("supervisor state directory is invalid");
+  }
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  const statePath = defaultStatePath(stateDir);
+  const state = await loadState(statePath);
+  const unattendedStartedAt = Date.now();
+  const unattendedExpiresAt = unattendedStartedAt + durationMs;
+  state.unattendedStartedAt = unattendedStartedAt;
+  state.unattendedExpiresAt = unattendedExpiresAt;
+  await saveState(statePath, state);
+  return { unattendedStartedAt, unattendedExpiresAt };
 }
