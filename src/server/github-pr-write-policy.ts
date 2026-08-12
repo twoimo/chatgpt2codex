@@ -18,6 +18,13 @@ export interface RepositoryTopology {
 }
 
 const rank: Record<Permission, number> = { NONE: 0, READ: 1, TRIAGE: 2, WRITE: 3, MAINTAIN: 4, ADMIN: 5 };
+const REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
+export function unattendedWriteEnabled(): boolean {
+  return process.env.CHATGPT2CODEX_UNATTENDED_WRITE === "1";
+}
+function unattendedRepository(value: string): boolean {
+  return REPOSITORY_PATTERN.test(value) && !value.includes("..");
+}
 export function isSameRepository(e: GithubEvidence): boolean { return e.baseRepositoryId === e.headRepositoryId && e.baseRepositoryId === e.repositoryId; }
 export function isOwnedFork(e: GithubEvidence, topology?: RepositoryTopology): boolean {
   return topology?.baseRepository === GITHUB_PR_WRITE_REPOSITORY
@@ -34,11 +41,23 @@ export function canWriteCode(e: GithubEvidence, topology?: RepositoryTopology): 
     && rank[e.permission] >= rank.WRITE
     && e.canPush;
 }
+export function canWriteCodeUnattended(e: GithubEvidence, topology?: RepositoryTopology): boolean {
+  if (!unattendedWriteEnabled() || !topology || !unattendedRepository(topology.baseRepository) || !unattendedRepository(topology.headRepository)) return false;
+  const headOwner = topology.headRepository.split("/", 1)[0];
+  return e.account.login === GITHUB_PR_WRITE_ACCOUNT
+    && e.author.login === GITHUB_PR_WRITE_ACCOUNT
+    && e.account.actorType === "User"
+    && e.author.actorType === "User"
+    && e.canPush
+    && rank[e.permission] >= rank.WRITE
+    && (topology.baseRepository === topology.headRepository || headOwner?.toLowerCase() === GITHUB_PR_WRITE_ACCOUNT.toLowerCase());
+}
 export function assertOperationAllowed(operation: WriteOperation, e: GithubEvidence, stage: WriteStage, topology?: RepositoryTopology): void {
   if (stage === "off" || (stage === "prepare" && operation !== "apply_suggestions")) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "operation is disabled at rollout stage");
-  if (stage !== "shadow" && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation) && !canWriteCode(e, topology)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
+  const reviewOperation = ["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation);
+  if (stage !== "shadow" && !reviewOperation && !canWriteCode(e, topology) && !canWriteCodeUnattended(e, topology)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
   if (e.account.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "the authenticated account must be a User");
-  if (!["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation) && e.author.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require a User-authored PR");
+  if (!reviewOperation && e.author.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "code writes require a User-authored PR");
   if (!Number.isSafeInteger(e.repositoryId) || !Number.isSafeInteger(e.baseRepositoryId) || !Number.isSafeInteger(e.headRepositoryId)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "immutable repository IDs are required");
 }
 

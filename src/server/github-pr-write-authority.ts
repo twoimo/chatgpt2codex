@@ -8,6 +8,7 @@ import {
   WRITE_TTL_MS,
   GITHUB_PR_WRITE_SCHEMA_VERSION,
   WRITE_STAGES,
+  WRITE_OPERATIONS,
   assertFreshExpiry,
   digest,
   effectIdentityFor,
@@ -285,6 +286,45 @@ export class GithubPrWriteAuthority {
     return { capabilityId, principal, generation: selectedGeneration, issuedAt, expiresAt, status: "active", scopeDigest };
   }
 
+  activeCapability(principal: string): Capability | undefined {
+    text(principal, "principal");
+    const row = this.db.prepare(
+      "SELECT capability_id, principal, generation, issued_at, expires_at, status, scope_digest FROM capabilities WHERE principal = ? AND status = 'active' ORDER BY issued_at DESC LIMIT 1",
+    ).get(principal);
+    if (!row) return undefined;
+    this.assertWindow(row, WRITE_TTL_MS.capability);
+    return {
+      capabilityId: String(row.capability_id),
+      principal: String(row.principal),
+      generation: Number(row.generation),
+      issuedAt: Number(row.issued_at),
+      expiresAt: Number(row.expires_at),
+      status: "active",
+      scopeDigest: String(row.scope_digest),
+    };
+  }
+
+  /** Explicit unattended mode may renew its bounded capability after expiry. */
+  unattendedCapability(principal: string, scope: readonly WriteOperation[] = WRITE_OPERATIONS): Capability {
+    if (process.env.CHATGPT2CODEX_UNATTENDED_WRITE !== "1") {
+      throw new GithubPrWriteError("GITHUB_WRITE_ATTESTATION", "unattended capability renewal is disabled");
+    }
+    if (this.currentStage() !== "enabled") {
+      throw new GithubPrWriteError("GITHUB_WRITE_ROLLOUT_BLOCKED", "unattended capability renewal requires enabled rollout");
+    }
+    text(principal, "principal");
+    if (scope.length !== WRITE_OPERATIONS.length || scope.some((operation, index) => operation !== WRITE_OPERATIONS[index])) {
+      throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT", "unattended capability scope is fixed");
+    }
+    try {
+      const active = this.activeCapability(principal);
+      if (active) return active;
+    } catch (error) {
+      if (!(error instanceof GithubPrWriteError) || error.code !== "GITHUB_WRITE_EXPIRED") throw error;
+    }
+    return this.issueCapability(principal, this.currentGeneration(), scope);
+  }
+
   openSession(capabilityId: string, generation: number, binding: unknown = { transport: "local" }): WriteSession {
     text(capabilityId, "capabilityId");
     number(generation, "generation");
@@ -370,6 +410,29 @@ export class GithubPrWriteAuthority {
       this.db.prepare("UPDATE previews SET status = 'approved' WHERE preview_id = ? AND status = 'approval_pending'").run(String(row.preview_id));
       this.db.prepare("INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?)").run(approvalId, challengeId, issuedAt, expiresAt, "approved", attestationDigest);
       this.audit("approval.granted", approvalId, { challengeId, attestationDigest });
+    });
+    return { approvalId, challengeId, issuedAt, expiresAt, status: "approved" };
+  }
+
+  approveUnattended(challengeId: string, binding: unknown): Approval {
+    if (process.env.CHATGPT2CODEX_UNATTENDED_WRITE !== "1") {
+      throw new GithubPrWriteError("GITHUB_WRITE_ATTESTATION", "unattended approval is disabled");
+    }
+    text(challengeId, "challengeId");
+    const row = this.db.prepare("SELECT preview_id, issued_at, expires_at, status FROM challenges WHERE challenge_id = ?").get(challengeId);
+    if (!row || row.status !== "pending") throw new GithubPrWriteError("GITHUB_WRITE_APPROVAL_INVALID", "challenge is invalid or already consumed");
+    this.assertWindow(row, WRITE_TTL_MS.challenge);
+    const { issuedAt, expiresAt } = this.expiry(WRITE_TTL_MS.approval);
+    const approvalId = randomUUID();
+    const unattendedDigest = digest({ mode: "unattended-v1", challengeId, binding });
+    this.transaction(() => {
+      const challengeUpdate = this.db.prepare("UPDATE challenges SET status = 'approved' WHERE challenge_id = ? AND status = 'pending'").run(challengeId);
+      const previewUpdate = this.db.prepare("UPDATE previews SET status = 'approved' WHERE preview_id = ? AND status = 'approval_pending'").run(String(row.preview_id));
+      if (challengeUpdate.changes !== 1 || previewUpdate.changes !== 1) {
+        throw new GithubPrWriteError("GITHUB_WRITE_APPROVAL_INVALID", "challenge approval state changed");
+      }
+      this.db.prepare("INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?)").run(approvalId, challengeId, issuedAt, expiresAt, "approved", unattendedDigest);
+      this.audit("approval.granted_unattended", approvalId, { challengeId, unattendedDigest });
     });
     return { approvalId, challengeId, issuedAt, expiresAt, status: "approved" };
   }

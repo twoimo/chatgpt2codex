@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError } from "./github-pr-write-contract.js";
 import { defaultGhCommand, type GhCommand } from "./github-pr-write-effects.js";
-import { canWriteCode, type GithubEvidence } from "./github-pr-write-policy.js";
+import { canWriteCode, canWriteCodeUnattended, type GithubEvidence, unattendedWriteEnabled } from "./github-pr-write-policy.js";
 
 export interface GitResult { stdout: string; stderr?: string; exitCode?: number; timedOut?: boolean; }
 export type GitCommand = (argv: readonly string[], cwd: string, timeoutMs: number) => Promise<GitResult>;
@@ -36,6 +36,7 @@ export type CodeEffect =
 const MAX_OUTPUT = 64 * 1024;
 const TIMEOUT_MS = 30_000;
 const SHA = /^[0-9a-f]{40}$/iu;
+const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/u;
 const DIGEST = /^[0-9a-f]{64}$/iu;
 const RELATIVE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]+$/u;
@@ -63,20 +64,24 @@ export class GithubPrWriteCodeEffects {
     try {
       const user = await this.gh(["api", "user", "--hostname", "github.com", "--jq", ".login"], this.timeoutMs);
       if (typeof user.stdout !== "string" || user.timedOut || user.exitCode !== 0 || user.stdout.trim() !== GITHUB_PR_WRITE_ACCOUNT) fail("GITHUB_WRITE_RECOVERY_REQUIRED", "authenticated account evidence is ambiguous");
-      const view = await this.gh(["pr", "view", String(context.prNumber), "--repo", GITHUB_PR_WRITE_REPOSITORY, "--hostname", "github.com", "--json", "state,author,headRefOid,baseRepository,headRepository,repository"], this.timeoutMs);
+      const repositoryName = unattendedWriteEnabled() ? context.repository : GITHUB_PR_WRITE_REPOSITORY;
+      const view = await this.gh(["pr", "view", String(context.prNumber), "--repo", repositoryName, "--json", "state,author,headRefOid,headRepository"], this.timeoutMs);
       if (typeof view.stdout !== "string" || view.timedOut || view.exitCode !== 0 || Buffer.byteLength(view.stdout, "utf8") > MAX_OUTPUT) fail("GITHUB_WRITE_RECOVERY_REQUIRED", "pull request evidence is ambiguous");
       let parsed: Record<string, unknown> = {};
       try { parsed = JSON.parse(view.stdout) as Record<string, unknown>; } catch { fail("GITHUB_WRITE_RECOVERY_REQUIRED", "pull request evidence is invalid"); }
       const author = parsed.author as Record<string, unknown> | undefined;
-      const repository = parsed.repository as Record<string, unknown> | undefined;
-      const baseRepository = parsed.baseRepository as Record<string, unknown> | undefined;
       const headRepository = parsed.headRepository as Record<string, unknown> | undefined;
-      if (baseRepositoryName !== GITHUB_PR_WRITE_REPOSITORY || (headRepositoryName !== GITHUB_PR_WRITE_REPOSITORY && headRepositoryName !== GITHUB_PR_WRITE_FORK_REPOSITORY)
+      const fixedTopology = baseRepositoryName === GITHUB_PR_WRITE_REPOSITORY
+        && (headRepositoryName === GITHUB_PR_WRITE_REPOSITORY || headRepositoryName === GITHUB_PR_WRITE_FORK_REPOSITORY)
+        && repositoryName === GITHUB_PR_WRITE_REPOSITORY;
+      const dynamicTopology = unattendedWriteEnabled()
+        && baseRepositoryName === repositoryName
+        && REPOSITORY.test(baseRepositoryName)
+        && REPOSITORY.test(headRepositoryName);
+      if ((!fixedTopology && !dynamicTopology)
         || parsed.state !== "OPEN"
         || String(parsed.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase()
         || author?.login !== GITHUB_PR_WRITE_ACCOUNT
-        || repository?.nameWithOwner !== GITHUB_PR_WRITE_REPOSITORY
-        || baseRepository?.nameWithOwner !== baseRepositoryName
         || headRepository?.nameWithOwner !== headRepositoryName) {
         fail("GITHUB_WRITE_MUTATION_DENIED", "pull request topology or head evidence is stale");
       }
@@ -90,7 +95,15 @@ export class GithubPrWriteCodeEffects {
     const baseRepository = context.baseRepository ?? GITHUB_PR_WRITE_REPOSITORY;
     const headRepository = context.headRepository ?? GITHUB_PR_WRITE_REPOSITORY;
     const topology = { baseRepository, headRepository };
-    if (!canWriteCode(context.evidence, topology) || baseRepository !== GITHUB_PR_WRITE_REPOSITORY || (headRepository !== GITHUB_PR_WRITE_REPOSITORY && headRepository !== GITHUB_PR_WRITE_FORK_REPOSITORY) || context.repository !== GITHUB_PR_WRITE_REPOSITORY || !SHA.test(context.expectedHead) || !Number.isSafeInteger(context.prNumber) || context.prNumber < 1 || !REF.test(context.repository)) fail("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
+    const allowed = canWriteCode(context.evidence, topology) || canWriteCodeUnattended(context.evidence, topology);
+    const fixedTarget = baseRepository === GITHUB_PR_WRITE_REPOSITORY
+      && (headRepository === GITHUB_PR_WRITE_REPOSITORY || headRepository === GITHUB_PR_WRITE_FORK_REPOSITORY)
+      && context.repository === GITHUB_PR_WRITE_REPOSITORY;
+    const dynamicTarget = unattendedWriteEnabled()
+      && baseRepository === context.repository
+      && REPOSITORY.test(context.repository)
+      && REPOSITORY.test(headRepository);
+    if (!allowed || (!fixedTarget && !dynamicTarget) || !SHA.test(context.expectedHead) || !Number.isSafeInteger(context.prNumber) || context.prNumber < 1 || !REF.test(context.repository)) fail("GITHUB_WRITE_MUTATION_DENIED", "code writes require an authored User PR on the approved repository topology with push permission");
     if (context.headRef !== undefined && (!REF.test(context.headRef) || context.headRef.split("/").some((part) => part === "." || part === ".."))) fail("GITHUB_WRITE_INVALID_INPUT", "head ref is invalid");
     const root = path.resolve(context.workspaceRoot);
     if (!root || root === path.parse(root).root) fail("GITHUB_WRITE_INVALID_INPUT", "workspace root is invalid");

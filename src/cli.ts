@@ -502,6 +502,37 @@ async function cmdGithubPrWriteHost(flags: Record<string, string | boolean>): Pr
   console.error(`github-pr-write admin host listening on ${host.socketPath} (workspace=${path.resolve(workspace)})`);
   await new Promise<void>(() => {});
 }
+async function cmdGithubPrFeedbackSupervisor(flags: Record<string, string | boolean>): Promise<void> {
+  const workspace = typeof flags.workspace === "string"
+    ? flags.workspace
+    : path.join(os.homedir(), "workspace");
+  const intervalSeconds = typeof flags["interval-seconds"] === "string"
+    ? Number.parseInt(flags["interval-seconds"], 10)
+    : 300;
+  if (!Number.isSafeInteger(intervalSeconds) || intervalSeconds < 60 || intervalSeconds > 86_400) {
+    throw new Error("github-pr-feedback-supervisor interval must be between 60 and 86400 seconds");
+  }
+  const { runGithubPrFeedbackSupervisor } = await import("./server/github-pr-feedback-supervisor.js");
+  const supervisor = await runGithubPrFeedbackSupervisor({
+    stateDir: defaultStateDir(),
+    workspaceRoot: path.resolve(workspace),
+    intervalMs: intervalSeconds * 1_000,
+    once: flags.once === true,
+    chatgptCdpUrl: typeof flags["chatgpt-cdp-url"] === "string" ? flags["chatgpt-cdp-url"] : undefined,
+  });
+  let closing = false;
+  const close = async (exitCode: number) => {
+    if (closing) return;
+    closing = true;
+    await supervisor.close();
+    process.exitCode = exitCode;
+  };
+  process.once("SIGINT", () => { void close(130); });
+  process.once("SIGTERM", () => { void close(143); });
+  if (flags.once === true) return;
+  console.error(`github-pr-feedback-supervisor listening (interval=${intervalSeconds}s, workspace=${path.resolve(workspace)})`);
+  await new Promise<void>(() => {});
+}
 async function cmdDirectMonitorCycle(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const [{ createDirectActionClient }, { runDirectMonitorCycle }] = await Promise.all([
@@ -795,6 +826,9 @@ async function main(): Promise<void> {
     case "github-pr-write-host":
       await cmdGithubPrWriteHost(flags);
       break;
+    case "github-pr-feedback-supervisor":
+      await cmdGithubPrFeedbackSupervisor(flags);
+      break;
     case "github-pr-write":
       await cmdGithubPrWrite(process.argv.slice(2));
       break;
@@ -805,7 +839,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|github-pr-write|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|owner-token|control|direct-action|github-pr-write|github-pr-feedback-supervisor|direct-monitor-cycle> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

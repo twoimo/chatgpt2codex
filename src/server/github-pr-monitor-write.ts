@@ -4,7 +4,7 @@ import type { ToolContext } from "../types.js";
 import { toolCallProof } from "./tool-proof.js";
 import { GithubPrWriteAuthority } from "./github-pr-write-authority.js";
 import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_FORK_REPOSITORY, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError, WRITE_OPERATIONS, digest, effectIdentityFor, type WriteStage } from "./github-pr-write-contract.js";
-import { assertOperationAllowed, assertSafeBody, renderComment, type GithubEvidence } from "./github-pr-write-policy.js";
+import { assertOperationAllowed, assertSafeBody, renderComment, type GithubEvidence, unattendedWriteEnabled } from "./github-pr-write-policy.js";
 import { GithubPrWriteEffects, defaultGhCommand, type GhCommand } from "./github-pr-write-effects.js";
 import { GithubPrWriteCodeEffects, defaultGitCommand, type GitCommand, type Suggestion } from "./github-pr-write-code-effects.js";
 
@@ -119,12 +119,14 @@ function assertOperationFields(operation: typeof WRITE_OPERATIONS[number], reque
   if (Object.keys(request).some((key) => !allowedKeys.has(key))) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
 }
 function assertHostTarget(request: Record<string, unknown>, evidence?: GithubEvidence, operation?: typeof WRITE_OPERATIONS[number]): void {
-  if (typeof request.repository !== "string" || request.repository !== GITHUB_PR_WRITE_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  const unattended = unattendedWriteEnabled();
+  if (typeof request.repository !== "string" || (unattended ? !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(request.repository) : request.repository !== GITHUB_PR_WRITE_REPOSITORY)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (!Number.isSafeInteger(request.prNumber) || Number(request.prNumber) < 1 || typeof request.expectedHead !== "string" || !/^[0-9a-f]{40}$/iu.test(request.expectedHead)) throw new GithubPrWriteError("GITHUB_WRITE_INVALID_INPUT");
-  if (typeof request.baseRepository !== "string" || request.baseRepository !== GITHUB_PR_WRITE_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  if (typeof request.baseRepository !== "string" || (unattended ? request.baseRepository !== request.repository : request.baseRepository !== GITHUB_PR_WRITE_REPOSITORY)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (typeof request.headRepository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(request.headRepository)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   const codeOperation = operation !== undefined && !["post_comment", "post_reply", "resolve_thread", "rerequest_reviewer"].includes(operation);
-  if (codeOperation && request.headRepository !== GITHUB_PR_WRITE_REPOSITORY && request.headRepository !== GITHUB_PR_WRITE_FORK_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  if (codeOperation && !unattended && request.headRepository !== GITHUB_PR_WRITE_REPOSITORY && request.headRepository !== GITHUB_PR_WRITE_FORK_REPOSITORY) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
+  if (codeOperation && unattended && request.headRepository !== request.baseRepository && !request.headRepository.toLowerCase().startsWith(`${GITHUB_PR_WRITE_ACCOUNT.toLowerCase()}/`)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
   if (evidence && (evidence.account.login !== GITHUB_PR_WRITE_ACCOUNT || evidence.expectedHead !== request.expectedHead)) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED");
 }
 function reviewContext(input: z.infer<typeof requestSchema>) {
@@ -163,7 +165,7 @@ function reviewEffect(input: z.infer<typeof requestSchema>, effectId: string) {
 async function assertReviewerPreIntent(input: z.infer<typeof requestSchema>, gh: GhCommand): Promise<void> {
   if (input.operation !== "rerequest_reviewer") return;
   const reviewer = requiredString(input.request, "reviewer");
-  const result = await gh(["api", `repos/${GITHUB_PR_WRITE_REPOSITORY}/pulls/${String(input.request.prNumber)}/requested_reviewers`, "--hostname", "github.com"], 15_000);
+  const result = await gh(["api", `repos/${String(input.request.repository)}/pulls/${String(input.request.prNumber)}/requested_reviewers`, "--hostname", "github.com"], 15_000);
   if (result.timedOut || result.exitCode !== 0 || typeof result.stdout !== "string" || Buffer.byteLength(result.stdout, "utf8") > 64 * 1024) {
     throw new GithubPrWriteError("GITHUB_WRITE_RECOVERY_REQUIRED", "reviewer pre-intent evidence is ambiguous");
   }

@@ -68,4 +68,77 @@ describe("GithubPrWriteAuthority v5", () => {
     expect(() => authority.issueCapability("x".repeat(129))).toThrowError(GithubPrWriteError);
     authority.close();
   });
+
+  it("exposes the active capability and gates unattended approval", async () => {
+    const authority = await GithubPrWriteAuthority.open(dir());
+    const previous = process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+    try {
+      delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      const capability = authority.issueCapability("twoimo");
+      expect(authority.activeCapability("twoimo")).toMatchObject({
+        capabilityId: capability.capabilityId,
+        generation: capability.generation,
+        status: "active",
+      });
+      const session = authority.openSession(capability.capabilityId, capability.generation);
+      const preview = authority.createPreview(session.sessionId, "post_comment", { body: "automated response" });
+      const challenge = authority.createChallenge(preview.previewId);
+      expect(() => authority.approveUnattended(challenge.challengeId, { sessionId: session.sessionId })).toThrowError(GithubPrWriteError);
+
+      process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+      const approval = authority.approveUnattended(challenge.challengeId, { sessionId: session.sessionId, operation: "post_comment" });
+      expect(approval.status).toBe("approved");
+      expect(authority.recordEffectIntent(preview.previewId, "unattended-request").status).toBe("pending");
+      expect(() => authority.approveUnattended(challenge.challengeId, { sessionId: session.sessionId })).toThrowError(GithubPrWriteError);
+    } finally {
+      if (previous === undefined) delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      else process.env.CHATGPT2CODEX_UNATTENDED_WRITE = previous;
+      authority.close();
+    }
+  });
+
+  it("renews only the fixed capability scope in explicit unattended mode", async () => {
+    const authority = await GithubPrWriteAuthority.open(dir());
+    const previousGate = process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+    const previousStage = process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+    try {
+      process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+      process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = "enabled";
+      authority.setStage("enabled");
+      const first = authority.unattendedCapability("twoimo");
+      expect(authority.unattendedCapability("twoimo").capabilityId).toBe(first.capabilityId);
+      expect(() => authority.unattendedCapability("twoimo", ["post_comment"])).toThrowError(GithubPrWriteError);
+    } finally {
+      if (previousGate === undefined) delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      else process.env.CHATGPT2CODEX_UNATTENDED_WRITE = previousGate;
+      if (previousStage === undefined) delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+      else process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = previousStage;
+      authority.close();
+    }
+  });
+
+  it("renews an expired unattended capability at the current generation", async () => {
+    const stateDir = dir();
+    let now = 10_000;
+    const clock = new AuthorityClock(() => now, () => now);
+    const authority = await GithubPrWriteAuthority.open(stateDir, clock);
+    const previousGate = process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+    const previousStage = process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+    try {
+      process.env.CHATGPT2CODEX_UNATTENDED_WRITE = "1";
+      process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = "enabled";
+      authority.setStage("enabled");
+      const first = authority.unattendedCapability("twoimo");
+      now += WRITE_TTL_MS.capability;
+      const renewed = authority.unattendedCapability("twoimo");
+      expect(renewed.capabilityId).not.toBe(first.capabilityId);
+      expect(renewed.generation).toBe(authority.currentGeneration());
+    } finally {
+      if (previousGate === undefined) delete process.env.CHATGPT2CODEX_UNATTENDED_WRITE;
+      else process.env.CHATGPT2CODEX_UNATTENDED_WRITE = previousGate;
+      if (previousStage === undefined) delete process.env.CHATGPT2CODEX_MONITOR_ROLLOUT;
+      else process.env.CHATGPT2CODEX_MONITOR_ROLLOUT = previousStage;
+      authority.close();
+    }
+  });
 });

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { GITHUB_PR_WRITE_ACCOUNT, GITHUB_PR_WRITE_REPOSITORY, GithubPrWriteError } from "./github-pr-write-contract.js";
-import { AUTO_MARKER_PREFIX, MAX_COMMENT_BYTES, assertSafeBody } from "./github-pr-write-policy.js";
+import { AUTO_MARKER_PREFIX, MAX_COMMENT_BYTES, assertSafeBody, unattendedWriteEnabled } from "./github-pr-write-policy.js";
 
 export interface GhResult { stdout: string; stderr?: string; exitCode?: number; timedOut?: boolean; }
 export type GhCommand = (argv: readonly string[], timeoutMs: number) => Promise<GhResult>;
@@ -94,7 +94,22 @@ export class GithubPrWriteEffects {
   }
 
   private validateContext(context: RemoteReviewContext): void {
-    if (context.repository !== GITHUB_PR_WRITE_REPOSITORY || context.actor !== GITHUB_PR_WRITE_ACCOUNT || !REPO.test(context.repository) || !Number.isSafeInteger(context.prNumber) || context.prNumber < 1 || !SHA.test(context.expectedHead) || !LOGIN.test(context.actor) || !LOGIN.test(context.author))
+    const unattended = unattendedWriteEnabled();
+    const baseRepository = context.baseRepository ?? context.repository;
+    const headRepository = context.headRepository ?? context.repository;
+    const dynamicTarget = unattended
+      && REPO.test(context.repository)
+      && REPO.test(baseRepository)
+      && REPO.test(headRepository)
+      && context.repository === baseRepository;
+    if ((!unattended && context.repository !== GITHUB_PR_WRITE_REPOSITORY)
+      || (unattended && !dynamicTarget)
+      || context.actor !== GITHUB_PR_WRITE_ACCOUNT
+      || !Number.isSafeInteger(context.prNumber)
+      || context.prNumber < 1
+      || !SHA.test(context.expectedHead)
+      || !LOGIN.test(context.actor)
+      || !LOGIN.test(context.author))
       throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "review target is outside the approved repository/account");
     if (context.actorType && context.actorType !== "User") throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "review effects require a User actor");
   }
@@ -102,14 +117,12 @@ export class GithubPrWriteEffects {
   private async evidence(context: RemoteReviewContext): Promise<void> {
     const user = json(await this.run(["api", "user", "--hostname", "github.com", "--jq", ".login"], "authenticated user"), "authenticated user");
     if (user !== context.actor) throw new GithubPrWriteError("GITHUB_WRITE_MUTATION_DENIED", "authenticated account does not match actor");
-    const view = parse<Record<string, unknown>>(await this.run(["pr", "view", String(context.prNumber), "--repo", context.repository, "--hostname", "github.com", "--json", "state,author,headRefOid,baseRepository,headRepository,repository"], "pull request evidence"), "pull request evidence");
+    const view = parse<Record<string, unknown>>(await this.run(["pr", "view", String(context.prNumber), "--repo", context.repository, "--json", "state,author,headRefOid,headRepository"], "pull request evidence"), "pull request evidence");
     const author = view.author as Record<string, unknown> | undefined;
-    const repo = view.repository as Record<string, unknown> | undefined;
     const headRepo = view.headRepository as Record<string, unknown> | undefined;
-    const baseRepo = view.baseRepository as Record<string, unknown> | undefined;
     const baseName = typeof context.baseRepository === "string" ? context.baseRepository : context.repository;
     const headName = typeof context.headRepository === "string" ? context.headRepository : context.repository;
-    if (view.state !== "OPEN" || String(view.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase() || author?.login !== context.author || repo?.nameWithOwner !== context.repository || baseRepo?.nameWithOwner !== baseName || headRepo?.nameWithOwner !== headName) fail("pull request evidence is stale or mismatched");
+    if (view.state !== "OPEN" || String(view.headRefOid).toLowerCase() !== context.expectedHead.toLowerCase() || author?.login !== context.author || context.repository !== baseName || headRepo?.nameWithOwner !== headName) fail("pull request evidence is stale or mismatched");
   }
   private async reconcileComment(
     context: RemoteReviewContext,
